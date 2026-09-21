@@ -1,12 +1,15 @@
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
+
+# Filter out tokenized stocks (they end with B before USDT)
+STOCK_SUFFIXES = ("BUSDT", "BUSD")
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -24,6 +27,13 @@ def get_candidates():
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
+            continue
+        # Skip tokenized stocks like SNDKBUSDT, SOXLBUSDT
+        if symbol.endswith("BUSDT"):
+            continue
+        # Skip obvious non-crypto
+        skip = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
+        if symbol.endswith(skip):
             continue
         try:
             quote_vol = float(t["quoteVolume"])
@@ -74,7 +84,8 @@ def scan():
     return hits
 
 def main():
-    print(f"Scanner starting at {datetime.now()}")
+    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    print(f"Scanner starting at {ist} IST")
     hits = scan()
     print(f"Found {len(hits)} hits")
     for h in hits:
@@ -85,7 +96,7 @@ def main():
             f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
             f"<b>Vol Ratio:</b> {h['vol_ratio']:.2f}x\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
-            f"<b>Time:</b> {datetime.now().strftime('%H:%M:%S')}"
+            f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST"
         )
         send_telegram(msg)
 
