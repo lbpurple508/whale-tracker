@@ -6,6 +6,8 @@ from datetime import datetime
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+BASE_URL = "https://data-api.binance.vision"
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -15,24 +17,24 @@ def send_telegram(message):
         print(f"Telegram error: {e}")
 
 def get_all_usdt_pairs():
-    url = "https://api.binance.com/api/v3/exchangeInfo"
-    r = requests.get(url, timeout=10)
+    url = f"{BASE_URL}/api/v3/exchangeInfo"
+    r = requests.get(url, timeout=15)
     data = r.json()
     pairs = []
-    for s in data["symbols"]:
-        if s["quoteAsset"] == "USDT" and s["status"] == "TRADING":
+    for s in data.get("symbols", []):
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
             pairs.append(s["symbol"])
     return pairs
 
 def get_klines(symbol, interval="15m", limit=25):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     r = requests.get(url, timeout=10)
     return r.json()
 
 def check_volume_breakout(symbol):
     try:
         klines = get_klines(symbol)
-        if len(klines) < 21:
+        if not isinstance(klines, list) or len(klines) < 21:
             return None
         volumes = [float(k[5]) for k in klines[:-1]]
         avg_vol = sum(volumes[-20:]) / 20
@@ -42,7 +44,7 @@ def check_volume_breakout(symbol):
         ratio = current_vol / avg_vol
         if ratio < 3:
             return None
-        ticker = requests.get(f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}", timeout=10).json()
+        ticker = requests.get(f"{BASE_URL}/api/v3/ticker/24hr?symbol={symbol}", timeout=10).json()
         change_24h = float(ticker["priceChangePercent"])
         quote_vol = float(ticker["quoteVolume"])
         current_price = float(ticker["lastPrice"])
@@ -57,11 +59,12 @@ def check_volume_breakout(symbol):
             "vol_ratio": ratio,
             "quote_vol": quote_vol,
         }
-    except Exception:
+    except Exception as e:
         return None
 
 def scan():
     pairs = get_all_usdt_pairs()
+    print(f"Scanning {len(pairs)} pairs...")
     hits = []
     for symbol in pairs:
         result = check_volume_breakout(symbol)
