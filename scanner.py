@@ -8,6 +8,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
 
+# Major coins — they don't pump 30-50%
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "DOTUSDT",
@@ -19,6 +20,14 @@ MAJORS = {
     "STXUSDT", "IMXUSDT", "RUNEUSDT", "AAVEUSDT", "MKRUSDT",
     "GRTUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "CRVUSDT",
     "ALGOUSDT", "EGLDUSDT", "FTMUSDT", "THETAUSDT", "FLOWUSDT",
+}
+
+# Known wash trading / bot manipulation tokens — SKIP THESE
+BLACKLIST = {
+    "GPSUSDT", "SHELLUSDT", "ENAUSDT", "ZKJUSDT", "KOGEUSDT",
+    "COAIUSDT", "SAITAMAUSDT", "ROBOUSDT", "VZZNUSDT", "LABUSDT",
+    "RAVEUSDT", "BROCCOLIUSDT", "SIRENUSDT", "AKEUSDT", "XPINUSDT",
+    "BTRUSDT", "ANTHROPICUSDT", "SKHYNIXUSDT", "REUSDT", "SNDKUSDT",
 }
 
 def format_price(p):
@@ -49,6 +58,8 @@ def get_candidates():
             continue
         if symbol in MAJORS:
             continue
+        if symbol in BLACKLIST:
+            continue
         if symbol.endswith("BUSDT"):
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
@@ -71,26 +82,61 @@ def get_candidates():
         })
     return candidates
 
-def check_volume(symbol):
+def check_depth(symbol, price):
+    try:
+        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
+        r = requests.get(url, timeout=10)
+        book = r.json()
+        low = price * 0.98
+        high = price * 1.02
+        bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
+        ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
+        return bid_depth, ask_depth
+    except Exception:
+        return 0, 0
+
+def check_signal(symbol, price):
     try:
         url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
         r = requests.get(url, timeout=10)
         klines = r.json()
         if not isinstance(klines, list) or len(klines) < 21:
             return None
+        
         volumes = [float(k[5]) for k in klines[:-1]]
         avg = sum(volumes[-20:]) / 20
-        current = float(klines[-1][5])
+        current_vol = float(klines[-1][5])
         if avg == 0:
             return None
-        ratio = current / avg
-        if ratio < 4:
+        vol_ratio = current_vol / avg
+        if vol_ratio < 4:
             return None
+        
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
         if current_close <= current_open:
             return None
-        return ratio
+        
+        total_vol = float(klines[-1][5])
+        taker_buy = float(klines[-1][9])
+        if total_vol == 0:
+            return None
+        taker_buy_pct = taker_buy / total_vol
+        if taker_buy_pct < 0.55:
+            return None
+        
+        bid_depth, ask_depth = check_depth(symbol, price)
+        if bid_depth < 20000 or ask_depth < 20000:
+            return None
+        if bid_depth / ask_depth < 0.7:
+            return None
+        
+        return {
+            "vol_ratio": vol_ratio,
+            "taker_buy_pct": taker_buy_pct * 100,
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+        }
     except Exception:
         return None
 
@@ -98,13 +144,13 @@ def scan():
     candidates = get_candidates()
     print(f"Candidates after filter: {len(candidates)}")
     hits = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(check_volume, c["symbol"]): c for c in candidates}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(check_signal, c["symbol"], c["price"]): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
-            ratio = future.result()
-            if ratio:
-                c["vol_ratio"] = ratio
+            result = future.result()
+            if result:
+                c.update(result)
                 hits.append(c)
     return hits
 
@@ -120,6 +166,9 @@ def main():
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
             f"<b>Vol Ratio:</b> {h['vol_ratio']:.2f}x\n"
+            f"<b>Taker Buy:</b> {h['taker_buy_pct']:.1f}%\n"
+            f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
+            f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST"
         )
