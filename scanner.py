@@ -1,7 +1,7 @@
 import os
 import requests
-import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -16,61 +16,61 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def get_all_usdt_pairs():
-    url = f"{BASE_URL}/api/v3/exchangeInfo"
-    r = requests.get(url, timeout=15)
-    data = r.json()
-    pairs = []
-    for s in data.get("symbols", []):
-        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
-            pairs.append(s["symbol"])
-    return pairs
+def get_candidates():
+    url = f"{BASE_URL}/api/v3/ticker/24hr"
+    r = requests.get(url, timeout=20)
+    tickers = r.json()
+    candidates = []
+    for t in tickers:
+        symbol = t.get("symbol", "")
+        if not symbol.endswith("USDT"):
+            continue
+        try:
+            quote_vol = float(t["quoteVolume"])
+            change = float(t["priceChangePercent"])
+            price = float(t["lastPrice"])
+        except (KeyError, ValueError):
+            continue
+        if quote_vol < 5_000_000:
+            continue
+        if change < 2 or change > 25:
+            continue
+        candidates.append({
+            "symbol": symbol,
+            "price": price,
+            "change_24h": change,
+            "quote_vol": quote_vol,
+        })
+    return candidates
 
-def get_klines(symbol, interval="15m", limit=25):
-    url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    r = requests.get(url, timeout=10)
-    return r.json()
-
-def check_volume_breakout(symbol):
+def check_volume(symbol):
     try:
-        klines = get_klines(symbol)
+        url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
+        r = requests.get(url, timeout=10)
+        klines = r.json()
         if not isinstance(klines, list) or len(klines) < 21:
             return None
         volumes = [float(k[5]) for k in klines[:-1]]
-        avg_vol = sum(volumes[-20:]) / 20
-        current_vol = float(klines[-1][5])
-        if avg_vol == 0:
+        avg = sum(volumes[-20:]) / 20
+        current = float(klines[-1][5])
+        if avg == 0:
             return None
-        ratio = current_vol / avg_vol
-        if ratio < 3:
-            return None
-        ticker = requests.get(f"{BASE_URL}/api/v3/ticker/24hr?symbol={symbol}", timeout=10).json()
-        change_24h = float(ticker["priceChangePercent"])
-        quote_vol = float(ticker["quoteVolume"])
-        current_price = float(ticker["lastPrice"])
-        if quote_vol < 5_000_000:
-            return None
-        if change_24h < 2 or change_24h > 25:
-            return None
-        return {
-            "symbol": symbol,
-            "price": current_price,
-            "change_24h": change_24h,
-            "vol_ratio": ratio,
-            "quote_vol": quote_vol,
-        }
-    except Exception as e:
+        return current / avg
+    except Exception:
         return None
 
 def scan():
-    pairs = get_all_usdt_pairs()
-    print(f"Scanning {len(pairs)} pairs...")
+    candidates = get_candidates()
+    print(f"Candidates after filter: {len(candidates)}")
     hits = []
-    for symbol in pairs:
-        result = check_volume_breakout(symbol)
-        if result:
-            hits.append(result)
-        time.sleep(0.05)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(check_volume, c["symbol"]): c for c in candidates}
+        for future in as_completed(futures):
+            c = futures[future]
+            ratio = future.result()
+            if ratio and ratio >= 3:
+                c["vol_ratio"] = ratio
+                hits.append(c)
     return hits
 
 def main():
