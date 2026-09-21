@@ -8,7 +8,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
 
-# Major coins — they don't pump 30-50%
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "DOTUSDT",
@@ -22,12 +21,12 @@ MAJORS = {
     "ALGOUSDT", "EGLDUSDT", "FTMUSDT", "THETAUSDT", "FLOWUSDT",
 }
 
-# Known wash trading / bot manipulation tokens — SKIP THESE
 BLACKLIST = {
     "GPSUSDT", "SHELLUSDT", "ENAUSDT", "ZKJUSDT", "KOGEUSDT",
     "COAIUSDT", "SAITAMAUSDT", "ROBOUSDT", "VZZNUSDT", "LABUSDT",
     "RAVEUSDT", "BROCCOLIUSDT", "SIRENUSDT", "AKEUSDT", "XPINUSDT",
     "BTRUSDT", "ANTHROPICUSDT", "SKHYNIXUSDT", "REUSDT", "SNDKUSDT",
+    "XPLUSDT",
 }
 
 def format_price(p):
@@ -72,7 +71,8 @@ def get_candidates():
             continue
         if quote_vol < 10_000_000:
             continue
-        if change < 2 or change > 15:
+        # Wider 24h range: allow up to 30% (fresh pumps can be high)
+        if change < 2 or change > 30:
             continue
         candidates.append({
             "symbol": symbol,
@@ -81,6 +81,26 @@ def get_candidates():
             "quote_vol": quote_vol,
         })
     return candidates
+
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 def check_depth(symbol, price):
     try:
@@ -102,7 +122,8 @@ def check_signal(symbol, price):
         klines = r.json()
         if not isinstance(klines, list) or len(klines) < 21:
             return None
-        
+
+        # Volume filter
         volumes = [float(k[5]) for k in klines[:-1]]
         avg = sum(volumes[-20:]) / 20
         current_vol = float(klines[-1][5])
@@ -111,12 +132,39 @@ def check_signal(symbol, price):
         vol_ratio = current_vol / avg
         if vol_ratio < 4:
             return None
-        
+
+        # Green candle
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
         if current_close <= current_open:
             return None
-        
+
+        # 1h change (4 candles back)
+        if len(klines) >= 5:
+            price_1h_ago = float(klines[-5][4])
+            change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
+        else:
+            change_1h = 0
+        # 1h change must be positive and not exhausted
+        if change_1h < 1 or change_1h > 20:
+            return None
+
+        # 4h change (16 candles back)
+        if len(klines) >= 17:
+            price_4h_ago = float(klines[-17][4])
+            change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
+        else:
+            change_4h = 0
+        if change_4h > 40:
+            return None
+
+        # RSI check (bot-side, under 75)
+        closes = [float(k[4]) for k in klines]
+        rsi = compute_rsi(closes, 14)
+        if rsi > 75:
+            return None
+
+        # Taker buy %
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
@@ -124,18 +172,22 @@ def check_signal(symbol, price):
         taker_buy_pct = taker_buy / total_vol
         if taker_buy_pct < 0.55:
             return None
-        
+
+        # Depth
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < 20000 or ask_depth < 20000:
             return None
         if bid_depth / ask_depth < 0.7:
             return None
-        
+
         return {
             "vol_ratio": vol_ratio,
             "taker_buy_pct": taker_buy_pct * 100,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
+            "change_1h": change_1h,
+            "change_4h": change_4h,
+            "rsi": rsi,
         }
     except Exception:
         return None
@@ -165,6 +217,9 @@ def main():
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
+            f"<b>1h Change:</b> {h['change_1h']:.2f}%\n"
+            f"<b>4h Change:</b> {h['change_4h']:.2f}%\n"
+            f"<b>RSI:</b> {h['rsi']:.1f}\n"
             f"<b>Vol Ratio:</b> {h['vol_ratio']:.2f}x\n"
             f"<b>Taker Buy:</b> {h['taker_buy_pct']:.1f}%\n"
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
