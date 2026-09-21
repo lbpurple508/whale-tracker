@@ -8,8 +8,15 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
 
-# Filter out tokenized stocks (they end with B before USDT)
-STOCK_SUFFIXES = ("BUSDT", "BUSD")
+# Skip major coins — they don't pump 30-50%
+MAJORS = {
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "DOTUSDT",
+    "MATICUSDT", "LTCUSDT", "LINKUSDT", "TONUSDT", "SHIBUSDT",
+    "BCHUSDT", "UNIUSDT", "ATOMUSDT", "ETCUSDT", "FILUSDT",
+    "APTUSDT", "NEARUSDT", "ICPUSDT", "VETUSDT", "OPUSDT",
+    "ARBUSDT", "INJUSDT", "SUIUSDT", "SEIUSDT", "TIAUSDT",
+}
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -28,12 +35,11 @@ def get_candidates():
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
-        # Skip tokenized stocks like SNDKBUSDT, SOXLBUSDT
+        if symbol in MAJORS:
+            continue
         if symbol.endswith("BUSDT"):
             continue
-        # Skip obvious non-crypto
-        skip = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
-        if symbol.endswith(skip):
+        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             continue
         try:
             quote_vol = float(t["quoteVolume"])
@@ -41,9 +47,9 @@ def get_candidates():
             price = float(t["lastPrice"])
         except (KeyError, ValueError):
             continue
-        if quote_vol < 5_000_000:
+        if quote_vol < 10_000_000:
             continue
-        if change < 2 or change > 25:
+        if change < 2 or change > 15:
             continue
         candidates.append({
             "symbol": symbol,
@@ -65,7 +71,15 @@ def check_volume(symbol):
         current = float(klines[-1][5])
         if avg == 0:
             return None
-        return current / avg
+        ratio = current / avg
+        if ratio < 4:
+            return None
+        # Check current 15m candle is GREEN (price rising now)
+        current_open = float(klines[-1][1])
+        current_close = float(klines[-1][4])
+        if current_close <= current_open:
+            return None
+        return ratio
     except Exception:
         return None
 
@@ -78,7 +92,7 @@ def scan():
         for future in as_completed(futures):
             c = futures[future]
             ratio = future.result()
-            if ratio and ratio >= 3:
+            if ratio:
                 c["vol_ratio"] = ratio
                 hits.append(c)
     return hits
