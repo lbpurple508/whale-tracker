@@ -8,7 +8,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
 
-# Skip major coins — they don't pump 30-50%
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "DOTUSDT",
@@ -16,7 +15,20 @@ MAJORS = {
     "BCHUSDT", "UNIUSDT", "ATOMUSDT", "ETCUSDT", "FILUSDT",
     "APTUSDT", "NEARUSDT", "ICPUSDT", "VETUSDT", "OPUSDT",
     "ARBUSDT", "INJUSDT", "SUIUSDT", "SEIUSDT", "TIAUSDT",
+    "XLMUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
+    "STXUSDT", "IMXUSDT", "RUNEUSDT", "AAVEUSDT", "MKRUSDT",
+    "GRTUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "CRVUSDT",
+    "ALGOUSDT", "EGLDUSDT", "FTMUSDT", "THETAUSDT", "FLOWUSDT",
 }
+
+def format_price(p):
+    if p >= 1:
+        return f"${p:.4f}"
+    if p >= 0.01:
+        return f"${p:.5f}"
+    if p >= 0.0001:
+        return f"${p:.6f}"
+    return f"${p:.8f}"
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -74,7 +86,6 @@ def check_volume(symbol):
         ratio = current / avg
         if ratio < 4:
             return None
-        # Check current 15m candle is GREEN (price rising now)
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
         if current_close <= current_open:
@@ -106,7 +117,7 @@ def main():
         msg = (
             f"🚨 <b>VOLUME BREAKOUT</b>\n\n"
             f"<b>Coin:</b> {h['symbol']}\n"
-            f"<b>Price:</b> ${h['price']}\n"
+            f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
             f"<b>Vol Ratio:</b> {h['vol_ratio']:.2f}x\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
