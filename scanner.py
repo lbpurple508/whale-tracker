@@ -102,7 +102,6 @@ def get_candidates():
             continue
         if change < 1 or change > 50:
             continue
-        # MAX PRICE FILTER: under $1.00 (low price = pump-friendly)
         if price > 1.00:
             continue
         candidates.append({
@@ -155,7 +154,6 @@ def check_signal(symbol, price):
         if not isinstance(klines, list) or len(klines) < 21:
             return None, ["not enough klines"]
 
-        # Volume spike on current candle
         volumes = [float(k[5]) for k in klines[:-1]]
         avg = sum(volumes[-20:]) / 20
         current_vol = float(klines[-1][5])
@@ -163,15 +161,13 @@ def check_signal(symbol, price):
             return None, ["avg vol zero"]
         vol_ratio = current_vol / avg
         if vol_ratio < 4:
-            reasons.append(f"vol {vol_ratio:.1f}x < 4x")
+            reasons.append(f"vol {vol_ratio:.1f}x")
 
-        # Green candle
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
         if current_close <= current_open:
             reasons.append("candle red")
 
-        # 1h change
         if len(klines) >= 5:
             price_1h_ago = float(klines[-5][4])
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
@@ -180,7 +176,6 @@ def check_signal(symbol, price):
         if change_1h < 0.5 or change_1h > 40:
             reasons.append(f"1h {change_1h:.1f}%")
 
-        # 4h change
         if len(klines) >= 17:
             price_4h_ago = float(klines[-17][4])
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
@@ -189,13 +184,11 @@ def check_signal(symbol, price):
         if change_4h > 60:
             reasons.append(f"4h {change_4h:.1f}%")
 
-        # RSI
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
         if rsi > 72:
             reasons.append(f"RSI {rsi:.1f}")
 
-        # Taker Buy — raised to 58%
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
@@ -204,14 +197,13 @@ def check_signal(symbol, price):
         if taker_buy_pct < 0.58:
             reasons.append(f"taker {taker_buy_pct*100:.1f}%")
 
-        # Depth
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < 50_000:
             reasons.append(f"bid ${bid_depth:,.0f}")
         if ask_depth < 50_000:
             reasons.append(f"ask ${ask_depth:,.0f}")
         if ask_depth > 0 and bid_depth / ask_depth < 0.6:
-            reasons.append("bid/ask ratio")
+            reasons.append("bid/ask")
 
         if reasons:
             return None, reasons
@@ -256,14 +248,35 @@ def scan():
     save_cooldown(cooldown)
     return hits
 
+def is_active_session(hour, minute):
+    # Asia: 5:30 AM - 11:30 AM IST
+    if hour == 5 and minute >= 30:
+        return True, "Asia"
+    if 6 <= hour <= 10:
+        return True, "Asia"
+    if hour == 11 and minute < 30:
+        return True, "Asia"
+    # Europe: 12:30 PM - 3:30 PM IST
+    if hour == 12 and minute >= 30:
+        return True, "Europe"
+    if 13 <= hour <= 14:
+        return True, "Europe"
+    if hour == 15 and minute < 30:
+        return True, "Europe"
+    return False, "Off-hours"
+
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    print(f"Scanner starting at {ist} IST")
+    active, session = is_active_session(ist.hour, ist.minute)
+    print(f"Scanner starting at {ist} IST — Session: {session} — Active: {active}")
+    
+    if not active:
+        print("Outside fresh cycle window (Asia 5:30-11:30, Europe 12:30-15:30). Skipping.")
+        return
+    
     hits = scan()
     print(f"Found {len(hits)} hits")
     for h in hits:
-        hour = ist.hour
-        session = "Asia" if 5 <= hour < 12 else "Europe" if 12 <= hour < 18 else "US"
         msg = (
             f"🚨 <b>VOLUME BREAKOUT</b> [{session}]\n\n"
             f"<b>Coin:</b> {h['symbol']}\n"
