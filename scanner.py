@@ -1,5 +1,7 @@
 import os
+import json
 import requests
+from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -7,6 +9,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
+COOLDOWN_FILE = Path("cooldown.json")
+COOLDOWN_MINUTES = 30
 
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -19,6 +23,7 @@ MAJORS = {
     "STXUSDT", "IMXUSDT", "RUNEUSDT", "AAVEUSDT", "MKRUSDT",
     "GRTUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "CRVUSDT",
     "ALGOUSDT", "EGLDUSDT", "FTMUSDT", "THETAUSDT", "FLOWUSDT",
+    "HBARUSDT",
 }
 
 BLACKLIST = {
@@ -26,7 +31,7 @@ BLACKLIST = {
     "COAIUSDT", "SAITAMAUSDT", "ROBOUSDT", "VZZNUSDT", "LABUSDT",
     "RAVEUSDT", "BROCCOLIUSDT", "SIRENUSDT", "AKEUSDT", "XPINUSDT",
     "BTRUSDT", "ANTHROPICUSDT", "SKHYNIXUSDT", "REUSDT", "SNDKUSDT",
-    "XPLUSDT", "BANKUSDT",
+    "XPLUSDT",
 }
 
 def format_price(p):
@@ -45,6 +50,30 @@ def send_telegram(message):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
+
+def load_cooldown():
+    if COOLDOWN_FILE.exists():
+        try:
+            data = json.loads(COOLDOWN_FILE.read_text())
+            now = datetime.utcnow()
+            cleaned = {}
+            for sym, ts in data.items():
+                try:
+                    t = datetime.fromisoformat(ts)
+                    if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
+                        cleaned[sym] = ts
+                except Exception:
+                    pass
+            return cleaned
+        except Exception:
+            return {}
+    return {}
+
+def save_cooldown(data):
+    try:
+        COOLDOWN_FILE.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"cooldown save error: {e}")
 
 def get_candidates():
     url = f"{BASE_URL}/api/v3/ticker/24hr"
@@ -71,8 +100,10 @@ def get_candidates():
             continue
         if quote_vol < 10_000_000:
             continue
-        # Widened: catch fresh pumps AND allow coins that already ran
         if change < 1 or change > 50:
+            continue
+        # MAX PRICE FILTER: under $1.00 (low price = pump-friendly)
+        if price > 1.00:
             continue
         candidates.append({
             "symbol": symbol,
@@ -124,7 +155,7 @@ def check_signal(symbol, price):
         if not isinstance(klines, list) or len(klines) < 21:
             return None, ["not enough klines"]
 
-        # Volume spike
+        # Volume spike on current candle
         volumes = [float(k[5]) for k in klines[:-1]]
         avg = sum(volumes[-20:]) / 20
         current_vol = float(klines[-1][5])
@@ -140,47 +171,47 @@ def check_signal(symbol, price):
         if current_close <= current_open:
             reasons.append("candle red")
 
-        # 1h change: widened to 1-40%
+        # 1h change
         if len(klines) >= 5:
             price_1h_ago = float(klines[-5][4])
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         else:
             change_1h = 0
         if change_1h < 0.5 or change_1h > 40:
-            reasons.append(f"1h {change_1h:.1f}% out of range")
+            reasons.append(f"1h {change_1h:.1f}%")
 
-        # 4h change: widened to 60%
+        # 4h change
         if len(klines) >= 17:
             price_4h_ago = float(klines[-17][4])
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         else:
             change_4h = 0
         if change_4h > 60:
-            reasons.append(f"4h {change_4h:.1f}% > 60%")
+            reasons.append(f"4h {change_4h:.1f}%")
 
-        # RSI under 72 (slight bump up from 70)
+        # RSI
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
         if rsi > 72:
-            reasons.append(f"RSI {rsi:.1f} > 72")
+            reasons.append(f"RSI {rsi:.1f}")
 
-        # Taker buy
+        # Taker Buy — raised to 58%
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
-            reasons.append("total vol zero")
+            reasons.append("vol zero")
         taker_buy_pct = taker_buy / total_vol if total_vol else 0
-        if taker_buy_pct < 0.52:
-            reasons.append(f"taker {taker_buy_pct*100:.1f}% < 52%")
+        if taker_buy_pct < 0.58:
+            reasons.append(f"taker {taker_buy_pct*100:.1f}%")
 
-        # Depth: $50k both sides
+        # Depth
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < 50_000:
-            reasons.append(f"bid ${bid_depth:,.0f} < $50k")
+            reasons.append(f"bid ${bid_depth:,.0f}")
         if ask_depth < 50_000:
-            reasons.append(f"ask ${ask_depth:,.0f} < $50k")
+            reasons.append(f"ask ${ask_depth:,.0f}")
         if ask_depth > 0 and bid_depth / ask_depth < 0.6:
-            reasons.append(f"bid/ask {bid_depth/ask_depth:.2f} < 0.6")
+            reasons.append("bid/ask ratio")
 
         if reasons:
             return None, reasons
@@ -200,22 +231,29 @@ def check_signal(symbol, price):
 def scan():
     candidates = get_candidates()
     print(f"Candidates after filter: {len(candidates)}")
+    cooldown = load_cooldown()
+    print(f"Cooldown active: {list(cooldown.keys())}")
     hits = []
     rejection_summary = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(check_signal, c["symbol"], c["price"]): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
+            if c["symbol"] in cooldown:
+                continue
             result, reasons = future.result()
             if result:
                 c.update(result)
                 hits.append(c)
             else:
-                # Log top rejection reason
                 if reasons:
                     top = reasons[0].split()[0]
                     rejection_summary[top] = rejection_summary.get(top, 0) + 1
     print(f"Rejection reasons: {rejection_summary}")
+    now = datetime.utcnow()
+    for h in hits:
+        cooldown[h["symbol"]] = now.isoformat()
+    save_cooldown(cooldown)
     return hits
 
 def main():
@@ -224,7 +262,6 @@ def main():
     hits = scan()
     print(f"Found {len(hits)} hits")
     for h in hits:
-        # Flag best sessions
         hour = ist.hour
         session = "Asia" if 5 <= hour < 12 else "Europe" if 12 <= hour < 18 else "US"
         msg = (
