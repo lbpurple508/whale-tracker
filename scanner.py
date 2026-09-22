@@ -26,7 +26,7 @@ BLACKLIST = {
     "COAIUSDT", "SAITAMAUSDT", "ROBOUSDT", "VZZNUSDT", "LABUSDT",
     "RAVEUSDT", "BROCCOLIUSDT", "SIRENUSDT", "AKEUSDT", "XPINUSDT",
     "BTRUSDT", "ANTHROPICUSDT", "SKHYNIXUSDT", "REUSDT", "SNDKUSDT",
-    "XPLUSDT",
+    "XPLUSDT", "BANKUSDT",
 }
 
 def format_price(p):
@@ -71,8 +71,8 @@ def get_candidates():
             continue
         if quote_vol < 10_000_000:
             continue
-        # Wider 24h range: allow up to 30% (fresh pumps can be high)
-        if change < 2 or change > 30:
+        # Widened: catch fresh pumps AND allow coins that already ran
+        if change < 1 or change > 50:
             continue
         candidates.append({
             "symbol": symbol,
@@ -116,69 +116,74 @@ def check_depth(symbol, price):
         return 0, 0
 
 def check_signal(symbol, price):
+    reasons = []
     try:
         url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
         r = requests.get(url, timeout=10)
         klines = r.json()
         if not isinstance(klines, list) or len(klines) < 21:
-            return None
+            return None, ["not enough klines"]
 
-        # Volume filter
+        # Volume spike
         volumes = [float(k[5]) for k in klines[:-1]]
         avg = sum(volumes[-20:]) / 20
         current_vol = float(klines[-1][5])
         if avg == 0:
-            return None
+            return None, ["avg vol zero"]
         vol_ratio = current_vol / avg
         if vol_ratio < 4:
-            return None
+            reasons.append(f"vol {vol_ratio:.1f}x < 4x")
 
         # Green candle
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
         if current_close <= current_open:
-            return None
+            reasons.append("candle red")
 
-        # 1h change (4 candles back)
+        # 1h change: widened to 1-40%
         if len(klines) >= 5:
             price_1h_ago = float(klines[-5][4])
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         else:
             change_1h = 0
-        # 1h change must be positive and not exhausted
-        if change_1h < 1 or change_1h > 20:
-            return None
+        if change_1h < 0.5 or change_1h > 40:
+            reasons.append(f"1h {change_1h:.1f}% out of range")
 
-        # 4h change (16 candles back)
+        # 4h change: widened to 60%
         if len(klines) >= 17:
             price_4h_ago = float(klines[-17][4])
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         else:
             change_4h = 0
-        if change_4h > 40:
-            return None
+        if change_4h > 60:
+            reasons.append(f"4h {change_4h:.1f}% > 60%")
 
-        # RSI check (bot-side, under 75)
+        # RSI under 72 (slight bump up from 70)
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
-        if rsi > 75:
-            return None
+        if rsi > 72:
+            reasons.append(f"RSI {rsi:.1f} > 72")
 
-        # Taker buy %
+        # Taker buy
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
-            return None
-        taker_buy_pct = taker_buy / total_vol
-        if taker_buy_pct < 0.55:
-            return None
+            reasons.append("total vol zero")
+        taker_buy_pct = taker_buy / total_vol if total_vol else 0
+        if taker_buy_pct < 0.52:
+            reasons.append(f"taker {taker_buy_pct*100:.1f}% < 52%")
 
-        # Depth
+        # Depth: $50k both sides
         bid_depth, ask_depth = check_depth(symbol, price)
-        if bid_depth < 20000 or ask_depth < 20000:
-            return None
-        if bid_depth / ask_depth < 0.7:
-            return None
+        if bid_depth < 50_000:
+            reasons.append(f"bid ${bid_depth:,.0f} < $50k")
+        if ask_depth < 50_000:
+            reasons.append(f"ask ${ask_depth:,.0f} < $50k")
+        if ask_depth > 0 and bid_depth / ask_depth < 0.6:
+            reasons.append(f"bid/ask {bid_depth/ask_depth:.2f} < 0.6")
+
+        if reasons:
+            return None, reasons
 
         return {
             "vol_ratio": vol_ratio,
@@ -188,22 +193,29 @@ def check_signal(symbol, price):
             "change_1h": change_1h,
             "change_4h": change_4h,
             "rsi": rsi,
-        }
-    except Exception:
-        return None
+        }, []
+    except Exception as e:
+        return None, [f"exception {e}"]
 
 def scan():
     candidates = get_candidates()
     print(f"Candidates after filter: {len(candidates)}")
     hits = []
+    rejection_summary = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(check_signal, c["symbol"], c["price"]): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
-            result = future.result()
+            result, reasons = future.result()
             if result:
                 c.update(result)
                 hits.append(c)
+            else:
+                # Log top rejection reason
+                if reasons:
+                    top = reasons[0].split()[0]
+                    rejection_summary[top] = rejection_summary.get(top, 0) + 1
+    print(f"Rejection reasons: {rejection_summary}")
     return hits
 
 def main():
@@ -212,8 +224,11 @@ def main():
     hits = scan()
     print(f"Found {len(hits)} hits")
     for h in hits:
+        # Flag best sessions
+        hour = ist.hour
+        session = "Asia" if 5 <= hour < 12 else "Europe" if 12 <= hour < 18 else "US"
         msg = (
-            f"🚨 <b>VOLUME BREAKOUT</b>\n\n"
+            f"🚨 <b>VOLUME BREAKOUT</b> [{session}]\n\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
