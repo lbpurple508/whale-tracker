@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-FAPI = "https://fapi.binance.com"
+BYBIT = "https://api.bybit.com"
 COOLDOWN_FILE = Path("futures_cooldown.json")
 COOLDOWN_MINUTES = 60
 
@@ -75,30 +75,18 @@ def save_cooldown(data):
     except Exception as e:
         print(f"cooldown save error: {e}")
 
-def safe_json(r):
-    """Return parsed JSON or None if not valid."""
-    try:
-        data = r.json()
-        if isinstance(data, dict) and "code" in data:
-            print(f"API error: {data}")
-            return None
-        return data
-    except Exception as e:
-        print(f"JSON parse error: {e}")
-        return None
-
 def get_futures_candidates():
+    """Get all USDT perpetual tickers from Bybit."""
     try:
-        url = f"{FAPI}/fapi/v1/ticker/24hr"
+        url = f"{BYBIT}/v5/market/tickers?category=linear"
         r = requests.get(url, timeout=20)
-        data = safe_json(r)
-        if not isinstance(data, list):
-            print(f"Unexpected ticker response type: {type(data)}")
+        data = r.json()
+        tickers = data.get("result", {}).get("list", [])
+        if not isinstance(tickers, list):
+            print(f"Unexpected response: {data}")
             return []
         candidates = []
-        for t in data:
-            if not isinstance(t, dict):
-                continue
+        for t in tickers:
             symbol = t.get("symbol", "")
             if not symbol.endswith("USDT"):
                 continue
@@ -107,8 +95,8 @@ def get_futures_candidates():
             if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
                 continue
             try:
-                quote_vol = float(t.get("quoteVolume", 0))
-                change = float(t.get("priceChangePercent", 0))
+                quote_vol = float(t.get("turnover24h", 0))
+                change = float(t.get("price24hPcnt", 0)) * 100  # decimal to %
                 price = float(t.get("lastPrice", 0))
             except (KeyError, ValueError, TypeError):
                 continue
@@ -129,63 +117,74 @@ def get_futures_candidates():
         print(f"get_futures_candidates error: {e}")
         return []
 
-def get_oi_history(symbol, period="5m", limit=13):
+def get_oi_history(symbol, interval="5min", limit=13):
+    """Bybit open interest history."""
     try:
-        url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
+        url = f"{BYBIT}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit={limit}"
         r = requests.get(url, timeout=10)
-        data = safe_json(r)
-        if not isinstance(data, list):
+        data = r.json()
+        result = data.get("result", {})
+        oi_list = result.get("list", [])
+        if not isinstance(oi_list, list):
             return []
-        return data
+        # Bybit returns newest first, reverse to oldest first
+        return list(reversed(oi_list))
     except Exception:
         return []
 
 def get_funding_rate(symbol):
+    """Bybit funding rate."""
     try:
-        url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
+        url = f"{BYBIT}/v5/market/tickers?category=linear&symbol={symbol}"
         r = requests.get(url, timeout=10)
-        data = safe_json(r)
-        if not isinstance(data, dict):
+        data = r.json()
+        tickers = data.get("result", {}).get("list", [])
+        if not tickers:
             return 0
-        return float(data.get("lastFundingRate", 0))
+        return float(tickers[0].get("fundingRate", 0))
     except Exception:
         return 0
 
 def get_top_trader_ratio(symbol):
+    """Bybit long/short account ratio."""
     try:
-        url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
+        url = f"{BYBIT}/v5/market/account-ratio?category=linear&symbol={symbol}&period=5min&limit=1"
         r = requests.get(url, timeout=10)
-        data = safe_json(r)
-        if not isinstance(data, list) or len(data) == 0:
+        data = r.json()
+        ratios = data.get("result", {}).get("list", [])
+        if not ratios:
             return 1
-        return float(data[-1].get("longShortRatio", 1))
+        return float(ratios[0].get("buyRatio", 0.5)) / max(float(ratios[0].get("sellRatio", 0.5)), 0.01)
     except Exception:
         return 1
 
 def check_pre_pump(symbol, price):
     reasons = []
     try:
-        oi_data = get_oi_history(symbol, "5m", 13)
+        oi_data = get_oi_history(symbol, "5min", 13)
         if not oi_data or len(oi_data) < 6:
             return None, ["no oi data"]
 
         try:
-            current_oi = float(oi_data[-1]["sumOpenInterestValue"])
-            oi_15m_ago = float(oi_data[-4]["sumOpenInterestValue"])
-            oi_1h_ago = float(oi_data[0]["sumOpenInterestValue"])
+            # Bybit OI value field: openInterest (in coins). Multiply by price for USD.
+            current_oi_raw = float(oi_data[-1].get("openInterest", 0))
+            oi_15m_ago_raw = float(oi_data[-4].get("openInterest", 0))
+            oi_1h_ago_raw = float(oi_data[0].get("openInterest", 0))
         except (KeyError, ValueError, IndexError):
             return None, ["oi parse error"]
 
-        if oi_15m_ago == 0 or oi_1h_ago == 0:
+        if oi_15m_ago_raw == 0 or oi_1h_ago_raw == 0:
             return None, ["oi zero"]
 
-        oi_15m_change = ((current_oi - oi_15m_ago) / oi_15m_ago) * 100
-        oi_1h_change = ((current_oi - oi_1h_ago) / oi_1h_ago) * 100
+        oi_15m_change = ((current_oi_raw - oi_15m_ago_raw) / oi_15m_ago_raw) * 100
+        oi_1h_change = ((current_oi_raw - oi_1h_ago_raw) / oi_1h_ago_raw) * 100
+        oi_value_usd = current_oi_raw * price
 
         if oi_15m_change < 5 and oi_1h_change < 10:
             reasons.append(f"oi_flat")
 
         funding = get_funding_rate(symbol)
+        # Bybit funding rate is per 8h. Positive high = longs crowded. Negative = shorts trapped (good).
         if funding > 0.001:
             reasons.append(f"funding_high")
 
@@ -199,7 +198,7 @@ def check_pre_pump(symbol, price):
         return {
             "oi_15m_change": oi_15m_change,
             "oi_1h_change": oi_1h_change,
-            "oi_value": current_oi,
+            "oi_value": oi_value_usd,
             "funding": funding,
             "ls_ratio": ls_ratio,
         }, []
