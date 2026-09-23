@@ -157,14 +157,16 @@ def check_signal(symbol, price, session):
         # Session-specific rules
         if session == "US":
             vol_min = 6
+            rsi_min = 55
             rsi_max = 70
             taker_min = 0.65
-            depth_min = 40_000
+            depth_min = 60_000
         else:
             vol_min = 5
-            rsi_max = 75
+            rsi_min = 55
+            rsi_max = 72
             taker_min = 0.60
-            depth_min = 30_000
+            depth_min = 75_000
 
         # Volume: current or previous candle
         volumes = [float(k[5]) for k in klines[:-2]]
@@ -198,20 +200,24 @@ def check_signal(symbol, price, session):
         if change_1h < 0.5 or change_1h > 60:
             reasons.append(f"1h {change_1h:.1f}%")
 
-        # 4h change
+        # 4h change — MUST BE POSITIVE (new fix)
         if len(klines) >= 17:
             price_4h_ago = float(klines[-17][4])
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         else:
             change_4h = 0
+        if change_4h < 0:
+            reasons.append(f"4h_neg {change_4h:.1f}%")
         if change_4h > 80:
-            reasons.append(f"4h {change_4h:.1f}%")
+            reasons.append(f"4h_high {change_4h:.1f}%")
 
-        # RSI
+        # RSI — minimum 55, maximum session-based (new fix)
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
+        if rsi < rsi_min:
+            reasons.append(f"RSI_low {rsi:.1f}")
         if rsi > rsi_max:
-            reasons.append(f"RSI {rsi:.1f}")
+            reasons.append(f"RSI_high {rsi:.1f}")
 
         # Taker Buy
         total_vol = float(klines[-1][5])
@@ -222,12 +228,12 @@ def check_signal(symbol, price, session):
         if taker_buy_pct < taker_min:
             reasons.append(f"taker {taker_buy_pct*100:.1f}%")
 
-        # Depth
+        # Depth — raised to $75k (Asia/Europe) or $60k (US)
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < depth_min:
-            reasons.append(f"bid ${bid_depth:,.0f}")
+            reasons.append(f"bid_thin ${bid_depth:,.0f}")
         if ask_depth < depth_min:
-            reasons.append(f"ask ${ask_depth:,.0f}")
+            reasons.append(f"ask_thin ${ask_depth:,.0f}")
         if ask_depth > 0 and bid_depth / ask_depth < 0.6:
             reasons.append("bid/ask")
 
@@ -265,7 +271,7 @@ def scan(session):
                 hits.append(c)
             else:
                 if reasons:
-                    top = reasons[0].split()[0]
+                    top = reasons[0].split()[0] if reasons[0] else "unknown"
                     rejection_summary[top] = rejection_summary.get(top, 0) + 1
     print(f"Rejection reasons: {rejection_summary}")
     now = datetime.utcnow()
@@ -275,21 +281,18 @@ def scan(session):
     return hits
 
 def is_active_session(hour, minute):
-    # Asia: 5:30 AM - 11:30 AM IST
     if hour == 5 and minute >= 30:
         return True, "Asia"
     if 6 <= hour <= 10:
         return True, "Asia"
     if hour == 11 and minute < 30:
         return True, "Asia"
-    # Europe: 12:30 PM - 3:30 PM IST
     if hour == 12 and minute >= 30:
         return True, "Europe"
     if 13 <= hour <= 14:
         return True, "Europe"
     if hour == 15 and minute < 30:
         return True, "Europe"
-    # US: 6:30 PM - 9:30 PM IST (tighter rules apply)
     if hour == 18 and minute >= 30:
         return True, "US"
     if 19 <= hour <= 20:
