@@ -1,0 +1,35 @@
+name: Futures Pre-Pump Scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Restore futures cooldown
+        uses: actions/cache/restore@v4
+        with:
+          path: futures_cooldown.json
+          key: futures-cooldown-${{ github.run_id }}
+          restore-keys: |
+            futures-cooldown-
+      - name: Run futures scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python futures_scanner.py
+      - name: Save futures cooldown
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: futures_cooldown.json
+          key: futures-cooldown-${{ github.run_id }}
