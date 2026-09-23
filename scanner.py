@@ -100,7 +100,8 @@ def get_candidates():
             continue
         if quote_vol < 10_000_000:
             continue
-        if change < 1 or change > 50:
+        # Widened: 1-80% (was 1-50%)
+        if change < 1 or change > 80:
             continue
         if price > 1.00:
             continue
@@ -154,49 +155,63 @@ def check_signal(symbol, price):
         if not isinstance(klines, list) or len(klines) < 21:
             return None, ["not enough klines"]
 
-        volumes = [float(k[5]) for k in klines[:-1]]
-        avg = sum(volumes[-20:]) / 20
+        # Volume: check CURRENT or PREVIOUS candle for spike
+        volumes = [float(k[5]) for k in klines[:-2]]
+        avg = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes)
         current_vol = float(klines[-1][5])
+        prev_vol = float(klines[-2][5])
         if avg == 0:
             return None, ["avg vol zero"]
-        vol_ratio = current_vol / avg
-        if vol_ratio < 4:
+        current_ratio = current_vol / avg
+        prev_ratio = prev_vol / avg
+        vol_ratio = max(current_ratio, prev_ratio)
+        if vol_ratio < 5:
             reasons.append(f"vol {vol_ratio:.1f}x")
 
+        # Green candle: current OR previous
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
-        if current_close <= current_open:
-            reasons.append("candle red")
+        prev_open = float(klines[-2][1])
+        prev_close = float(klines[-2][4])
+        current_green = current_close > current_open
+        prev_green = prev_close > prev_open
+        if not (current_green or prev_green):
+            reasons.append("both candles red")
 
+        # 1h change: widened to 0.5-60%
         if len(klines) >= 5:
             price_1h_ago = float(klines[-5][4])
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         else:
             change_1h = 0
-        if change_1h < 0.5 or change_1h > 40:
+        if change_1h < 0.5 or change_1h > 60:
             reasons.append(f"1h {change_1h:.1f}%")
 
+        # 4h change: 80%
         if len(klines) >= 17:
             price_4h_ago = float(klines[-17][4])
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         else:
             change_4h = 0
-        if change_4h > 60:
+        if change_4h > 80:
             reasons.append(f"4h {change_4h:.1f}%")
 
+        # RSI under 72
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
         if rsi > 72:
             reasons.append(f"RSI {rsi:.1f}")
 
+        # Taker Buy 60%+
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
             reasons.append("vol zero")
         taker_buy_pct = taker_buy / total_vol if total_vol else 0
-        if taker_buy_pct < 0.58:
+        if taker_buy_pct < 0.60:
             reasons.append(f"taker {taker_buy_pct*100:.1f}%")
 
+        # Depth $50k
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < 50_000:
             reasons.append(f"bid ${bid_depth:,.0f}")
@@ -249,14 +264,12 @@ def scan():
     return hits
 
 def is_active_session(hour, minute):
-    # Asia: 5:30 AM - 11:30 AM IST
     if hour == 5 and minute >= 30:
         return True, "Asia"
     if 6 <= hour <= 10:
         return True, "Asia"
     if hour == 11 and minute < 30:
         return True, "Asia"
-    # Europe: 12:30 PM - 3:30 PM IST
     if hour == 12 and minute >= 30:
         return True, "Europe"
     if 13 <= hour <= 14:
@@ -269,11 +282,11 @@ def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     active, session = is_active_session(ist.hour, ist.minute)
     print(f"Scanner starting at {ist} IST — Session: {session} — Active: {active}")
-    
+
     if not active:
-        print("Outside fresh cycle window (Asia 5:30-11:30, Europe 12:30-15:30). Skipping.")
+        print("Outside fresh cycle window. Skipping.")
         return
-    
+
     hits = scan()
     print(f"Found {len(hits)} hits")
     for h in hits:
