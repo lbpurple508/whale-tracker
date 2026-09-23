@@ -8,9 +8,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BYBIT = "https://api.bybit.com"
+FAPI = "https://fapi.binance.com"
 COOLDOWN_FILE = Path("futures_cooldown.json")
 COOLDOWN_MINUTES = 60
+
+# Webshare proxy (Japan - bypasses Binance US block)
+PROXY_URL = "http://kwwlofiq:gmc73r98yj48@142.111.67.146:5611"
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL}
 
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -75,122 +79,112 @@ def save_cooldown(data):
     except Exception as e:
         print(f"cooldown save error: {e}")
 
-def get_futures_candidates():
-    """Get all USDT perpetual tickers from Bybit."""
+def safe_get(url, timeout=15):
+    """GET through the proxy."""
     try:
-        url = f"{BYBIT}/v5/market/tickers?category=linear"
-        r = requests.get(url, timeout=20)
-        data = r.json()
-        tickers = data.get("result", {}).get("list", [])
-        if not isinstance(tickers, list):
-            print(f"Unexpected response: {data}")
-            return []
-        candidates = []
-        for t in tickers:
-            symbol = t.get("symbol", "")
-            if not symbol.endswith("USDT"):
-                continue
-            if symbol in MAJORS or symbol in BLACKLIST:
-                continue
-            if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
-                continue
-            try:
-                quote_vol = float(t.get("turnover24h", 0))
-                change = float(t.get("price24hPcnt", 0)) * 100  # decimal to %
-                price = float(t.get("lastPrice", 0))
-            except (KeyError, ValueError, TypeError):
-                continue
-            if quote_vol < 10_000_000:
-                continue
-            if price > 1.00 or price <= 0:
-                continue
-            if abs(change) > 5:
-                continue
-            candidates.append({
-                "symbol": symbol,
-                "price": price,
-                "change_24h": change,
-                "quote_vol": quote_vol,
-            })
-        return candidates
+        r = requests.get(url, proxies=PROXIES, timeout=timeout)
+        if r.status_code == 451:
+            print(f"451 blocked: {url}")
+            return None
+        try:
+            return r.json()
+        except Exception:
+            print(f"JSON parse fail: {r.text[:150]}")
+            return None
     except Exception as e:
-        print(f"get_futures_candidates error: {e}")
-        return []
+        print(f"Request error: {e}")
+        return None
 
-def get_oi_history(symbol, interval="5min", limit=13):
-    """Bybit open interest history."""
-    try:
-        url = f"{BYBIT}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit={limit}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        result = data.get("result", {})
-        oi_list = result.get("list", [])
-        if not isinstance(oi_list, list):
-            return []
-        # Bybit returns newest first, reverse to oldest first
-        return list(reversed(oi_list))
-    except Exception:
+def get_futures_candidates():
+    data = safe_get(f"{FAPI}/fapi/v1/ticker/24hr")
+    if not isinstance(data, list):
+        print(f"Ticker response invalid: {type(data)}")
         return []
+    candidates = []
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        symbol = t.get("symbol", "")
+        if not symbol.endswith("USDT"):
+            continue
+        if symbol in MAJORS or symbol in BLACKLIST:
+            continue
+        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
+            continue
+        try:
+            quote_vol = float(t.get("quoteVolume", 0))
+            change = float(t.get("priceChangePercent", 0))
+            price = float(t.get("lastPrice", 0))
+        except (KeyError, ValueError, TypeError):
+            continue
+        if quote_vol < 10_000_000:
+            continue
+        if price > 1.00 or price <= 0:
+            continue
+        if abs(change) > 5:
+            continue
+        candidates.append({
+            "symbol": symbol,
+            "price": price,
+            "change_24h": change,
+            "quote_vol": quote_vol,
+        })
+    return candidates
+
+def get_oi_history(symbol, period="5m", limit=13):
+    data = safe_get(f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}")
+    if not isinstance(data, list):
+        return []
+    return data
 
 def get_funding_rate(symbol):
-    """Bybit funding rate."""
+    data = safe_get(f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}")
+    if not isinstance(data, dict):
+        return 0
     try:
-        url = f"{BYBIT}/v5/market/tickers?category=linear&symbol={symbol}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        tickers = data.get("result", {}).get("list", [])
-        if not tickers:
-            return 0
-        return float(tickers[0].get("fundingRate", 0))
+        return float(data.get("lastFundingRate", 0))
     except Exception:
         return 0
 
 def get_top_trader_ratio(symbol):
-    """Bybit long/short account ratio."""
+    data = safe_get(f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1")
+    if not isinstance(data, list) or not data:
+        return 1
     try:
-        url = f"{BYBIT}/v5/market/account-ratio?category=linear&symbol={symbol}&period=5min&limit=1"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        ratios = data.get("result", {}).get("list", [])
-        if not ratios:
-            return 1
-        return float(ratios[0].get("buyRatio", 0.5)) / max(float(ratios[0].get("sellRatio", 0.5)), 0.01)
+        return float(data[-1].get("longShortRatio", 1))
     except Exception:
         return 1
 
 def check_pre_pump(symbol, price):
     reasons = []
     try:
-        oi_data = get_oi_history(symbol, "5min", 13)
+        oi_data = get_oi_history(symbol, "5m", 13)
         if not oi_data or len(oi_data) < 6:
-            return None, ["no oi data"]
+            return None, ["no_oi"]
 
         try:
-            # Bybit OI value field: openInterest (in coins). Multiply by price for USD.
-            current_oi_raw = float(oi_data[-1].get("openInterest", 0))
-            oi_15m_ago_raw = float(oi_data[-4].get("openInterest", 0))
-            oi_1h_ago_raw = float(oi_data[0].get("openInterest", 0))
+            current_oi = float(oi_data[-1]["sumOpenInterestValue"])
+            oi_15m_ago = float(oi_data[-4]["sumOpenInterestValue"])
+            oi_1h_ago = float(oi_data[0]["sumOpenInterestValue"])
         except (KeyError, ValueError, IndexError):
-            return None, ["oi parse error"]
+            return None, ["oi_parse"]
 
-        if oi_15m_ago_raw == 0 or oi_1h_ago_raw == 0:
-            return None, ["oi zero"]
+        if oi_15m_ago == 0 or oi_1h_ago == 0:
+            return None, ["oi_zero"]
 
-        oi_15m_change = ((current_oi_raw - oi_15m_ago_raw) / oi_15m_ago_raw) * 100
-        oi_1h_change = ((current_oi_raw - oi_1h_ago_raw) / oi_1h_ago_raw) * 100
-        oi_value_usd = current_oi_raw * price
+        oi_15m_change = ((current_oi - oi_15m_ago) / oi_15m_ago) * 100
+        oi_1h_change = ((current_oi - oi_1h_ago) / oi_1h_ago) * 100
 
         if oi_15m_change < 5 and oi_1h_change < 10:
-            reasons.append(f"oi_flat")
+            reasons.append("oi_flat")
 
         funding = get_funding_rate(symbol)
-        # Bybit funding rate is per 8h. Positive high = longs crowded. Negative = shorts trapped (good).
         if funding > 0.001:
-            reasons.append(f"funding_high")
+            reasons.append("funding_high")
 
         ls_ratio = get_top_trader_ratio(symbol)
         if ls_ratio < 1.2:
-            reasons.append(f"ls_low")
+            reasons.append("ls_low")
 
         if reasons:
             return None, reasons
@@ -198,12 +192,12 @@ def check_pre_pump(symbol, price):
         return {
             "oi_15m_change": oi_15m_change,
             "oi_1h_change": oi_1h_change,
-            "oi_value": oi_value_usd,
+            "oi_value": current_oi,
             "funding": funding,
             "ls_ratio": ls_ratio,
         }, []
     except Exception as e:
-        return None, [f"exception {e}"]
+        return None, [f"exception_{e}"]
 
 def is_active_session(hour, minute):
     if hour == 5:
@@ -239,7 +233,7 @@ def main():
     print(f"Futures candidates: {len(candidates)}")
 
     if not candidates:
-        print("No candidates. Exiting cleanly.")
+        print("No candidates. Exiting.")
         return
 
     cooldown = load_cooldown()
@@ -247,7 +241,7 @@ def main():
 
     hits = []
     rejection = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(check_pre_pump, c["symbol"], c["price"]): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
@@ -259,7 +253,7 @@ def main():
                 hits.append(c)
             else:
                 if reasons:
-                    top = reasons[0].split()[0] if reasons[0] else "unknown"
+                    top = reasons[0].split("_")[0]
                     rejection[top] = rejection.get(top, 0) + 1
 
     print(f"Rejection reasons: {rejection}")
