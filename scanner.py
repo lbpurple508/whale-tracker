@@ -100,7 +100,6 @@ def get_candidates():
             continue
         if quote_vol < 10_000_000:
             continue
-        # Widened: 1-80% (was 1-50%)
         if change < 1 or change > 80:
             continue
         if price > 1.00:
@@ -146,7 +145,7 @@ def check_depth(symbol, price):
     except Exception:
         return 0, 0
 
-def check_signal(symbol, price):
+def check_signal(symbol, price, session):
     reasons = []
     try:
         url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
@@ -155,7 +154,19 @@ def check_signal(symbol, price):
         if not isinstance(klines, list) or len(klines) < 21:
             return None, ["not enough klines"]
 
-        # Volume: check CURRENT or PREVIOUS candle for spike
+        # Session-specific rules
+        if session == "US":
+            vol_min = 6
+            rsi_max = 70
+            taker_min = 0.65
+            depth_min = 40_000
+        else:
+            vol_min = 5
+            rsi_max = 75
+            taker_min = 0.60
+            depth_min = 30_000
+
+        # Volume: current or previous candle
         volumes = [float(k[5]) for k in klines[:-2]]
         avg = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes)
         current_vol = float(klines[-1][5])
@@ -165,7 +176,7 @@ def check_signal(symbol, price):
         current_ratio = current_vol / avg
         prev_ratio = prev_vol / avg
         vol_ratio = max(current_ratio, prev_ratio)
-        if vol_ratio < 5:
+        if vol_ratio < vol_min:
             reasons.append(f"vol {vol_ratio:.1f}x")
 
         # Green candle: current OR previous
@@ -176,9 +187,9 @@ def check_signal(symbol, price):
         current_green = current_close > current_open
         prev_green = prev_close > prev_open
         if not (current_green or prev_green):
-            reasons.append("both candles red")
+            reasons.append("both red")
 
-        # 1h change: widened to 0.5-60%
+        # 1h change
         if len(klines) >= 5:
             price_1h_ago = float(klines[-5][4])
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
@@ -187,7 +198,7 @@ def check_signal(symbol, price):
         if change_1h < 0.5 or change_1h > 60:
             reasons.append(f"1h {change_1h:.1f}%")
 
-        # 4h change: 80%
+        # 4h change
         if len(klines) >= 17:
             price_4h_ago = float(klines[-17][4])
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
@@ -196,26 +207,26 @@ def check_signal(symbol, price):
         if change_4h > 80:
             reasons.append(f"4h {change_4h:.1f}%")
 
-        # RSI under 72
+        # RSI
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
-        if rsi > 72:
+        if rsi > rsi_max:
             reasons.append(f"RSI {rsi:.1f}")
 
-        # Taker Buy 60%+
+        # Taker Buy
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
             reasons.append("vol zero")
         taker_buy_pct = taker_buy / total_vol if total_vol else 0
-        if taker_buy_pct < 0.60:
+        if taker_buy_pct < taker_min:
             reasons.append(f"taker {taker_buy_pct*100:.1f}%")
 
-        # Depth $50k
+        # Depth
         bid_depth, ask_depth = check_depth(symbol, price)
-        if bid_depth < 50_000:
+        if bid_depth < depth_min:
             reasons.append(f"bid ${bid_depth:,.0f}")
-        if ask_depth < 50_000:
+        if ask_depth < depth_min:
             reasons.append(f"ask ${ask_depth:,.0f}")
         if ask_depth > 0 and bid_depth / ask_depth < 0.6:
             reasons.append("bid/ask")
@@ -235,7 +246,7 @@ def check_signal(symbol, price):
     except Exception as e:
         return None, [f"exception {e}"]
 
-def scan():
+def scan(session):
     candidates = get_candidates()
     print(f"Candidates after filter: {len(candidates)}")
     cooldown = load_cooldown()
@@ -243,7 +254,7 @@ def scan():
     hits = []
     rejection_summary = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(check_signal, c["symbol"], c["price"]): c for c in candidates}
+        futures = {executor.submit(check_signal, c["symbol"], c["price"], session): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
             if c["symbol"] in cooldown:
@@ -264,18 +275,27 @@ def scan():
     return hits
 
 def is_active_session(hour, minute):
+    # Asia: 5:30 AM - 11:30 AM IST
     if hour == 5 and minute >= 30:
         return True, "Asia"
     if 6 <= hour <= 10:
         return True, "Asia"
     if hour == 11 and minute < 30:
         return True, "Asia"
+    # Europe: 12:30 PM - 3:30 PM IST
     if hour == 12 and minute >= 30:
         return True, "Europe"
     if 13 <= hour <= 14:
         return True, "Europe"
     if hour == 15 and minute < 30:
         return True, "Europe"
+    # US: 6:30 PM - 9:30 PM IST (tighter rules apply)
+    if hour == 18 and minute >= 30:
+        return True, "US"
+    if 19 <= hour <= 20:
+        return True, "US"
+    if hour == 21 and minute < 30:
+        return True, "US"
     return False, "Off-hours"
 
 def main():
@@ -287,7 +307,7 @@ def main():
         print("Outside fresh cycle window. Skipping.")
         return
 
-    hits = scan()
+    hits = scan(session)
     print(f"Found {len(hits)} hits")
     for h in hits:
         msg = (
