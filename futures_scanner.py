@@ -75,45 +75,68 @@ def save_cooldown(data):
     except Exception as e:
         print(f"cooldown save error: {e}")
 
+def safe_json(r):
+    """Return parsed JSON or None if not valid."""
+    try:
+        data = r.json()
+        if isinstance(data, dict) and "code" in data:
+            print(f"API error: {data}")
+            return None
+        return data
+    except Exception as e:
+        print(f"JSON parse error: {e}")
+        return None
+
 def get_futures_candidates():
-    url = f"{FAPI}/fapi/v1/ticker/24hr"
-    r = requests.get(url, timeout=20)
-    tickers = r.json()
-    candidates = []
-    for t in tickers:
-        symbol = t.get("symbol", "")
-        if not symbol.endswith("USDT"):
-            continue
-        if symbol in MAJORS or symbol in BLACKLIST:
-            continue
-        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
-            continue
-        try:
-            quote_vol = float(t["quoteVolume"])
-            change = float(t["priceChangePercent"])
-            price = float(t["lastPrice"])
-        except (KeyError, ValueError):
-            continue
-        if quote_vol < 10_000_000:
-            continue
-        if price > 1.00:
-            continue
-        # Pre-pump: price should be FLAT (under 5% move)
-        if abs(change) > 5:
-            continue
-        candidates.append({
-            "symbol": symbol,
-            "price": price,
-            "change_24h": change,
-            "quote_vol": quote_vol,
-        })
-    return candidates
+    try:
+        url = f"{FAPI}/fapi/v1/ticker/24hr"
+        r = requests.get(url, timeout=20)
+        data = safe_json(r)
+        if not isinstance(data, list):
+            print(f"Unexpected ticker response type: {type(data)}")
+            return []
+        candidates = []
+        for t in data:
+            if not isinstance(t, dict):
+                continue
+            symbol = t.get("symbol", "")
+            if not symbol.endswith("USDT"):
+                continue
+            if symbol in MAJORS or symbol in BLACKLIST:
+                continue
+            if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
+                continue
+            try:
+                quote_vol = float(t.get("quoteVolume", 0))
+                change = float(t.get("priceChangePercent", 0))
+                price = float(t.get("lastPrice", 0))
+            except (KeyError, ValueError, TypeError):
+                continue
+            if quote_vol < 10_000_000:
+                continue
+            if price > 1.00 or price <= 0:
+                continue
+            if abs(change) > 5:
+                continue
+            candidates.append({
+                "symbol": symbol,
+                "price": price,
+                "change_24h": change,
+                "quote_vol": quote_vol,
+            })
+        return candidates
+    except Exception as e:
+        print(f"get_futures_candidates error: {e}")
+        return []
 
 def get_oi_history(symbol, period="5m", limit=13):
     try:
         url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
         r = requests.get(url, timeout=10)
-        return r.json()
+        data = safe_json(r)
+        if not isinstance(data, list):
+            return []
+        return data
     except Exception:
         return []
 
@@ -121,7 +144,9 @@ def get_funding_rate(symbol):
     try:
         url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
         r = requests.get(url, timeout=10)
-        data = r.json()
+        data = safe_json(r)
+        if not isinstance(data, dict):
+            return 0
         return float(data.get("lastFundingRate", 0))
     except Exception:
         return 0
@@ -130,12 +155,12 @@ def get_top_trader_ratio(symbol):
     try:
         url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
         r = requests.get(url, timeout=10)
-        data = r.json()
-        if data and len(data) > 0:
-            return float(data[-1].get("longShortRatio", 1))
+        data = safe_json(r)
+        if not isinstance(data, list) or len(data) == 0:
+            return 1
+        return float(data[-1].get("longShortRatio", 1))
     except Exception:
-        pass
-    return 1
+        return 1
 
 def check_pre_pump(symbol, price):
     reasons = []
@@ -144,9 +169,12 @@ def check_pre_pump(symbol, price):
         if not oi_data or len(oi_data) < 6:
             return None, ["no oi data"]
 
-        current_oi = float(oi_data[-1]["sumOpenInterestValue"])
-        oi_15m_ago = float(oi_data[-4]["sumOpenInterestValue"])
-        oi_1h_ago = float(oi_data[0]["sumOpenInterestValue"])
+        try:
+            current_oi = float(oi_data[-1]["sumOpenInterestValue"])
+            oi_15m_ago = float(oi_data[-4]["sumOpenInterestValue"])
+            oi_1h_ago = float(oi_data[0]["sumOpenInterestValue"])
+        except (KeyError, ValueError, IndexError):
+            return None, ["oi parse error"]
 
         if oi_15m_ago == 0 or oi_1h_ago == 0:
             return None, ["oi zero"]
@@ -154,19 +182,16 @@ def check_pre_pump(symbol, price):
         oi_15m_change = ((current_oi - oi_15m_ago) / oi_15m_ago) * 100
         oi_1h_change = ((current_oi - oi_1h_ago) / oi_1h_ago) * 100
 
-        # Require OI spike
         if oi_15m_change < 5 and oi_1h_change < 10:
-            reasons.append(f"oi15m{oi_15m_change:.1f}%1h{oi_1h_change:.1f}%")
+            reasons.append(f"oi_flat")
 
-        # Funding rate (negative or low = shorts trapped)
         funding = get_funding_rate(symbol)
         if funding > 0.001:
-            reasons.append(f"funding{funding*100:.3f}%")
+            reasons.append(f"funding_high")
 
-        # Top trader ratio
         ls_ratio = get_top_trader_ratio(symbol)
         if ls_ratio < 1.2:
-            reasons.append(f"ls{ls_ratio:.2f}")
+            reasons.append(f"ls_low")
 
         if reasons:
             return None, reasons
@@ -182,22 +207,18 @@ def check_pre_pump(symbol, price):
         return None, [f"exception {e}"]
 
 def is_active_session(hour, minute):
-    # Pre-pump detection: run a bit earlier than spot scanner
-    # Asia: 5:00-11:30 AM
     if hour == 5:
         return True, "Asia"
     if 6 <= hour <= 10:
         return True, "Asia"
     if hour == 11 and minute < 30:
         return True, "Asia"
-    # Europe: 12:00-3:30 PM
     if hour == 12:
         return True, "Europe"
     if 13 <= hour <= 14:
         return True, "Europe"
     if hour == 15 and minute < 30:
         return True, "Europe"
-    # US: 6:00-9:30 PM
     if hour == 18:
         return True, "US"
     if 19 <= hour <= 20:
@@ -218,6 +239,10 @@ def main():
     candidates = get_futures_candidates()
     print(f"Futures candidates: {len(candidates)}")
 
+    if not candidates:
+        print("No candidates. Exiting cleanly.")
+        return
+
     cooldown = load_cooldown()
     print(f"Cooldown: {list(cooldown.keys())}")
 
@@ -235,7 +260,7 @@ def main():
                 hits.append(c)
             else:
                 if reasons:
-                    top = reasons[0].split()[0]
+                    top = reasons[0].split()[0] if reasons[0] else "unknown"
                     rejection[top] = rejection.get(top, 0) + 1
 
     print(f"Rejection reasons: {rejection}")
