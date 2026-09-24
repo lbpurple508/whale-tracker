@@ -97,8 +97,38 @@ def safe_get(url, timeout=15, use_proxy=True):
         print(f"Request error: {e}")
         return None
 
+def btc_is_healthy():
+    """FIX 1: Block all alerts if BTC dumping >2% in 1h."""
+    try:
+        url = f"{SPOT_API}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 2:
+            return True
+        current_close = float(data[-1][4])
+        prev_close = float(data[-2][4])
+        if prev_close == 0:
+            return True
+        change = ((current_close - prev_close) / prev_close) * 100
+        print(f"BTC 1h change: {change:.2f}%")
+        return change > -2
+    except Exception as e:
+        print(f"BTC check error: {e}")
+        return True
+
+def build_execution_plan(price):
+    """FIX 2: Calculate entry, stop, TP1, TP2 for spot entry."""
+    stop = price * 0.97
+    tp1 = price * 1.05
+    tp2 = price * 1.10
+    return {
+        "entry": price,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+    }
+
 def get_spot_1h_change(symbol):
-    """Get spot 1h price change % from Binance spot API (works from US IPs)."""
     try:
         url = f"{SPOT_API}/api/v3/klines?symbol={symbol}&interval=1h&limit=2"
         r = requests.get(url, timeout=10)
@@ -176,7 +206,6 @@ def get_top_trader_ratio(symbol):
 def check_pre_pump(symbol, price):
     reasons = []
     try:
-        # FIX #1: Check if price already moved (mid-pump detection)
         spot_1h = get_spot_1h_change(symbol)
         if spot_1h > 10:
             return None, [f"already_moved {spot_1h:.1f}%"]
@@ -203,12 +232,11 @@ def check_pre_pump(symbol, price):
         if oi_15m_change < 5 and oi_1h_change < 10:
             reasons.append("oi_flat")
 
-        # FIX #2: Funding must be NEGATIVE (shorts trapped = squeeze fuel)
         funding = get_funding_rate(symbol)
         if funding >= 0:
-            reasons.append(f"funding_pos {funding*100:.3f}%")
+            reasons.append(f"funding_pos")
         elif funding > -0.0001:
-            reasons.append(f"funding_weak {funding*100:.4f}%")
+            reasons.append(f"funding_weak")
 
         ls_ratio = get_top_trader_ratio(symbol)
         if ls_ratio < 1.2:
@@ -258,6 +286,10 @@ def main():
         print("Outside fresh cycle window. Skipping.")
         return
 
+    if not btc_is_healthy():
+        print("BTC dumping >2% in 1h. All alerts blocked.")
+        return
+
     candidates = get_futures_candidates()
     print(f"Futures candidates: {len(candidates)}")
 
@@ -291,6 +323,7 @@ def main():
     now = datetime.utcnow()
     for h in hits:
         cooldown[h["symbol"]] = now.isoformat()
+        plan = build_execution_plan(h["price"])
         msg = (
             f"🔮 <b>PRE-PUMP DETECTED</b> [{session}]\n\n"
             f"<b>Coin:</b> {h['symbol']}\n"
@@ -304,7 +337,13 @@ def main():
             f"<b>Top Trader L/S:</b> {h['ls_ratio']:.2f}\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"⚠️ <b>ACTION:</b> Watch spot chart. Enter when spot volume confirms."
+            f"📋 <b>IF ENTERED NOW</b>\n"
+            f"<b>Entry:</b> {format_price(plan['entry'])}\n"
+            f"<b>Stop:</b> {format_price(plan['stop'])} (-3%)\n"
+            f"<b>TP1:</b> {format_price(plan['tp1'])} (+5%)\n"
+            f"<b>TP2:</b> {format_price(plan['tp2'])} (+10%)\n\n"
+            f"⚠️ <b>WAIT</b> for 🚨 Volume Breakout before entering.\n"
+            f"⚠️ Check tag: Seed (half size) / Monitoring (skip)"
         )
         send_telegram(msg)
 
