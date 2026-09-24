@@ -98,7 +98,6 @@ def safe_get(url, timeout=15, use_proxy=True):
         return None
 
 def btc_is_healthy():
-    """FIX 1: Block all alerts if BTC dumping >2% in 1h."""
     try:
         url = f"{SPOT_API}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
         r = requests.get(url, timeout=10)
@@ -117,7 +116,6 @@ def btc_is_healthy():
         return True
 
 def build_execution_plan(price):
-    """FIX 2: Calculate entry, stop, TP1, TP2 for spot entry."""
     stop = price * 0.97
     tp1 = price * 1.05
     tp2 = price * 1.10
@@ -256,35 +254,32 @@ def check_pre_pump(symbol, price):
     except Exception as e:
         return None, [f"exception_{e}"]
 
-def is_active_session(hour, minute):
-    if hour == 5:
-        return True, "Asia"
+def get_session_label(hour, minute):
+    if hour == 5 and minute >= 30:
+        return "Asia"
     if 6 <= hour <= 10:
-        return True, "Asia"
+        return "Asia"
     if hour == 11 and minute < 30:
-        return True, "Asia"
-    if hour == 12:
-        return True, "Europe"
+        return "Asia"
+    if hour == 12 and minute >= 30:
+        return "Europe"
     if 13 <= hour <= 14:
-        return True, "Europe"
+        return "Europe"
     if hour == 15 and minute < 30:
-        return True, "Europe"
-    if hour == 18:
-        return True, "US"
+        return "Europe"
+    if hour == 18 and minute >= 30:
+        return "US"
     if 19 <= hour <= 20:
-        return True, "US"
+        return "US"
     if hour == 21 and minute < 30:
-        return True, "US"
-    return False, "Off-hours"
+        return "US"
+    return "Dead-Zone"
 
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    active, session = is_active_session(ist.hour, ist.minute)
-    print(f"Futures Scanner starting at {ist} IST — Session: {session} — Active: {active}")
-
-    if not active:
-        print("Outside fresh cycle window. Skipping.")
-        return
+    session = get_session_label(ist.hour, ist.minute)
+    print(f"Futures Scanner starting at {ist} IST — Session label: {session}")
+    print("Data collection mode active (Sept 25 - Oct 25). No session filter.")
 
     if not btc_is_healthy():
         print("BTC dumping >2% in 1h. All alerts blocked.")
@@ -339,11 +334,9 @@ def main():
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
             f"📋 <b>IF ENTERED NOW</b>\n"
             f"<b>Entry:</b> {format_price(plan['entry'])}\n"
-            f"<b>Stop:</b> {format_price(plan['stop'])} (-3%)\n"
-            f"<b>TP1:</b> {format_price(plan['tp1'])} (+5%)\n"
-            f"<b>TP2:</b> {format_price(plan['tp2'])} (+10%)\n\n"
+            f"<b>Stop:</b> {format_price(plan['stop'])} (-3%)\n\n"
             f"⚠️ <b>WAIT</b> for 🚨 Volume Breakout before entering.\n"
-            f"⚠️ Check tag: Seed (half size) / Monitoring (skip)"
+            f"⚠️ DATA COLLECTION MODE - Log this alert"
         )
         send_telegram(msg)
 
