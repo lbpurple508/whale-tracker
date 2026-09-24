@@ -9,10 +9,10 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 FAPI = "https://fapi.binance.com"
+SPOT_API = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("futures_cooldown.json")
 COOLDOWN_MINUTES = 60
 
-# Webshare proxy (Japan - bypasses Binance US block)
 PROXY_URL = "http://kwwlofiq:gmc73r98yj48@142.111.67.146:5611"
 PROXIES = {"http": PROXY_URL, "https": PROXY_URL}
 
@@ -79,10 +79,12 @@ def save_cooldown(data):
     except Exception as e:
         print(f"cooldown save error: {e}")
 
-def safe_get(url, timeout=15):
-    """GET through the proxy."""
+def safe_get(url, timeout=15, use_proxy=True):
     try:
-        r = requests.get(url, proxies=PROXIES, timeout=timeout)
+        if use_proxy:
+            r = requests.get(url, proxies=PROXIES, timeout=timeout)
+        else:
+            r = requests.get(url, timeout=timeout)
         if r.status_code == 451:
             print(f"451 blocked: {url}")
             return None
@@ -94,6 +96,22 @@ def safe_get(url, timeout=15):
     except Exception as e:
         print(f"Request error: {e}")
         return None
+
+def get_spot_1h_change(symbol):
+    """Get spot 1h price change % from Binance spot API (works from US IPs)."""
+    try:
+        url = f"{SPOT_API}/api/v3/klines?symbol={symbol}&interval=1h&limit=2"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 2:
+            return 0
+        current_close = float(data[-1][4])
+        prev_close = float(data[-2][4])
+        if prev_close == 0:
+            return 0
+        return ((current_close - prev_close) / prev_close) * 100
+    except Exception:
+        return 0
 
 def get_futures_candidates():
     data = safe_get(f"{FAPI}/fapi/v1/ticker/24hr")
@@ -158,6 +176,13 @@ def get_top_trader_ratio(symbol):
 def check_pre_pump(symbol, price):
     reasons = []
     try:
+        # FIX #1: Check if price already moved (mid-pump detection)
+        spot_1h = get_spot_1h_change(symbol)
+        if spot_1h > 10:
+            return None, [f"already_moved {spot_1h:.1f}%"]
+        if spot_1h < -5:
+            return None, [f"dumping {spot_1h:.1f}%"]
+
         oi_data = get_oi_history(symbol, "5m", 13)
         if not oi_data or len(oi_data) < 6:
             return None, ["no_oi"]
@@ -178,9 +203,12 @@ def check_pre_pump(symbol, price):
         if oi_15m_change < 5 and oi_1h_change < 10:
             reasons.append("oi_flat")
 
+        # FIX #2: Funding must be NEGATIVE (shorts trapped = squeeze fuel)
         funding = get_funding_rate(symbol)
-        if funding > 0.001:
-            reasons.append("funding_high")
+        if funding >= 0:
+            reasons.append(f"funding_pos {funding*100:.3f}%")
+        elif funding > -0.0001:
+            reasons.append(f"funding_weak {funding*100:.4f}%")
 
         ls_ratio = get_top_trader_ratio(symbol)
         if ls_ratio < 1.2:
@@ -195,6 +223,7 @@ def check_pre_pump(symbol, price):
             "oi_value": current_oi,
             "funding": funding,
             "ls_ratio": ls_ratio,
+            "spot_1h": spot_1h,
         }, []
     except Exception as e:
         return None, [f"exception_{e}"]
@@ -253,7 +282,7 @@ def main():
                 hits.append(c)
             else:
                 if reasons:
-                    top = reasons[0].split("_")[0]
+                    top = reasons[0].split()[0].split("_")[0]
                     rejection[top] = rejection.get(top, 0) + 1
 
     print(f"Rejection reasons: {rejection}")
@@ -267,6 +296,7 @@ def main():
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])} (flat)\n"
             f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
+            f"<b>1h Spot Move:</b> {h['spot_1h']:+.2f}%\n"
             f"<b>OI 15m Change:</b> +{h['oi_15m_change']:.2f}%\n"
             f"<b>OI 1h Change:</b> +{h['oi_1h_change']:.2f}%\n"
             f"<b>OI Value:</b> ${h['oi_value']:,.0f}\n"
