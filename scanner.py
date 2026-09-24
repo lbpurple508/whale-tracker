@@ -75,6 +75,37 @@ def save_cooldown(data):
     except Exception as e:
         print(f"cooldown save error: {e}")
 
+def btc_is_healthy():
+    """FIX 1: Block all alerts if BTC dumping >2% in 1h."""
+    try:
+        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 2:
+            return True
+        current_close = float(data[-1][4])
+        prev_close = float(data[-2][4])
+        if prev_close == 0:
+            return True
+        change = ((current_close - prev_close) / prev_close) * 100
+        print(f"BTC 1h change: {change:.2f}%")
+        return change > -2
+    except Exception as e:
+        print(f"BTC check error: {e}")
+        return True
+
+def build_execution_plan(price):
+    """FIX 2: Calculate entry, stop, TP1, TP2."""
+    stop = price * 0.97
+    tp1 = price * 1.05
+    tp2 = price * 1.10
+    return {
+        "entry": price,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+    }
+
 def get_candidates():
     url = f"{BASE_URL}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
@@ -154,7 +185,6 @@ def check_signal(symbol, price, session):
         if not isinstance(klines, list) or len(klines) < 21:
             return None, ["not enough klines"]
 
-        # Session-specific rules
         if session == "US":
             vol_min = 6
             rsi_min = 55
@@ -168,7 +198,6 @@ def check_signal(symbol, price, session):
             taker_min = 0.60
             depth_min = 75_000
 
-        # Volume: current or previous candle
         volumes = [float(k[5]) for k in klines[:-2]]
         avg = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes)
         current_vol = float(klines[-1][5])
@@ -181,7 +210,6 @@ def check_signal(symbol, price, session):
         if vol_ratio < vol_min:
             reasons.append(f"vol {vol_ratio:.1f}x")
 
-        # Green candle: current OR previous
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
         prev_open = float(klines[-2][1])
@@ -191,7 +219,6 @@ def check_signal(symbol, price, session):
         if not (current_green or prev_green):
             reasons.append("both red")
 
-        # 1h change
         if len(klines) >= 5:
             price_1h_ago = float(klines[-5][4])
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
@@ -200,7 +227,6 @@ def check_signal(symbol, price, session):
         if change_1h < 0.5 or change_1h > 60:
             reasons.append(f"1h {change_1h:.1f}%")
 
-        # 4h change — MUST BE POSITIVE (new fix)
         if len(klines) >= 17:
             price_4h_ago = float(klines[-17][4])
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
@@ -211,7 +237,6 @@ def check_signal(symbol, price, session):
         if change_4h > 80:
             reasons.append(f"4h_high {change_4h:.1f}%")
 
-        # RSI — minimum 55, maximum session-based (new fix)
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
         if rsi < rsi_min:
@@ -219,7 +244,6 @@ def check_signal(symbol, price, session):
         if rsi > rsi_max:
             reasons.append(f"RSI_high {rsi:.1f}")
 
-        # Taker Buy
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
@@ -228,7 +252,6 @@ def check_signal(symbol, price, session):
         if taker_buy_pct < taker_min:
             reasons.append(f"taker {taker_buy_pct*100:.1f}%")
 
-        # Depth — raised to $75k (Asia/Europe) or $60k (US)
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < depth_min:
             reasons.append(f"bid_thin ${bid_depth:,.0f}")
@@ -310,9 +333,14 @@ def main():
         print("Outside fresh cycle window. Skipping.")
         return
 
+    if not btc_is_healthy():
+        print("BTC dumping >2% in 1h. All alerts blocked.")
+        return
+
     hits = scan(session)
     print(f"Found {len(hits)} hits")
     for h in hits:
+        plan = build_execution_plan(h["price"])
         msg = (
             f"🚨 <b>VOLUME BREAKOUT</b> [{session}]\n\n"
             f"<b>Coin:</b> {h['symbol']}\n"
@@ -326,7 +354,14 @@ def main():
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
-            f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST"
+            f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
+            f"📋 <b>EXECUTION PLAN</b>\n"
+            f"<b>Entry:</b> {format_price(plan['entry'])}\n"
+            f"<b>Stop:</b> {format_price(plan['stop'])} (-3%)\n"
+            f"<b>TP1:</b> {format_price(plan['tp1'])} (+5%)\n"
+            f"<b>TP2:</b> {format_price(plan['tp2'])} (+10%)\n\n"
+            f"⚠️ Check tag: Seed (half size) / Monitoring (skip)\n"
+            f"⚠️ Trail stop: +2%→BE, +3.5%→+1%, +5%→sell 50%"
         )
         send_telegram(msg)
 
