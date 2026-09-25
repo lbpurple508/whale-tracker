@@ -7,66 +7,70 @@ jobs:
   dump:
     runs-on: ubuntu-latest
     steps:
-      - name: Restore spike rejections
-        uses: actions/cache/restore@v4
+      - uses: actions/checkout@v4
+      - name: Download spike rejections
+        uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          path: rejections.json
-          key: cooldown-latest
-          restore-keys: |
-            cooldown-
-      - name: Restore grind rejections
-        uses: actions/cache/restore@v4
+          name: spike-rejections
+          path: spike/
+      - name: Download grind rejections
+        uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          path: grind_rejections.json
-          key: grind-cooldown-latest
-          restore-keys: |
-            grind-cooldown-
-      - name: Restore futures rejections
-        uses: actions/cache/restore@v4
+          name: grind-rejections
+          path: grind/
+      - name: Download futures rejections
+        uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          path: futures_rejections.json
-          key: futures-cooldown-latest
-          restore-keys: |
-            futures-cooldown-
-      - name: Display spike rejections
+          name: futures-rejections
+          path: futures/
+      - name: Display spike
         run: |
           echo "=== SPIKE REJECTIONS ==="
-          if [ -f rejections.json ]; then
+          if [ -f spike/rejections.json ]; then
             python3 -c "
-          import json
-          data = json.load(open('rejections.json'))
-          items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
-          for sym, i in items[:30]:
-              print(f\"{sym:<15} {i.get('count', 0):>5}x  {i.get('change_24h', 0):>7.2f}%  {i.get('top_reason', '')}\")
-          "
+import json
+data = json.load(open('spike/rejections.json'))
+items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
+print(f'{len(data)} unique coins rejected')
+print()
+for sym, i in items[:30]:
+    print(f'{sym:<15} {i.get(\"count\", 0):>5}x  {i.get(\"change_24h\", 0):>7.2f}%  {i.get(\"top_reason\", \"\")}')
+"
           else
             echo "no spike rejections file"
           fi
-      - name: Display grind rejections
+      - name: Display grind
         run: |
           echo "=== GRIND REJECTIONS ==="
-          if [ -f grind_rejections.json ]; then
+          if [ -f grind/grind_rejections.json ]; then
             python3 -c "
-          import json
-          data = json.load(open('grind_rejections.json'))
-          items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
-          for sym, i in items[:30]:
-              print(f\"{sym:<15} {i.get('count', 0):>5}x  {i.get('change_24h', 0):>7.2f}%  {i.get('top_reason', '')}\")
-          "
+import json
+data = json.load(open('grind/grind_rejections.json'))
+items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
+print(f'{len(data)} unique coins rejected')
+print()
+for sym, i in items[:30]:
+    print(f'{sym:<15} {i.get(\"count\", 0):>5}x  {i.get(\"change_24h\", 0):>7.2f}%  {i.get(\"top_reason\", \"\")}')
+"
           else
             echo "no grind rejections file"
           fi
-      - name: Display futures rejections
+      - name: Display futures
         run: |
           echo "=== FUTURES REJECTIONS ==="
-          if [ -f futures_rejections.json ]; then
+          if [ -f futures/futures_rejections.json ]; then
             python3 -c "
-          import json
-          data = json.load(open('futures_rejections.json'))
-          items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
-          for sym, i in items[:30]:
-              print(f\"{sym:<15} {i.get('count', 0):>5}x  {i.get('change_24h', 0):>7.2f}%  {i.get('top_reason', '')}\")
-          "
+import json
+data = json.load(open('futures/futures_rejections.json'))
+items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
+print(f'{len(data)} unique coins rejected')
+print()
+for sym, i in items[:30]:
+    print(f'{sym:<15} {i.get(\"count\", 0):>5}x  {i.get(\"change_24h\", 0):>7.2f}%  {i.get(\"top_reason\", \"\")}')
+"
           else
             echo "no futures rejections file"
           fi
