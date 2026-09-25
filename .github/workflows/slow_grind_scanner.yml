@@ -1,0 +1,35 @@
+name: Slow Grind Scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Restore grind cooldown
+        uses: actions/cache/restore@v4
+        with:
+          path: grind_cooldown.json
+          key: grind-cooldown-${{ github.run_id }}
+          restore-keys: |
+            grind-cooldown-
+      - name: Run slow grind scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python slow_grind_scanner.py
+      - name: Save grind cooldown
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: grind_cooldown.json
+          key: grind-cooldown-${{ github.run_id }}
