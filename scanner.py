@@ -77,7 +77,6 @@ def save_cooldown(data):
         print(f"cooldown save error: {e}")
 
 def log_rejection(symbol, reasons, price, change_24h, reason_type):
-    """Log rejection to file so we can analyze offline."""
     try:
         data = {}
         if REJECT_FILE.exists():
@@ -101,7 +100,6 @@ def log_rejection(symbol, reasons, price, change_24h, reason_type):
         data[key]["change_24h"] = change_24h
         data[key]["top_reason"] = reasons[0] if reasons else "unknown"
         data[key]["all_reasons"] = reasons[:3]
-        # Keep max 200 entries
         if len(data) > 200:
             sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
             data = dict(sorted_items[:200])
@@ -126,12 +124,6 @@ def btc_is_healthy():
     except Exception as e:
         print(f"BTC check error: {e}")
         return True
-
-def build_execution_plan(price):
-    return {
-        "entry": price,
-        "stop": price * 0.97,
-    }
 
 def get_candidates():
     url = f"{BASE_URL}/api/v3/ticker/24hr"
@@ -162,7 +154,7 @@ def get_candidates():
         if quote_vol < 10_000_000:
             rejected_stage1["vol_low"] += 1
             continue
-        if change < 1 or change > 80:
+        if change < 1 or change > 150:
             rejected_stage1["change_range"] += 1
             continue
         if price > 1.00:
@@ -180,8 +172,7 @@ def get_candidates():
 def compute_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
         if diff > 0:
@@ -202,8 +193,7 @@ def check_depth(symbol, price):
         url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
         r = requests.get(url, timeout=10)
         book = r.json()
-        low = price * 0.98
-        high = price * 1.02
+        low, high = price * 0.98, price * 1.02
         bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
         ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
         return bid_depth, ask_depth
@@ -230,9 +220,7 @@ def check_signal(symbol, price, session):
         prev_vol = float(klines[-2][5])
         if avg == 0:
             return None, ["avg_vol_zero"]
-        current_ratio = current_vol / avg
-        prev_ratio = prev_vol / avg
-        vol_ratio = max(current_ratio, prev_ratio)
+        vol_ratio = max(current_vol / avg, prev_vol / avg)
         if vol_ratio < vol_min:
             reasons.append(f"vol_{vol_ratio:.1f}x")
 
@@ -361,7 +349,7 @@ def main():
     hits = scan(session)
     print(f"Found {len(hits)} hits")
     for h in hits:
-        plan = build_execution_plan(h["price"])
+        stop = h["price"] * 0.97
         msg = (
             f"🚨 <b>VOLUME BREAKOUT</b> [{session}]\n\n"
             f"<b>Type:</b> FAST SPIKE\n"
@@ -377,9 +365,9 @@ def main():
             f"<b>Ask:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
             f"📋 <b>PLAN</b>\n"
-            f"Entry: {format_price(plan['entry'])}\n"
-            f"Stop: {format_price(plan['stop'])} (-3%)\n"
-            f"Trail: +2%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
+            f"Entry: {format_price(h['price'])}\n"
+            f"Stop: {format_price(stop)} (-3%)\n"
+            f"Trail: +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
             f"⚠️ Check tag: Seed(half) / Monitoring(skip)"
         )
         send_telegram(msg)
