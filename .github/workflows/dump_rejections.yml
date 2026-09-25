@@ -40,29 +40,14 @@ jobs:
           search_artifacts: true
 
       - name: Build report
-        run: |
-          python3 scripts/dump.py spike/rejections.json grind/grind_rejections.json futures/futures_rejections.json > report.txt
-          cat report.txt
+        run: python3 scripts/dump.py spike/rejections.json grind/grind_rejections.json futures/futures_rejections.json > report.txt
+
+      - name: Show report
+        run: cat report.txt
 
       - name: Send to Telegram
         if: always()
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ ! -f report.txt ]; then
-            echo "no report"
-            exit 0
-          fi
-          python3 -c "
-import os, requests
-token = os.environ['TELEGRAM_TOKEN']
-chat = os.environ['TELEGRAM_CHAT_ID']
-text = open('report.txt').read()
-# Telegram limit 4096. Split if needed.
-max_len = 4000
-chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
-for c in chunks:
-    requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
-                  json={'chat_id': chat, 'text': c, 'parse_mode': 'HTML'}, timeout=15)
-"
+        run: python3 scripts/send_report.py
