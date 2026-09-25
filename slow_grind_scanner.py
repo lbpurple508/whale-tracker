@@ -10,6 +10,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("grind_cooldown.json")
+REJECT_FILE = Path("grind_rejections.json")
 COOLDOWN_MINUTES = 60
 
 MAJORS = {
@@ -75,6 +76,37 @@ def save_cooldown(data):
     except Exception as e:
         print(f"cooldown save error: {e}")
 
+def log_rejection(symbol, reasons, price, change_24h, reason_type):
+    try:
+        data = {}
+        if REJECT_FILE.exists():
+            try:
+                data = json.loads(REJECT_FILE.read_text())
+            except Exception:
+                data = {}
+        key = f"{symbol}"
+        if key not in data:
+            data[key] = {
+                "symbol": symbol,
+                "first_seen": datetime.utcnow().isoformat(),
+                "count": 0,
+                "type": reason_type,
+                "price": price,
+                "change_24h": change_24h,
+            }
+        data[key]["count"] += 1
+        data[key]["last_seen"] = datetime.utcnow().isoformat()
+        data[key]["price"] = price
+        data[key]["change_24h"] = change_24h
+        data[key]["top_reason"] = reasons[0] if reasons else "unknown"
+        data[key]["all_reasons"] = reasons[:3]
+        if len(data) > 200:
+            sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
+            data = dict(sorted_items[:200])
+        REJECT_FILE.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"reject log error: {e}")
+
 def btc_is_healthy():
     try:
         url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
@@ -93,11 +125,11 @@ def btc_is_healthy():
         return True
 
 def get_candidates():
-    """Pre-filter: coins that are already up 5-40% on 24h."""
     url = f"{BASE_URL}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
     tickers = r.json()
     candidates = []
+    rejected = {"vol_low": 0, "change_low": 0, "change_high": 0, "price_high": 0}
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
@@ -117,11 +149,16 @@ def get_candidates():
         except (KeyError, ValueError):
             continue
         if quote_vol < 5_000_000:
+            rejected["vol_low"] += 1
             continue
-        # Slow grind range: already up but not parabolic
-        if change < 5 or change > 60:
+        if change < 5:
+            rejected["change_low"] += 1
+            continue
+        if change > 60:
+            rejected["change_high"] += 1
             continue
         if price > 1.00:
+            rejected["price_high"] += 1
             continue
         candidates.append({
             "symbol": symbol,
@@ -129,13 +166,13 @@ def get_candidates():
             "change_24h": change,
             "quote_vol": quote_vol,
         })
+    print(f"Stage1 rejections: {rejected}")
     return candidates
 
 def compute_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
         if diff > 0:
@@ -156,8 +193,7 @@ def check_depth(symbol, price):
         url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
         r = requests.get(url, timeout=10)
         book = r.json()
-        low = price * 0.98
-        high = price * 1.02
+        low, high = price * 0.98, price * 1.02
         bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
         ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
         return bid_depth, ask_depth
@@ -167,92 +203,78 @@ def check_depth(symbol, price):
 def check_grind(symbol, price):
     reasons = []
     try:
-        # 15m candles, 25 bars = 6.25 hours
         url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
         r = requests.get(url, timeout=10)
         klines = r.json()
         if not isinstance(klines, list) or len(klines) < 21:
-            return None, ["not enough klines"]
+            return None, ["not_enough_klines"]
 
-        # 1h change (4 candles back)
         current_close = float(klines[-1][4])
         price_1h_ago = float(klines[-5][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         if change_1h < 1 or change_1h > 15:
-            reasons.append(f"1h {change_1h:.1f}%")
+            reasons.append(f"1h_{change_1h:.1f}%")
 
-        # 4h change (16 candles back)
         price_4h_ago = float(klines[-17][4])
         change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         if change_4h < 3 or change_4h > 40:
-            reasons.append(f"4h {change_4h:.1f}%")
+            reasons.append(f"4h_{change_4h:.1f}%")
 
-        # Current candle green
         current_open = float(klines[-1][1])
         if current_close <= current_open:
-            reasons.append("red candle")
+            reasons.append("red_candle")
 
-        # Volume: 1h total (4 candles) vs average 1h total
         recent_1h_vol = sum(float(k[5]) for k in klines[-4:])
         prior_vols = [float(k[5]) for k in klines[-20:-4]]
         avg_1h_vol = sum(prior_vols) / len(prior_vols) * 4 if prior_vols else 0
         if avg_1h_vol == 0:
-            return None, ["avg vol zero"]
+            return None, ["avg_vol_zero"]
         vol_ratio_1h = recent_1h_vol / avg_1h_vol
-        # Slow grind: 1h volume between 1.5x and 4x (not explosive)
         if vol_ratio_1h < 1.5:
-            reasons.append(f"1hvol {vol_ratio_1h:.1f}x")
+            reasons.append(f"1hvol_{vol_ratio_1h:.1f}x")
         if vol_ratio_1h > 5:
-            reasons.append(f"too_fast {vol_ratio_1h:.1f}x")
+            reasons.append(f"too_fast_{vol_ratio_1h:.1f}x")
 
-        # Consistency: at least 2 of last 4 candles green
         greens = sum(1 for k in klines[-4:] if float(k[4]) > float(k[1]))
         if greens < 2:
-            reasons.append(f"greens {greens}/4")
+            reasons.append(f"greens_{greens}")
 
-        # RSI 55-72
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
         if rsi < 55:
-            reasons.append(f"RSI_low {rsi:.1f}")
+            reasons.append(f"RSI_low_{rsi:.1f}")
         if rsi > 72:
-            reasons.append(f"RSI_high {rsi:.1f}")
+            reasons.append(f"RSI_high_{rsi:.1f}")
 
-        # Taker buy on current candle
         total_vol = float(klines[-1][5])
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
-            reasons.append("vol zero")
+            reasons.append("vol_zero")
         taker_pct = taker_buy / total_vol if total_vol else 0
         if taker_pct < 0.55:
-            reasons.append(f"taker {taker_pct*100:.1f}%")
+            reasons.append(f"taker_{taker_pct*100:.1f}%")
 
-        # Depth $50k each side
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < 50_000:
-            reasons.append(f"bid ${bid_depth:,.0f}")
+            reasons.append(f"bid_thin_{bid_depth:.0f}")
         if ask_depth < 50_000:
-            reasons.append(f"ask ${ask_depth:,.0f}")
+            reasons.append(f"ask_thin_{ask_depth:.0f}")
 
         if reasons:
             return None, reasons
 
         return {
-            "change_1h": change_1h,
-            "change_4h": change_4h,
-            "vol_ratio_1h": vol_ratio_1h,
-            "greens": greens,
-            "rsi": rsi,
-            "taker_pct": taker_pct * 100,
-            "bid_depth": bid_depth,
-            "ask_depth": ask_depth,
+            "change_1h": change_1h, "change_4h": change_4h,
+            "vol_ratio_1h": vol_ratio_1h, "greens": greens,
+            "rsi": rsi, "taker_pct": taker_pct * 100,
+            "bid_depth": bid_depth, "ask_depth": ask_depth,
         }, []
     except Exception as e:
-        return None, [f"exception {e}"]
+        return None, [f"exception_{e}"]
 
 def scan():
     candidates = get_candidates()
-    print(f"Slow grind candidates: {len(candidates)}")
+    print(f"Candidates after Stage1: {len(candidates)}")
     cooldown = load_cooldown()
     print(f"Cooldown: {list(cooldown.keys())}")
     hits = []
@@ -269,9 +291,10 @@ def scan():
                 hits.append(c)
             else:
                 if reasons:
-                    top = reasons[0].split()[0] if reasons[0] else "unknown"
+                    top = reasons[0].split("_")[0]
                     rejection[top] = rejection.get(top, 0) + 1
-    print(f"Rejection reasons: {rejection}")
+                    log_rejection(c["symbol"], reasons, c["price"], c["change_24h"], "grind")
+    print(f"Stage2 rejection: {rejection}")
     now = datetime.utcnow()
     for h in hits:
         cooldown[h["symbol"]] = now.isoformat()
@@ -302,39 +325,36 @@ def get_session_label(hour, minute):
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
-    print(f"Slow Grind Scanner starting at {ist} IST — Session label: {session}")
+    print(f"Slow Grind Scanner starting at {ist} IST — Session: {session}")
 
     if not btc_is_healthy():
-        print("BTC dumping >2% in 1h. All alerts blocked.")
+        print("BTC dumping >2%. Skipping.")
         return
 
     hits = scan()
     print(f"Found {len(hits)} slow grind signals")
-
     for h in hits:
         stop = h["price"] * 0.97
         msg = (
             f"📈 <b>SLOW GRIND DETECTED</b> [{session}]\n\n"
-            f"<b>Type:</b> ACCUMULATION (4-6 hour grind)\n"
+            f"<b>Type:</b> ACCUMULATION (4-6h grind)\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
-            f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
-            f"<b>1h Change:</b> {h['change_1h']:.2f}%\n"
-            f"<b>4h Change:</b> {h['change_4h']:.2f}%\n"
+            f"<b>24h:</b> {h['change_24h']:.2f}%\n"
+            f"<b>1h:</b> {h['change_1h']:.2f}%\n"
+            f"<b>4h:</b> {h['change_4h']:.2f}%\n"
             f"<b>RSI:</b> {h['rsi']:.1f}\n"
-            f"<b>Vol Ratio (1h):</b> {h['vol_ratio_1h']:.2f}x\n"
-            f"<b>Green Candles:</b> {h['greens']}/4\n"
-            f"<b>Taker Buy:</b> {h['taker_pct']:.1f}%\n"
-            f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
-            f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
-            f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
+            f"<b>Vol (1h):</b> {h['vol_ratio_1h']:.2f}x\n"
+            f"<b>Greens:</b> {h['greens']}/4\n"
+            f"<b>Taker:</b> {h['taker_pct']:.1f}%\n"
+            f"<b>Bid:</b> ${h['bid_depth']:,.0f}\n"
+            f"<b>Ask:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"📋 <b>EXECUTION PLAN</b>\n"
-            f"<b>Entry:</b> {format_price(h['price'])}\n"
-            f"<b>Stop:</b> {format_price(stop)} (-3%)\n"
-            f"<b>Trailing:</b> +2%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
-            f"⚠️ Check tag: Seed (half size) / Monitoring (skip)\n"
-            f"⚠️ DATA COLLECTION MODE - Log this alert"
+            f"📋 <b>PLAN</b>\n"
+            f"Entry: {format_price(h['price'])}\n"
+            f"Stop: {format_price(stop)} (-3%)\n"
+            f"Trail: +2%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
+            f"⚠️ Check tag: Seed(half) / Monitoring(skip)"
         )
         send_telegram(msg)
 
