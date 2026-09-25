@@ -37,3 +37,12 @@ jobs:
             futures_cooldown.json
             futures_rejections.json
           key: futures-cooldown-${{ github.run_id }}
+      - name: Upload rejections
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: futures-rejections
+          path: futures_rejections.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
