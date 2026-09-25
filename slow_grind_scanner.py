@@ -148,13 +148,14 @@ def get_candidates():
             price = float(t["lastPrice"])
         except (KeyError, ValueError):
             continue
+        # CHANGED: vol min 5M, change range 3-150%, price <$1
         if quote_vol < 5_000_000:
             rejected["vol_low"] += 1
             continue
-        if change < 5:
+        if change < 3:
             rejected["change_low"] += 1
             continue
-        if change > 60:
+        if change > 150:
             rejected["change_high"] += 1
             continue
         if price > 1.00:
@@ -212,12 +213,13 @@ def check_grind(symbol, price):
         current_close = float(klines[-1][4])
         price_1h_ago = float(klines[-5][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
-        if change_1h < 1 or change_1h > 15:
+        # CHANGED: 1h range now 0.3 - 20%
+        if change_1h < 0.3 or change_1h > 20:
             reasons.append(f"1h_{change_1h:.1f}%")
 
         price_4h_ago = float(klines[-17][4])
         change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
-        if change_4h < 3 or change_4h > 40:
+        if change_4h < 3 or change_4h > 60:
             reasons.append(f"4h_{change_4h:.1f}%")
 
         current_open = float(klines[-1][1])
@@ -353,7 +355,7 @@ def main():
             f"📋 <b>PLAN</b>\n"
             f"Entry: {format_price(h['price'])}\n"
             f"Stop: {format_price(stop)} (-3%)\n"
-            f"Trail: +2%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
+            f"Trail: +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
             f"⚠️ Check tag: Seed(half) / Monitoring(skip)"
         )
         send_telegram(msg)
