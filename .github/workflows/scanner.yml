@@ -37,3 +37,12 @@ jobs:
             cooldown.json
             rejections.json
           key: cooldown-${{ github.run_id }}
+      - name: Upload rejections
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spike-rejections
+          path: rejections.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
