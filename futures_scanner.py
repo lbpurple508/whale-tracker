@@ -11,6 +11,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 FAPI = "https://fapi.binance.com"
 SPOT_API = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("futures_cooldown.json")
+REJECT_FILE = Path("futures_rejections.json")
 COOLDOWN_MINUTES = 60
 
 PROXY_URL = "http://kwwlofiq:gmc73r98yj48@142.111.67.146:5611"
@@ -33,7 +34,7 @@ MAJORS = {
 BLACKLIST = {
     "GPSUSDT", "SHELLUSDT", "ENAUSDT", "ZKJUSDT", "KOGEUSDT",
     "COAIUSDT", "SAITAMAUSDT", "ROBOUSDT", "VZZNUSDT", "LABUSDT",
-    "RAVEUSDT", "BROCCOLIUSDT", "SIRENUSDT", "AKEUSDT", "XPINUSDT",
+    "RAVEUSDT", "SIRENUSDT", "AKEUSDT", "XPINUSDT",
     "BTRUSDT", "ANTHROPICUSDT", "SKHYNIXUSDT", "REUSDT", "SNDKUSDT",
     "XPLUSDT",
 }
@@ -79,6 +80,39 @@ def save_cooldown(data):
     except Exception as e:
         print(f"cooldown save error: {e}")
 
+def log_rejection(symbol, reasons, price, change_24h, reason_type):
+    """Log rejection to file so we can analyze offline."""
+    try:
+        data = {}
+        if REJECT_FILE.exists():
+            try:
+                data = json.loads(REJECT_FILE.read_text())
+            except Exception:
+                data = {}
+        key = f"{symbol}"
+        if key not in data:
+            data[key] = {
+                "symbol": symbol,
+                "first_seen": datetime.utcnow().isoformat(),
+                "count": 0,
+                "type": reason_type,
+                "price": price,
+                "change_24h": change_24h,
+            }
+        data[key]["count"] += 1
+        data[key]["last_seen"] = datetime.utcnow().isoformat()
+        data[key]["price"] = price
+        data[key]["change_24h"] = change_24h
+        data[key]["top_reason"] = reasons[0] if reasons else "unknown"
+        data[key]["all_reasons"] = reasons[:3]
+        # Keep max 200 entries
+        if len(data) > 200:
+            sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
+            data = dict(sorted_items[:200])
+        REJECT_FILE.write_text(json.dumps(data))
+    except Exception as e:
+        print(f"reject log error: {e}")
+
 def safe_get(url, timeout=15, use_proxy=True):
     try:
         if use_proxy:
@@ -116,14 +150,9 @@ def btc_is_healthy():
         return True
 
 def build_execution_plan(price):
-    stop = price * 0.97
-    tp1 = price * 1.05
-    tp2 = price * 1.10
     return {
         "entry": price,
-        "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
+        "stop": price * 0.97,
     }
 
 def get_spot_1h_change(symbol):
@@ -147,13 +176,18 @@ def get_futures_candidates():
         print(f"Ticker response invalid: {type(data)}")
         return []
     candidates = []
+    rejected_stage1 = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0}
     for t in data:
         if not isinstance(t, dict):
             continue
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
-        if symbol in MAJORS or symbol in BLACKLIST:
+        if symbol in MAJORS:
+            rejected_stage1["major"] += 1
+            continue
+        if symbol in BLACKLIST:
+            rejected_stage1["blacklist"] += 1
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
             continue
@@ -164,10 +198,13 @@ def get_futures_candidates():
         except (KeyError, ValueError, TypeError):
             continue
         if quote_vol < 10_000_000:
+            rejected_stage1["vol_low"] += 1
             continue
         if price > 1.00 or price <= 0:
+            rejected_stage1["price_high"] += 1
             continue
         if abs(change) > 5:
+            rejected_stage1["change_range"] += 1
             continue
         candidates.append({
             "symbol": symbol,
@@ -175,6 +212,7 @@ def get_futures_candidates():
             "change_24h": change,
             "quote_vol": quote_vol,
         })
+    print(f"Stage1 rejections: {rejected_stage1}")
     return candidates
 
 def get_oi_history(symbol, period="5m", limit=13):
@@ -206,9 +244,9 @@ def check_pre_pump(symbol, price):
     try:
         spot_1h = get_spot_1h_change(symbol)
         if spot_1h > 10:
-            return None, [f"already_moved {spot_1h:.1f}%"]
+            return None, [f"already_moved_{spot_1h:.1f}%"]
         if spot_1h < -5:
-            return None, [f"dumping {spot_1h:.1f}%"]
+            return None, [f"dumping_{spot_1h:.1f}%"]
 
         oi_data = get_oi_history(symbol, "5m", 13)
         if not oi_data or len(oi_data) < 6:
@@ -219,7 +257,7 @@ def check_pre_pump(symbol, price):
             oi_15m_ago = float(oi_data[-4]["sumOpenInterestValue"])
             oi_1h_ago = float(oi_data[0]["sumOpenInterestValue"])
         except (KeyError, ValueError, IndexError):
-            return None, ["oi_parse"]
+            return None, ["oi_parse_error"]
 
         if oi_15m_ago == 0 or oi_1h_ago == 0:
             return None, ["oi_zero"]
@@ -228,17 +266,17 @@ def check_pre_pump(symbol, price):
         oi_1h_change = ((current_oi - oi_1h_ago) / oi_1h_ago) * 100
 
         if oi_15m_change < 5 and oi_1h_change < 10:
-            reasons.append("oi_flat")
+            reasons.append(f"oi_flat_{oi_15m_change:.1f}%_{oi_1h_change:.1f}%")
 
         funding = get_funding_rate(symbol)
         if funding >= 0:
-            reasons.append(f"funding_pos")
+            reasons.append(f"funding_pos_{funding*100:.4f}%")
         elif funding > -0.0001:
-            reasons.append(f"funding_weak")
+            reasons.append(f"funding_weak_{funding*100:.4f}%")
 
         ls_ratio = get_top_trader_ratio(symbol)
         if ls_ratio < 1.2:
-            reasons.append("ls_low")
+            reasons.append(f"ls_low_{ls_ratio:.2f}")
 
         if reasons:
             return None, reasons
@@ -278,11 +316,10 @@ def get_session_label(hour, minute):
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
-    print(f"Futures Scanner starting at {ist} IST — Session label: {session}")
-    print("Data collection mode active (Sept 25 - Oct 25). No session filter.")
+    print(f"Futures Scanner starting at {ist} IST — Session: {session}")
 
     if not btc_is_healthy():
-        print("BTC dumping >2% in 1h. All alerts blocked.")
+        print("BTC dumping >2%. Skipping.")
         return
 
     candidates = get_futures_candidates()
@@ -309,10 +346,11 @@ def main():
                 hits.append(c)
             else:
                 if reasons:
-                    top = reasons[0].split()[0].split("_")[0]
+                    top = reasons[0].split("_")[0]
                     rejection[top] = rejection.get(top, 0) + 1
+                    log_rejection(c["symbol"], reasons, c["price"], c["change_24h"], "prepump")
 
-    print(f"Rejection reasons: {rejection}")
+    print(f"Stage2 rejection: {rejection}")
     print(f"Found {len(hits)} pre-pump signals")
 
     now = datetime.utcnow()
@@ -321,22 +359,23 @@ def main():
         plan = build_execution_plan(h["price"])
         msg = (
             f"🔮 <b>PRE-PUMP DETECTED</b> [{session}]\n\n"
+            f"<b>Type:</b> WHALE LOADING (warning only)\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])} (flat)\n"
-            f"<b>24h Change:</b> {h['change_24h']:.2f}%\n"
-            f"<b>1h Spot Move:</b> {h['spot_1h']:+.2f}%\n"
-            f"<b>OI 15m Change:</b> +{h['oi_15m_change']:.2f}%\n"
-            f"<b>OI 1h Change:</b> +{h['oi_1h_change']:.2f}%\n"
-            f"<b>OI Value:</b> ${h['oi_value']:,.0f}\n"
-            f"<b>Funding Rate:</b> {h['funding']*100:.4f}%\n"
-            f"<b>Top Trader L/S:</b> {h['ls_ratio']:.2f}\n"
+            f"<b>24h:</b> {h['change_24h']:.2f}%\n"
+            f"<b>1h Spot:</b> {h['spot_1h']:+.2f}%\n"
+            f"<b>OI 15m:</b> +{h['oi_15m_change']:.2f}%\n"
+            f"<b>OI 1h:</b> +{h['oi_1h_change']:.2f}%\n"
+            f"<b>OI Val:</b> ${h['oi_value']:,.0f}\n"
+            f"<b>Funding:</b> {h['funding']*100:.4f}%\n"
+            f"<b>L/S:</b> {h['ls_ratio']:.2f}\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"📋 <b>IF ENTERED NOW</b>\n"
-            f"<b>Entry:</b> {format_price(plan['entry'])}\n"
-            f"<b>Stop:</b> {format_price(plan['stop'])} (-3%)\n\n"
+            f"📋 <b>IF ENTERED</b>\n"
+            f"Entry: {format_price(plan['entry'])}\n"
+            f"Stop: {format_price(plan['stop'])} (-3%)\n\n"
             f"⚠️ <b>WAIT</b> for 🚨 Volume Breakout before entering.\n"
-            f"⚠️ DATA COLLECTION MODE - Log this alert"
+            f"⚠️ Check tag: Seed(half) / Monitoring(skip)"
         )
         send_telegram(msg)
 
