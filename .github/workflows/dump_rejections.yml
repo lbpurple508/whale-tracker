@@ -8,69 +8,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Download spike rejections
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: spike-rejections
           path: spike/
+
       - name: Download grind rejections
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: grind-rejections
           path: grind/
+
       - name: Download futures rejections
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: futures-rejections
           path: futures/
-      - name: Display spike
+
+      - name: Display all rejections
         run: |
-          echo "=== SPIKE REJECTIONS ==="
+          echo "========================================"
+          echo "SPIKE REJECTIONS"
+          echo "========================================"
           if [ -f spike/rejections.json ]; then
-            python3 -c "
-import json
-data = json.load(open('spike/rejections.json'))
-items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
-print(f'{len(data)} unique coins rejected')
-print()
-for sym, i in items[:30]:
-    print(f'{sym:<15} {i.get(\"count\", 0):>5}x  {i.get(\"change_24h\", 0):>7.2f}%  {i.get(\"top_reason\", \"\")}')
-"
+            python3 scripts/dump.py spike/rejections.json
           else
-            echo "no spike rejections file"
+            echo "no spike file"
           fi
-      - name: Display grind
-        run: |
-          echo "=== GRIND REJECTIONS ==="
+          echo ""
+          echo "========================================"
+          echo "GRIND REJECTIONS"
+          echo "========================================"
           if [ -f grind/grind_rejections.json ]; then
-            python3 -c "
-import json
-data = json.load(open('grind/grind_rejections.json'))
-items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
-print(f'{len(data)} unique coins rejected')
-print()
-for sym, i in items[:30]:
-    print(f'{sym:<15} {i.get(\"count\", 0):>5}x  {i.get(\"change_24h\", 0):>7.2f}%  {i.get(\"top_reason\", \"\")}')
-"
+            python3 scripts/dump.py grind/grind_rejections.json
           else
-            echo "no grind rejections file"
+            echo "no grind file"
           fi
-      - name: Display futures
-        run: |
-          echo "=== FUTURES REJECTIONS ==="
+          echo ""
+          echo "========================================"
+          echo "FUTURES REJECTIONS"
+          echo "========================================"
           if [ -f futures/futures_rejections.json ]; then
-            python3 -c "
-import json
-data = json.load(open('futures/futures_rejections.json'))
-items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
-print(f'{len(data)} unique coins rejected')
-print()
-for sym, i in items[:30]:
-    print(f'{sym:<15} {i.get(\"count\", 0):>5}x  {i.get(\"change_24h\", 0):>7.2f}%  {i.get(\"top_reason\", \"\")}')
-"
+            python3 scripts/dump.py futures/futures_rejections.json
           else
-            echo "no futures rejections file"
+            echo "no futures file"
           fi
