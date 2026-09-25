@@ -1,4 +1,4 @@
-name: Dump Rejections
+name: Dump Rejections Report
 
 on:
   workflow_dispatch:
