@@ -15,10 +15,12 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install requests
-      - name: Restore cooldown cache
+      - name: Restore cache
         uses: actions/cache/restore@v4
         with:
-          path: cooldown.json
+          path: |
+            cooldown.json
+            rejections.json
           key: cooldown-${{ github.run_id }}
           restore-keys: |
             cooldown-
@@ -27,9 +29,11 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scanner.py
-      - name: Save cooldown cache
+      - name: Save cache
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: cooldown.json
+          path: |
+            cooldown.json
+            rejections.json
           key: cooldown-${{ github.run_id }}
