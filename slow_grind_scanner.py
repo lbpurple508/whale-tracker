@@ -148,7 +148,6 @@ def get_candidates():
             price = float(t["lastPrice"])
         except (KeyError, ValueError):
             continue
-        # CHANGED: vol min 5M, change range 3-150%, price <$1
         if quote_vol < 5_000_000:
             rejected["vol_low"] += 1
             continue
@@ -213,8 +212,8 @@ def check_grind(symbol, price):
         current_close = float(klines[-1][4])
         price_1h_ago = float(klines[-5][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
-        # CHANGED: 1h range now 0.3 - 20%
-        if change_1h < 0.3 or change_1h > 20:
+        # FIXED: 1h cap now 0.3 - 4%
+        if change_1h < 0.3 or change_1h > 4:
             reasons.append(f"1h_{change_1h:.1f}%")
 
         price_4h_ago = float(klines[-17][4])
