@@ -2,25 +2,26 @@ import json
 import sys
 
 if len(sys.argv) < 2:
-    print("usage: python dump.py <file>")
+    print("usage: python dump.py <file1> [file2] [file3]")
     sys.exit(1)
 
-filename = sys.argv[1]
-try:
-    data = json.load(open(filename))
-except Exception as e:
-    print(f"error loading {filename}: {e}")
-    sys.exit(1)
+labels = {
+    "rejections": "SPIKE",
+    "grind_rejections": "GRIND",
+    "futures_rejections": "FUTURES",
+}
 
-items = sorted(data.items(), key=lambda x: x[1].get("count", 0), reverse=True)
-print(f"{len(data)} unique coins rejected")
-print()
-print(f"{'COIN':<15} {'COUNT':>6} {'24h%':>8} {'PRICE':>12}  REASON")
-print("-" * 70)
-
-for sym, info in items[:30]:
-    count = info.get("count", 0)
-    change = info.get("change_24h", 0)
-    price = info.get("price", 0)
-    reason = info.get("top_reason", "")
-    print(f"{sym:<15} {count:>6} {change:>7.2f}% {price:>12.6f}  {reason}")
+for filename in sys.argv[1:]:
+    print(f"\n=== {labels.get(filename.replace('.json','').split('/')[-1], filename)} ===")
+    try:
+        data = json.load(open(filename))
+    except Exception:
+        print("no data")
+        continue
+    items = sorted(data.items(), key=lambda x: x[1].get("count", 0), reverse=True)
+    print(f"{len(data)} coins rejected\n")
+    for sym, info in items[:15]:
+        count = info.get("count", 0)
+        change = info.get("change_24h", 0)
+        reason = info.get("top_reason", "")
+        print(f"{sym:<12} {count:>4}x {change:>+7.2f}% {reason}")
