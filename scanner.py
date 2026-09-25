@@ -236,7 +236,8 @@ def check_signal(symbol, price, session):
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         else:
             change_1h = 0
-        if change_1h < 0.5 or change_1h > 60:
+        # FIXED: 1h cap now 0.5 - 6%
+        if change_1h < 0.5 or change_1h > 6:
             reasons.append(f"1h_{change_1h:.1f}%")
 
         if len(klines) >= 17:
