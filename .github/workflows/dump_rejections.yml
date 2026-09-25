@@ -1,0 +1,72 @@
+name: Dump Rejections
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore spike rejections
+        uses: actions/cache/restore@v4
+        with:
+          path: rejections.json
+          key: cooldown-latest
+          restore-keys: |
+            cooldown-
+      - name: Restore grind rejections
+        uses: actions/cache/restore@v4
+        with:
+          path: grind_rejections.json
+          key: grind-cooldown-latest
+          restore-keys: |
+            grind-cooldown-
+      - name: Restore futures rejections
+        uses: actions/cache/restore@v4
+        with:
+          path: futures_rejections.json
+          key: futures-cooldown-latest
+          restore-keys: |
+            futures-cooldown-
+      - name: Display spike rejections
+        run: |
+          echo "=== SPIKE REJECTIONS ==="
+          if [ -f rejections.json ]; then
+            python3 -c "
+          import json
+          data = json.load(open('rejections.json'))
+          items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
+          for sym, i in items[:30]:
+              print(f\"{sym:<15} {i.get('count', 0):>5}x  {i.get('change_24h', 0):>7.2f}%  {i.get('top_reason', '')}\")
+          "
+          else
+            echo "no spike rejections file"
+          fi
+      - name: Display grind rejections
+        run: |
+          echo "=== GRIND REJECTIONS ==="
+          if [ -f grind_rejections.json ]; then
+            python3 -c "
+          import json
+          data = json.load(open('grind_rejections.json'))
+          items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
+          for sym, i in items[:30]:
+              print(f\"{sym:<15} {i.get('count', 0):>5}x  {i.get('change_24h', 0):>7.2f}%  {i.get('top_reason', '')}\")
+          "
+          else
+            echo "no grind rejections file"
+          fi
+      - name: Display futures rejections
+        run: |
+          echo "=== FUTURES REJECTIONS ==="
+          if [ -f futures_rejections.json ]; then
+            python3 -c "
+          import json
+          data = json.load(open('futures_rejections.json'))
+          items = sorted(data.items(), key=lambda x: x[1].get('count', 0), reverse=True)
+          for sym, i in items[:30]:
+              print(f\"{sym:<15} {i.get('count', 0):>5}x  {i.get('change_24h', 0):>7.2f}%  {i.get('top_reason', '')}\")
+          "
+          else
+            echo "no futures rejections file"
+          fi
