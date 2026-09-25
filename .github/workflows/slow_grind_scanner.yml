@@ -37,3 +37,12 @@ jobs:
             grind_cooldown.json
             grind_rejections.json
           key: grind-cooldown-${{ github.run_id }}
+      - name: Upload rejections
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grind-rejections
+          path: grind_rejections.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
