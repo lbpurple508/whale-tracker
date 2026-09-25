@@ -39,6 +39,9 @@ BLACKLIST = {
     "XPLUSDT",
 }
 
+# Global cache for spot symbols
+_SPOT_SYMBOLS = None
+
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -55,6 +58,27 @@ def send_telegram(message):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
+
+def get_spot_symbols():
+    """Fetch all USDT spot symbols from Binance Spot API (works from US)."""
+    global _SPOT_SYMBOLS
+    if _SPOT_SYMBOLS is not None:
+        return _SPOT_SYMBOLS
+    try:
+        url = f"{SPOT_API}/api/v3/exchangeInfo"
+        r = requests.get(url, timeout=20)
+        data = r.json()
+        symbols = set()
+        for s in data.get("symbols", []):
+            if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+                symbols.add(s["symbol"])
+        _SPOT_SYMBOLS = symbols
+        print(f"Loaded {len(symbols)} spot USDT symbols")
+        return symbols
+    except Exception as e:
+        print(f"spot symbols error: {e}")
+        _SPOT_SYMBOLS = set()
+        return _SPOT_SYMBOLS
 
 def load_cooldown():
     if COOLDOWN_FILE.exists():
@@ -81,7 +105,6 @@ def save_cooldown(data):
         print(f"cooldown save error: {e}")
 
 def log_rejection(symbol, reasons, price, change_24h, reason_type):
-    """Log rejection to file so we can analyze offline."""
     try:
         data = {}
         if REJECT_FILE.exists():
@@ -105,7 +128,6 @@ def log_rejection(symbol, reasons, price, change_24h, reason_type):
         data[key]["change_24h"] = change_24h
         data[key]["top_reason"] = reasons[0] if reasons else "unknown"
         data[key]["all_reasons"] = reasons[:3]
-        # Keep max 200 entries
         if len(data) > 200:
             sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
             data = dict(sorted_items[:200])
@@ -175,8 +197,14 @@ def get_futures_candidates():
     if not isinstance(data, list):
         print(f"Ticker response invalid: {type(data)}")
         return []
+    
+    spot_symbols = get_spot_symbols()
     candidates = []
-    rejected_stage1 = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0}
+    rejected_stage1 = {
+        "vol_low": 0, "change_range": 0, "price_high": 0,
+        "major": 0, "blacklist": 0, "not_on_spot": 0
+    }
+    
     for t in data:
         if not isinstance(t, dict):
             continue
@@ -191,6 +219,12 @@ def get_futures_candidates():
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
             continue
+        
+        # NEW FIX: Cross-check symbol exists on Binance Spot
+        if spot_symbols and symbol not in spot_symbols:
+            rejected_stage1["not_on_spot"] += 1
+            continue
+        
         try:
             quote_vol = float(t.get("quoteVolume", 0))
             change = float(t.get("priceChangePercent", 0))
@@ -323,7 +357,7 @@ def main():
         return
 
     candidates = get_futures_candidates()
-    print(f"Futures candidates: {len(candidates)}")
+    print(f"Futures candidates (spot-verified): {len(candidates)}")
 
     if not candidates:
         print("No candidates. Exiting.")
