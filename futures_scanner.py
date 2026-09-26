@@ -58,8 +58,6 @@ def send_telegram(message):
         print(f"Telegram error: {e}")
 
 def get_working_proxy():
-    """Fetch proxies from ProxyScrape GitHub mirror and find one that works with Binance."""
-    # Check cache first (5 min validity)
     if PROXY_CACHE_FILE.exists():
         try:
             cached = json.loads(PROXY_CACHE_FILE.read_text())
@@ -79,12 +77,10 @@ def get_working_proxy():
             print("Invalid proxy list format")
             return None
 
-        # Filter: HTTP protocol + SSL support (needed for HTTPS Binance API)
         candidates = [
             p for p in data
             if p.get("protocol") == "http" and p.get("ssl") is True
         ]
-        # Sort by uptime (descending) and latency (ascending)
         candidates.sort(key=lambda x: (-x.get("uptime_percent", 0), x.get("latency_ms", 9999)))
 
         print(f"Testing {len(candidates[:50])} HTTP+SSL proxies...")
@@ -115,7 +111,6 @@ def get_working_proxy():
         return None
 
 def safe_get(url, timeout=15, proxy=None):
-    """GET through proxy."""
     if not proxy:
         return None
     proxies = {"http": proxy, "https": proxy}
@@ -400,7 +395,8 @@ def main():
 
     proxy = get_working_proxy()
     if not proxy:
-        print("No working proxy. Skipping futures scan.")
+        print("No working proxy. Alerting Telegram.")
+        send_telegram("⚠️ <b>FUTURES SCANNER - NO PROXY</b>\n\nAll free proxies failed. Futures signals paused until next run.")
         return
 
     candidates = get_futures_candidates(proxy)
@@ -462,5 +458,13 @@ def main():
 
     save_cooldown(cooldown)
 
+def safe_main():
+    try:
+        main()
+    except Exception as e:
+        err = str(e)[:300]
+        send_telegram(f"🚨 <b>FUTURES SCANNER CRASHED</b>\n\n<b>Error:</b> {err}")
+        raise
+
 if __name__ == "__main__":
-    main()
+    safe_main()
