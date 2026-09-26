@@ -15,7 +15,6 @@ PROXY_LIST_URL_1 = "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main
 PROXY_LIST_URL_2 = "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/http.txt"
 COOLDOWN_FILE = Path("futures_cooldown.json")
 REJECT_FILE = Path("futures_rejections.json")
-PROXY_POOL_FILE = Path("proxy_pool.json")
 COOLDOWN_MINUTES = 60
 
 MAJORS = {
@@ -46,11 +45,9 @@ _PROXY_POOL = []
 # ---------- PROXY POOL ----------
 
 def load_proxy_pool():
-    """Fetch fresh proxy list and build in-memory pool."""
     global _PROXY_POOL
     all_proxies = []
-    
-    # Source 1: ProxyScrape
+
     try:
         r = requests.get(PROXY_LIST_URL_1, timeout=15)
         data = r.json()
@@ -64,7 +61,6 @@ def load_proxy_pool():
     except Exception as e:
         print(f"ProxyScrape error: {e}")
 
-    # Source 2: ProxRipper
     try:
         r = requests.get(PROXY_LIST_URL_2, timeout=15)
         for line in r.text.splitlines():
@@ -76,7 +72,6 @@ def load_proxy_pool():
     except Exception as e:
         print(f"ProxRipper error: {e}")
 
-    # Dedupe + shuffle
     all_proxies = list(set(all_proxies))
     random.shuffle(all_proxies)
     _PROXY_POOL = all_proxies
@@ -84,17 +79,16 @@ def load_proxy_pool():
     return _PROXY_POOL
 
 def get_random_proxy():
-    """Get random proxy from pool."""
     if not _PROXY_POOL:
         load_proxy_pool()
     if not _PROXY_POOL:
         return None
     return random.choice(_PROXY_POOL)
 
-def rotate_get(url, timeout=10, max_attempts=8):
+def rotate_get_small(url, timeout=8, max_attempts=30):
     """
-    Try up to max_attempts proxies. Each request uses a DIFFERENT proxy.
-    Returns parsed JSON or None.
+    For SMALL endpoints only (< 5KB response).
+    Rotates proxy on each attempt. Tries up to 30 proxies.
     """
     for attempt in range(max_attempts):
         proxy = get_random_proxy()
@@ -112,10 +106,8 @@ def rotate_get(url, timeout=10, max_attempts=8):
                 except Exception:
                     continue
             elif r.status_code == 451:
-                # Blocked - try different proxy
                 continue
         except Exception:
-            # Timeout/error - try different proxy
             continue
     return None
 
@@ -217,6 +209,8 @@ def get_spot_1h_change(symbol):
     except Exception:
         return 0
 
+# ---------- CANDIDATES VIA SPOT API (NO PROXY NEEDED) ----------
+
 def get_spot_symbols():
     global _SPOT_SYMBOLS
     if _SPOT_SYMBOLS is not None:
@@ -237,57 +231,31 @@ def get_spot_symbols():
         _SPOT_SYMBOLS = set()
         return _SPOT_SYMBOLS
 
-# ---------- FUTURES DATA (VIA ROTATING PROXIES) ----------
-
-def get_futures_candidates():
-    """Get ticker data via rotating proxies."""
-    # First, get all futures tickers with ONE good proxy
-    data = None
-    for attempt in range(15):
-        proxy = get_random_proxy()
-        if not proxy:
-            break
-        try:
-            r = requests.get(
-                f"{FAPI}/fapi/v1/ticker/24hr",
-                proxies={"http": proxy, "https": proxy},
-                timeout=15
-            )
-            if r.status_code == 200:
-                d = r.json()
-                if isinstance(d, list) and len(d) > 100:
-                    data = d
-                    print(f"Got ticker data on attempt {attempt+1}")
-                    break
-        except Exception:
-            continue
-    
-    if not data:
-        print("Failed to get ticker data after 15 attempts")
-        return []
-    
+def get_candidates_from_spot():
+    """
+    Get candidate list from Binance SPOT API (no proxy needed).
+    Filter: price <$1, 24h change -3% to +10%, volume >$10M.
+    Then verify futures availability later via OI call.
+    """
+    url = f"{SPOT_API}/api/v3/ticker/24hr"
+    r = requests.get(url, timeout=20)
+    tickers = r.json()
     spot_symbols = get_spot_symbols()
     candidates = []
-    rejected_stage1 = {
-        "vol_low": 0, "change_range": 0, "price_high": 0,
-        "major": 0, "blacklist": 0, "not_on_spot": 0
-    }
-    for t in data:
-        if not isinstance(t, dict):
-            continue
+    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0}
+    for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
+        if symbol not in spot_symbols:
+            continue
         if symbol in MAJORS:
-            rejected_stage1["major"] += 1
+            rejected["major"] += 1
             continue
         if symbol in BLACKLIST:
-            rejected_stage1["blacklist"] += 1
+            rejected["blacklist"] += 1
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
-            continue
-        if spot_symbols and symbol not in spot_symbols:
-            rejected_stage1["not_on_spot"] += 1
             continue
         try:
             quote_vol = float(t.get("quoteVolume", 0))
@@ -296,13 +264,13 @@ def get_futures_candidates():
         except (KeyError, ValueError, TypeError):
             continue
         if quote_vol < 10_000_000:
-            rejected_stage1["vol_low"] += 1
+            rejected["vol_low"] += 1
             continue
         if price > 1.00 or price <= 0:
-            rejected_stage1["price_high"] += 1
+            rejected["price_high"] += 1
             continue
-        if abs(change) > 5:
-            rejected_stage1["change_range"] += 1
+        if change < -3 or change > 10:
+            rejected["change_range"] += 1
             continue
         candidates.append({
             "symbol": symbol,
@@ -310,37 +278,46 @@ def get_futures_candidates():
             "change_24h": change,
             "quote_vol": quote_vol,
         })
-    print(f"Stage1 rejections: {rejected_stage1}")
+    print(f"Stage1 rejections: {rejected}")
     return candidates
 
+# ---------- FUTURES DATA VIA PROXY (SMALL RESPONSES ONLY) ----------
+
 def get_oi_history(symbol, period="5m", limit=13):
+    """OI history: small JSON (~1KB). Works with rotating proxies."""
     url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
-    data = rotate_get(url, timeout=8, max_attempts=6)
+    data = rotate_get_small(url, timeout=6, max_attempts=15)
     if not isinstance(data, list):
         return []
     return data
 
 def get_funding_rate(symbol):
+    """Funding: tiny JSON. Fast."""
     url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
-    data = rotate_get(url, timeout=8, max_attempts=6)
+    data = rotate_get_small(url, timeout=6, max_attempts=15)
     if not isinstance(data, dict):
-        return 0
+        return None
     try:
         return float(data.get("lastFundingRate", 0))
     except Exception:
-        return 0
+        return None
 
 def get_top_trader_ratio(symbol):
+    """L/S ratio: tiny JSON."""
     url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
-    data = rotate_get(url, timeout=8, max_attempts=6)
+    data = rotate_get_small(url, timeout=6, max_attempts=15)
     if not isinstance(data, list) or not data:
-        return 1
+        return None
     try:
         return float(data[-1].get("longShortRatio", 1))
     except Exception:
-        return 1
+        return None
 
 def check_pre_pump(symbol, price):
+    """
+    If OI call returns [] → coin not on futures. Skip silently.
+    Only alert if all 3 futures calls return valid data.
+    """
     reasons = []
     try:
         spot_1h = get_spot_1h_change(symbol)
@@ -349,9 +326,10 @@ def check_pre_pump(symbol, price):
         if spot_1h < -5:
             return None, [f"dumping_{spot_1h:.1f}%"]
 
+        # OI history check - if empty, not on futures
         oi_data = get_oi_history(symbol, "5m", 13)
         if not oi_data or len(oi_data) < 6:
-            return None, ["no_oi"]
+            return None, ["not_on_futures"]
 
         try:
             current_oi = float(oi_data[-1]["sumOpenInterestValue"])
@@ -370,12 +348,16 @@ def check_pre_pump(symbol, price):
             reasons.append(f"oi_flat_{oi_15m_change:.1f}%_{oi_1h_change:.1f}%")
 
         funding = get_funding_rate(symbol)
+        if funding is None:
+            return None, ["funding_fail"]
         if funding >= 0:
             reasons.append(f"funding_pos_{funding*100:.4f}%")
         elif funding > -0.0001:
             reasons.append(f"funding_weak_{funding*100:.4f}%")
 
         ls_ratio = get_top_trader_ratio(symbol)
+        if ls_ratio is None:
+            return None, ["ls_fail"]
         if ls_ratio < 1.2:
             reasons.append(f"ls_low_{ls_ratio:.2f}")
 
@@ -429,19 +411,25 @@ def main():
         print("No proxies available. Exiting.")
         return
 
-    candidates = get_futures_candidates()
-    print(f"Futures candidates (spot-verified): {len(candidates)}")
+    # Get candidates from SPOT API (no proxy)
+    candidates = get_candidates_from_spot()
+    print(f"Candidates from spot: {len(candidates)}")
 
     if not candidates:
         print("No candidates. Exiting.")
         return
+
+    # Limit to top 40 by volume (fewer = faster scan)
+    candidates.sort(key=lambda x: x["quote_vol"], reverse=True)
+    candidates = candidates[:40]
+    print(f"Scanning top {len(candidates)} by volume...")
 
     cooldown = load_cooldown()
     print(f"Cooldown: {list(cooldown.keys())}")
 
     hits = []
     rejection = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(check_pre_pump, c["symbol"], c["price"]): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
@@ -466,7 +454,6 @@ def main():
         stop = h["price"] * 0.97
         msg = (
             f"🔮 <b>PRE-PUMP DETECTED</b> [{session}]\n\n"
-            f"<b>Type:</b> WHALE LOADING\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])} (flat)\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
@@ -478,10 +465,10 @@ def main():
             f"<b>L/S:</b> {h['ls_ratio']:.2f}\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"📋 <b>IF ENTERED</b>\n"
+            f"📋 <b>PLAN</b>\n"
             f"Entry: {format_price(h['price'])}\n"
             f"Stop: {format_price(stop)} (-3%)\n\n"
-            f"⚠️ WAIT for Volume Breakout or Grind before entering."
+            f"⚠️ WAIT for Volume Breakout before entering."
         )
         send_telegram(msg)
 
