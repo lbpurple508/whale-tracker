@@ -37,6 +37,17 @@ BLACKLIST = {
     "XPLUSDT",
 }
 
+# Monitoring tokens - handled by separate scanner
+MONITORING_BLACKLIST = {
+    "RAREUSDT", "ARKUSDT", "WIFUSDT", "QIUSDT", "MOVEUSDT",
+    "STXUSDT", "LSKUSDT", "SYNUSDT", "MOVRUSDT", "NOMUSDT",
+    "JASMYUSDT", "TLMUSDT", "GLMRUSDT", "QUICKUSDT", "ACTUSDT",
+    "BLURUSDT", "RESOLVUSDT", "AVAUSDT", "DODOUSDT", "PORTALUSDT",
+    "VELODROMEUSDT", "EPICUSDT", "SOPHUSDT", "AWEUSDT", "SCRUSDT",
+    "HEIUSDT", "TOWNSUSDT", "GTCUSDT", "FTTUSDT", "COOKIEUSDT",
+    "QKCUSDT", "GNSUSDT",
+}
+
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -119,15 +130,9 @@ def record_alert(symbol):
 def log_rejection(symbol, reasons, price, change_24h):
     try:
         data = load_json(REJECT_FILE)
-        key = f"{symbol}"
+        key = symbol
         if key not in data:
-            data[key] = {
-                "symbol": symbol,
-                "first_seen": datetime.utcnow().isoformat(),
-                "count": 0,
-                "price": price,
-                "change_24h": change_24h,
-            }
+            data[key] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
         data[key]["count"] += 1
         data[key]["last_seen"] = datetime.utcnow().isoformat()
         data[key]["price"] = price
@@ -162,7 +167,7 @@ def get_candidates():
     r = requests.get(url, timeout=20)
     tickers = r.json()
     candidates = []
-    rejected_stage1 = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0}
+    rejected_stage1 = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0, "monitoring": 0}
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
@@ -172,6 +177,9 @@ def get_candidates():
             continue
         if symbol in BLACKLIST:
             rejected_stage1["blacklist"] += 1
+            continue
+        if symbol in MONITORING_BLACKLIST:
+            rejected_stage1["monitoring"] += 1
             continue
         if symbol.endswith("BUSDT"):
             continue
@@ -391,10 +399,10 @@ def main():
             header = f"🚨 <b>VOLUME BREAKOUT</b> [{session}]"
             priority = "NORMAL"
         elif count == 2:
-            header = f"🚨🚨 <b>STRONG BREAKOUT — 2ND ALERT</b> [{session}]"
+            header = f"🚨🚨 <b>STRONG BREAKOUT — 2ND</b> [{session}]"
             priority = "STRONG"
         else:
-            header = f"💥💥 <b>URGENT — {count}X ALERTS</b> [{session}]"
+            header = f"💥💥 <b>URGENT — {count}X</b> [{session}]"
             priority = "URGENT"
 
         record_alert(h["symbol"])
@@ -422,8 +430,7 @@ def main():
             f"Entry: {format_price(h['price'])}\n"
             f"Stop: {format_price(stop)} (-3%)\n"
             f"Trail: +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
-            f"⚠️ 2nd alert = ENTER\n"
-            f"⚠️ Check tag: Seed(half) / Monitoring(half)"
+            f"⚠️ 2nd alert = ENTER"
         )
         send_telegram(msg)
 
@@ -431,8 +438,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        err = str(e)[:300]
-        send_telegram(f"🚨 <b>SPIKE SCANNER CRASHED</b>\n\n<b>Error:</b> {err}")
+        send_telegram(f"🚨 <b>SPIKE SCANNER CRASHED</b>\n\n<b>Error:</b> {str(e)[:300]}")
         raise
 
 if __name__ == "__main__":
