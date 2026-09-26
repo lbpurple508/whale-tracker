@@ -416,5 +416,13 @@ def main():
         )
         send_telegram(msg)
 
+def safe_main():
+    try:
+        main()
+    except Exception as e:
+        err = str(e)[:300]
+        send_telegram(f"🚨 <b>GRIND SCANNER CRASHED</b>\n\n<b>Error:</b> {err}")
+        raise
+
 if __name__ == "__main__":
-    main()
+    safe_main()
