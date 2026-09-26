@@ -76,7 +76,7 @@ def save_json(path, data):
     try:
         path.write_text(json.dumps(data))
     except Exception as e:
-        print(f"save error {path}: {e}")
+        print(f"save error: {e}")
 
 def load_cooldown():
     data = load_json(COOLDOWN_FILE)
@@ -166,19 +166,19 @@ def get_candidates():
     r = requests.get(url, timeout=20)
     tickers = r.json()
     candidates = []
-    rejected_stage1 = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0, "monitoring": 0}
+    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0, "monitoring": 0}
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
         if symbol in MAJORS:
-            rejected_stage1["major"] += 1
+            rejected["major"] += 1
             continue
         if symbol in BLACKLIST:
-            rejected_stage1["blacklist"] += 1
+            rejected["blacklist"] += 1
             continue
         if symbol in MONITORING_BLACKLIST:
-            rejected_stage1["monitoring"] += 1
+            rejected["monitoring"] += 1
             continue
         if symbol.endswith("BUSDT"):
             continue
@@ -191,13 +191,13 @@ def get_candidates():
         except (KeyError, ValueError):
             continue
         if quote_vol < 5_000_000:
-            rejected_stage1["vol_low"] += 1
+            rejected["vol_low"] += 1
             continue
         if change < 2 or change > 200:
-            rejected_stage1["change_range"] += 1
+            rejected["change_range"] += 1
             continue
         if price > 1.00:
-            rejected_stage1["price_high"] += 1
+            rejected["price_high"] += 1
             continue
         candidates.append({
             "symbol": symbol,
@@ -205,7 +205,7 @@ def get_candidates():
             "change_24h": change,
             "quote_vol": quote_vol,
         })
-    print(f"Stage1 rejections: {rejected_stage1}")
+    print(f"Stage1 rejections: {rejected}")
     return candidates
 
 def compute_rsi(closes, period=14):
@@ -266,8 +266,6 @@ def check_signal(symbol, price, session):
             return None, ["avg_vol_zero"]
         vol_ratio = recent_1h_vol / avg_1h_vol
 
-        # SPIKE SCANNER: ONLY fires on 5x+ volume spike
-        # Acceleration (2x + 3/4) is handled by slow_grind_scanner
         if vol_ratio < 5:
             reasons.append(f"vol_{vol_ratio:.1f}x_need5x")
 
@@ -393,40 +391,36 @@ def main():
     print(f"Found {len(hits)} signals")
     for h in hits:
         count = get_alert_count(h["symbol"]) + 1
-        if count == 1:
-            header = f"🚨 <b>VOLUME BREAKOUT</b> [{session}]"
-            priority = "NORMAL"
-        elif count == 2:
-            header = f"🚨🚨 <b>STRONG BREAKOUT — 2ND</b> [{session}]"
-            priority = "STRONG"
-        else:
-            header = f"💥💥 <b>URGENT — {count}X</b> [{session}]"
-            priority = "URGENT"
-
         record_alert(h["symbol"])
         stop = h["price"] * 0.97
 
+        # ============ CLEAR HEADER AND ACTION ============
+        if count == 1:
+            header = f"🚨 VOLUME BREAKOUT [1/2] [{session}]"
+            action = "⏸️ WAIT — Do NOT enter yet. Wait for [2/2] alert."
+        elif count == 2:
+            header = f"🚨🚨 VOLUME BREAKOUT [2/2] [{session}]"
+            action = "✅ ENTER NOW — Buy at current price."
+        else:
+            header = f"💥 VOLUME BREAKOUT [{count}/2+] [{session}]"
+            action = f"✅ ADD MORE — This is confirmation #{count}. Buy another $5."
+
         msg = (
             f"{header}\n\n"
-            f"<b>Priority:</b> {priority}\n"
-            f"<b>Alerts (4h):</b> {count}\n"
-            f"<b>Signal:</b> SPIKE\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
             f"<b>1h:</b> {h['change_1h']:.2f}%\n"
             f"<b>4h:</b> {h['change_4h']:.2f}%\n"
             f"<b>RSI:</b> {h['rsi']:.1f}\n"
-            f"<b>Vol (1h):</b> {h['vol_ratio']:.2f}x\n"
-            f"<b>Taker:</b> {h['taker_pct']:.1f}%\n"
-            f"<b>Bid:</b> ${h['bid_depth']:,.0f}\n"
-            f"<b>Ask:</b> ${h['ask_depth']:,.0f}\n"
+            f"<b>Volume:</b> {h['vol_ratio']:.2f}x normal\n"
+            f"<b>Buyers:</b> {h['taker_pct']:.1f}%\n"
+            f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
+            f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"📋 <b>PLAN</b>\n"
-            f"Entry: {format_price(h['price'])}\n"
-            f"Stop: {format_price(stop)} (-3%)\n"
-            f"Trail: +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
-            f"⚠️ 2nd alert = ENTER"
+            f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
+            f"<b>Trail:</b> +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
+            f"{action}"
         )
         send_telegram(msg)
 
@@ -434,7 +428,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        send_telegram(f"🚨 <b>SPIKE SCANNER CRASHED</b>\n\n<b>Error:</b> {str(e)[:300]}")
+        send_telegram(f"🚨 SPIKE SCANNER CRASHED\n\nError: {str(e)[:300]}")
         raise
 
 if __name__ == "__main__":
