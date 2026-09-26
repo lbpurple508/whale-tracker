@@ -11,7 +11,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("cooldown.json")
 REJECT_FILE = Path("rejections.json")
+HISTORY_FILE = Path("alert_history.json")
 COOLDOWN_MINUTES = 30
+HISTORY_HOURS = 4
 
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -52,45 +54,77 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def load_cooldown():
-    if COOLDOWN_FILE.exists():
+def load_json(path):
+    if path.exists():
         try:
-            data = json.loads(COOLDOWN_FILE.read_text())
-            now = datetime.utcnow()
-            cleaned = {}
-            for sym, ts in data.items():
-                try:
-                    t = datetime.fromisoformat(ts)
-                    if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
-                        cleaned[sym] = ts
-                except Exception:
-                    pass
-            return cleaned
+            return json.loads(path.read_text())
         except Exception:
             return {}
     return {}
 
-def save_cooldown(data):
+def save_json(path, data):
     try:
-        COOLDOWN_FILE.write_text(json.dumps(data))
+        path.write_text(json.dumps(data))
     except Exception as e:
-        print(f"cooldown save error: {e}")
+        print(f"save error {path}: {e}")
 
-def log_rejection(symbol, reasons, price, change_24h, reason_type):
+def load_cooldown():
+    data = load_json(COOLDOWN_FILE)
+    now = datetime.utcnow()
+    cleaned = {}
+    for sym, ts in data.items():
+        try:
+            t = datetime.fromisoformat(ts)
+            if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
+                cleaned[sym] = ts
+        except Exception:
+            pass
+    return cleaned
+
+def get_alert_count(symbol):
+    history = load_json(HISTORY_FILE)
+    now = datetime.utcnow()
+    if symbol not in history:
+        return 0
+    events = history[symbol].get("events", [])
+    count = 0
+    for ts_str in events:
+        try:
+            t = datetime.fromisoformat(ts_str)
+            if (now - t).total_seconds() < HISTORY_HOURS * 3600:
+                count += 1
+        except Exception:
+            pass
+    return count
+
+def record_alert(symbol):
+    history = load_json(HISTORY_FILE)
+    now = datetime.utcnow()
+    if symbol not in history:
+        history[symbol] = {"events": []}
+    history[symbol]["events"].append(now.isoformat())
+    history[symbol]["events"] = [
+        ts for ts in history[symbol]["events"]
+        if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600
+    ]
+    if len(history) > 300:
+        sorted_items = sorted(
+            history.items(),
+            key=lambda x: x[1]["events"][-1] if x[1]["events"] else "",
+            reverse=True
+        )
+        history = dict(sorted_items[:300])
+    save_json(HISTORY_FILE, history)
+
+def log_rejection(symbol, reasons, price, change_24h):
     try:
-        data = {}
-        if REJECT_FILE.exists():
-            try:
-                data = json.loads(REJECT_FILE.read_text())
-            except Exception:
-                data = {}
+        data = load_json(REJECT_FILE)
         key = f"{symbol}"
         if key not in data:
             data[key] = {
                 "symbol": symbol,
                 "first_seen": datetime.utcnow().isoformat(),
                 "count": 0,
-                "type": reason_type,
                 "price": price,
                 "change_24h": change_24h,
             }
@@ -99,11 +133,10 @@ def log_rejection(symbol, reasons, price, change_24h, reason_type):
         data[key]["price"] = price
         data[key]["change_24h"] = change_24h
         data[key]["top_reason"] = reasons[0] if reasons else "unknown"
-        data[key]["all_reasons"] = reasons[:3]
         if len(data) > 200:
             sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
             data = dict(sorted_items[:200])
-        REJECT_FILE.write_text(json.dumps(data))
+        save_json(REJECT_FILE, data)
     except Exception as e:
         print(f"reject log error: {e}")
 
@@ -121,8 +154,7 @@ def btc_is_healthy():
         change = ((current_close - prev_close) / prev_close) * 100
         print(f"BTC 1h change: {change:.2f}%")
         return change > -2
-    except Exception as e:
-        print(f"BTC check error: {e}")
+    except Exception:
         return True
 
 def get_candidates():
@@ -151,10 +183,10 @@ def get_candidates():
             price = float(t["lastPrice"])
         except (KeyError, ValueError):
             continue
-        if quote_vol < 10_000_000:
+        if quote_vol < 5_000_000:
             rejected_stage1["vol_low"] += 1
             continue
-        if change < 1 or change > 150:
+        if change < 2 or change > 200:
             rejected_stage1["change_range"] += 1
             continue
         if price > 1.00:
@@ -210,19 +242,28 @@ def check_signal(symbol, price, session):
             return None, ["not_enough_klines"]
 
         if session == "US":
-            vol_min, rsi_min, rsi_max, taker_min, depth_min = 6, 55, 70, 0.65, 60_000
+            rsi_max = 70
+            taker_min = 0.65
+            depth_min = 60_000
         else:
-            vol_min, rsi_min, rsi_max, taker_min, depth_min = 5, 55, 72, 0.60, 75_000
+            rsi_max = 72
+            taker_min = 0.60
+            depth_min = 60_000
 
-        volumes = [float(k[5]) for k in klines[:-2]]
-        avg = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes)
-        current_vol = float(klines[-1][5])
-        prev_vol = float(klines[-2][5])
-        if avg == 0:
+        # Volume spike OR acceleration
+        last_4_vols = [float(k[5]) for k in klines[-4:]]
+        accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
+        recent_1h_vol = sum(float(k[5]) for k in klines[-4:])
+        prior_vols = [float(k[5]) for k in klines[-20:-4]]
+        avg_1h_vol = sum(prior_vols) / len(prior_vols) * 4 if prior_vols else 0
+        if avg_1h_vol == 0:
             return None, ["avg_vol_zero"]
-        vol_ratio = max(current_vol / avg, prev_vol / avg)
-        if vol_ratio < vol_min:
-            reasons.append(f"vol_{vol_ratio:.1f}x")
+        vol_ratio = recent_1h_vol / avg_1h_vol
+
+        has_spike = vol_ratio >= 5
+        has_acceleration = vol_ratio >= 2 and accel_count >= 3
+        if not (has_spike or has_acceleration):
+            reasons.append(f"vol_{vol_ratio:.1f}x_acc{accel_count}")
 
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
@@ -236,8 +277,7 @@ def check_signal(symbol, price, session):
             change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         else:
             change_1h = 0
-        # FIXED: 1h cap now 0.5 - 6%
-        if change_1h < 0.5 or change_1h > 6:
+        if change_1h < -0.5 or change_1h > 8:
             reasons.append(f"1h_{change_1h:.1f}%")
 
         if len(klines) >= 17:
@@ -245,14 +285,12 @@ def check_signal(symbol, price, session):
             change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         else:
             change_4h = 0
-        if change_4h < 0:
-            reasons.append(f"4h_neg_{change_4h:.1f}%")
-        if change_4h > 80:
-            reasons.append(f"4h_high_{change_4h:.1f}%")
+        if change_4h < 0 or change_4h > 60:
+            reasons.append(f"4h_{change_4h:.1f}%")
 
         closes = [float(k[4]) for k in klines]
         rsi = compute_rsi(closes, 14)
-        if rsi < rsi_min:
+        if rsi < 50:
             reasons.append(f"RSI_low_{rsi:.1f}")
         if rsi > rsi_max:
             reasons.append(f"RSI_high_{rsi:.1f}")
@@ -261,24 +299,24 @@ def check_signal(symbol, price, session):
         taker_buy = float(klines[-1][9])
         if total_vol == 0:
             reasons.append("vol_zero")
-        taker_buy_pct = taker_buy / total_vol if total_vol else 0
-        if taker_buy_pct < taker_min:
-            reasons.append(f"taker_{taker_buy_pct*100:.1f}%")
+        taker_pct = taker_buy / total_vol if total_vol else 0
+        if taker_pct < taker_min:
+            reasons.append(f"taker_{taker_pct*100:.1f}%")
 
         bid_depth, ask_depth = check_depth(symbol, price)
         if bid_depth < depth_min:
-            reasons.append(f"bid_thin_{bid_depth:.0f}")
+            reasons.append(f"bid_{bid_depth:.0f}")
         if ask_depth < depth_min:
-            reasons.append(f"ask_thin_{ask_depth:.0f}")
-        if ask_depth > 0 and bid_depth / ask_depth < 0.6:
-            reasons.append("bid_ask_ratio")
+            reasons.append(f"ask_{ask_depth:.0f}")
 
         if reasons:
             return None, reasons
 
         return {
             "vol_ratio": vol_ratio,
-            "taker_buy_pct": taker_buy_pct * 100,
+            "accel_count": accel_count,
+            "is_spike": has_spike,
+            "taker_pct": taker_pct * 100,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
             "change_1h": change_1h,
@@ -292,7 +330,6 @@ def scan(session):
     candidates = get_candidates()
     print(f"Candidates after Stage1: {len(candidates)}")
     cooldown = load_cooldown()
-    print(f"Cooldown active: {list(cooldown.keys())}")
     hits = []
     rejection_summary = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -309,12 +346,12 @@ def scan(session):
                 if reasons:
                     top = reasons[0].split("_")[0]
                     rejection_summary[top] = rejection_summary.get(top, 0) + 1
-                    log_rejection(c["symbol"], reasons, c["price"], c["change_24h"], "spike")
-    print(f"Stage2 rejection reasons: {rejection_summary}")
+                    log_rejection(c["symbol"], reasons, c["price"], c["change_24h"])
+    print(f"Stage2 rejection: {rejection_summary}")
     now = datetime.utcnow()
     for h in hits:
         cooldown[h["symbol"]] = now.isoformat()
-    save_cooldown(cooldown)
+    save_json(COOLDOWN_FILE, cooldown)
     return hits
 
 def get_session_label(hour, minute):
@@ -341,27 +378,44 @@ def get_session_label(hour, minute):
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
-    print(f"Scanner starting at {ist} IST — Session: {session}")
+    print(f"Spike Scanner starting at {ist} IST — Session: {session}")
 
     if not btc_is_healthy():
         print("BTC dumping >2%. Skipping.")
         return
 
     hits = scan(session)
-    print(f"Found {len(hits)} hits")
+    print(f"Found {len(hits)} signals")
     for h in hits:
+        count = get_alert_count(h["symbol"]) + 1
+        if count == 1:
+            header = f"🚨 <b>VOLUME BREAKOUT</b> [{session}]"
+            priority = "NORMAL"
+        elif count == 2:
+            header = f"🚨🚨 <b>STRONG BREAKOUT — 2ND ALERT</b> [{session}]"
+            priority = "STRONG"
+        else:
+            header = f"💥💥 <b>URGENT — {count}X ALERTS</b> [{session}]"
+            priority = "URGENT"
+
+        record_alert(h["symbol"])
+        signal_type = "SPIKE" if h.get("is_spike") else f"ACCEL ({h['accel_count']}/3)"
         stop = h["price"] * 0.97
+
         msg = (
-            f"🚨 <b>VOLUME BREAKOUT</b> [{session}]\n\n"
-            f"<b>Type:</b> FAST SPIKE\n"
+            f"{header}\n\n"
+            f"<b>Priority:</b> {priority}\n"
+            f"<b>Alerts (4h):</b> {count}\n"
+            f"<b>Signal:</b> {signal_type}\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
             f"<b>1h:</b> {h['change_1h']:.2f}%\n"
             f"<b>4h:</b> {h['change_4h']:.2f}%\n"
             f"<b>RSI:</b> {h['rsi']:.1f}\n"
-            f"<b>Vol:</b> {h['vol_ratio']:.2f}x\n"
-            f"<b>Taker:</b> {h['taker_buy_pct']:.1f}%\n"
+            f"<b>Vol (1h):</b> {h['vol_ratio']:.2f}x\n"
+            f"<b>Accel:</b> {h['accel_count']}/3\n"
+            f"<b>Taker:</b> {h['taker_pct']:.1f}%\n"
             f"<b>Bid:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
@@ -369,7 +423,8 @@ def main():
             f"Entry: {format_price(h['price'])}\n"
             f"Stop: {format_price(stop)} (-3%)\n"
             f"Trail: +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
-            f"⚠️ Check tag: Seed(half) / Monitoring(skip)"
+            f"⚠️ 2nd alert = ENTER\n"
+            f"⚠️ Check tag: Seed(half) / Monitoring(half)"
         )
         send_telegram(msg)
 
