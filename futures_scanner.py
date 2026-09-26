@@ -15,15 +15,21 @@ COOLDOWN_FILE = Path("futures_cooldown.json")
 REJECT_FILE = Path("futures_rejections.json")
 COOLDOWN_MINUTES = 60
 
-# ================= HARDCODED JAPAN PROXY POOL =================
-# Fresh Japan proxies (not US-blocked, works with Binance Futures)
+# Japan proxies - use your list (highest uptime first)
 JAPAN_PROXIES = [
-    "http://3.113.38.132:443",
+    "https://140.238.32.108:3128",
+    "http://45.43.60.220:8080",
+    "https://64.176.51.83:8443",
+    "https://160.16.144.120:443",
+    "http://43.167.166.56:1080",
+    "http://47.79.86.137:1080",
     "https://3.113.38.132:443",
+    "http://103.75.118.84:1080",
+    "http://101.36.104.46:10808",
+    "https://153.126.214.29:443",
     "http://211.128.96.206:80",
     "https://140.238.50.134:1234",
     "http://8.209.255.13:3128",
-    "http://45.43.60.220:8080",
     "http://47.74.46.81:11310",
     "https://14.137.237.91:443",
     "http://172.237.11.129:3128",
@@ -32,21 +38,15 @@ JAPAN_PROXIES = [
     "http://56.155.73.159:27549",
     "http://138.3.218.141:54261",
     "http://213.165.43.73:46650",
-    "https://153.126.214.29:443",
     "http://47.91.29.151:9200",
-    "http://101.36.104.46:10808",
     "https://210.236.6.167:443",
-    "http://140.238.32.108:3128",
     "http://8.221.138.111:18080",
     "http://35.78.212.217:35679",
     "http://47.91.29.151:194",
     "https://56.155.73.159:29393",
     "https://210.236.6.162:443",
     "http://47.74.46.81:1080",
-    "http://47.79.86.137:1080",
     "https://56.155.73.159:28082",
-    "http://43.167.166.56:1080",
-    "https://64.176.51.83:8443",
     "http://35.78.212.217:50469",
     "http://56.155.73.159:29191",
     "http://52.195.147.51:8082",
@@ -55,10 +55,8 @@ JAPAN_PROXIES = [
     "http://56.155.73.159:35512",
     "http://35.78.212.217:58837",
     "https://35.78.212.217:8443",
-    "https://160.16.144.120:443",
     "http://8.221.138.111:100",
     "http://47.91.29.151:7890",
-    "http://103.75.118.84:1080",
     "http://47.91.29.151:6666",
     "http://56.155.73.159:7280",
     "https://175.134.18.237:443",
@@ -68,10 +66,6 @@ JAPAN_PROXIES = [
     "http://35.78.212.217:44573",
     "http://35.78.252.142:33946",
 ]
-
-# Fallback sources if Japan pool fails
-PROXY_LIST_URL_1 = "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.json"
-PROXY_LIST_URL_2 = "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/http.txt"
 
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -95,16 +89,13 @@ BLACKLIST = {
     "XPLUSDT",
 }
 
-# ================= STATE =================
 _SPOT_SYMBOLS = None
 _FUTURES_SYMBOLS = None
 _VERIFIED_PROXIES = []
-_PROXY_DEAD = set()
 
-# ================= PROXY VERIFICATION =================
+# ================= PROXY =================
 
-def test_proxy_oi(proxy_str):
-    """Test against OI endpoint. Returns proxy or None."""
+def test_proxy(proxy_str):
     try:
         proxies = {"http": proxy_str, "https": proxy_str}
         url = f"{FAPI}/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=5"
@@ -117,117 +108,42 @@ def test_proxy_oi(proxy_str):
         pass
     return None
 
-def load_external_proxies():
-    """Fetch external proxy list as backup."""
-    proxies = []
-    try:
-        r = requests.get(PROXY_LIST_URL_1, timeout=10)
-        data = r.json()
-        if isinstance(data, list):
-            for p in data:
-                if p.get("protocol") == "http" and p.get("ssl") is True:
-                    ip = p.get("ip")
-                    port = p.get("port")
-                    if ip and port:
-                        proxies.append(f"http://{ip}:{port}")
-    except Exception:
-        pass
-    try:
-        r = requests.get(PROXY_LIST_URL_2, timeout=10)
-        for line in r.text.splitlines():
-            line = line.strip()
-            if line and ":" in line and not line.startswith("#"):
-                if not line.startswith("http"):
-                    line = f"http://{line}"
-                proxies.append(line)
-    except Exception:
-        pass
-    return proxies
-
-def build_verified_pool():
-    """Test Japan proxies first. If too few, add external."""
+def build_proxy_pool():
     global _VERIFIED_PROXIES
     if _VERIFIED_PROXIES:
         return _VERIFIED_PROXIES
-
-    print(f"Testing {len(JAPAN_PROXIES)} Japan proxies (parallel)...")
+    print(f"Testing {len(JAPAN_PROXIES)} Japan proxies...")
     verified = []
-
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        futures = {executor.submit(test_proxy_oi, p): p for p in JAPAN_PROXIES}
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        futures = {executor.submit(test_proxy, p): p for p in JAPAN_PROXIES}
         try:
-            for future in as_completed(futures, timeout=30):
+            for future in as_completed(futures, timeout=25):
                 try:
                     result = future.result()
                     if result:
                         verified.append(result)
-                        print(f"JP VERIFIED ({len(verified)}): {result}")
+                        print(f"VERIFIED ({len(verified)}): {result}")
                 except Exception:
                     continue
         except Exception:
             pass
-
-    print(f"Japan proxies verified: {len(verified)}")
-
-    # If we have enough Japan proxies, use them
-    if len(verified) >= 5:
-        _VERIFIED_PROXIES = verified
-        print(f"Using {len(verified)} Japan proxies")
-        return _VERIFIED_PROXIES
-
-    # Otherwise, add external
-    print("Not enough Japan proxies. Adding external...")
-    external = load_external_proxies()
-    random.shuffle(external)
-    test_list = external[:200]
-
-    with ThreadPoolExecutor(max_workers=80) as executor:
-        futures = {executor.submit(test_proxy_oi, p): p for p in test_list}
-        try:
-            for future in as_completed(futures, timeout=40):
-                try:
-                    result = future.result()
-                    if result:
-                        verified.append(result)
-                        print(f"EXT VERIFIED ({len(verified)}): {result}")
-                        if len(verified) >= 25:
-                            for f in futures:
-                                f.cancel()
-                            break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
     _VERIFIED_PROXIES = verified
-    print(f"Final verified pool: {len(verified)} proxies")
+    print(f"Verified pool: {len(verified)} proxies")
     return _VERIFIED_PROXIES
 
-def rotate_get_small(url, timeout=8, max_attempts=30):
-    """Rotate through verified proxies on every retry."""
-    global _VERIFIED_PROXIES
+def rotate_get(url, timeout=8, max_attempts=40):
     if not _VERIFIED_PROXIES:
         return None
-    pool = [p for p in _VERIFIED_PROXIES if p not in _PROXY_DEAD]
-    if not pool:
-        pool = list(_VERIFIED_PROXIES)
     for _ in range(max_attempts):
-        if not pool:
-            break
-        proxy = random.choice(pool)
+        proxy = random.choice(_VERIFIED_PROXIES)
         try:
-            proxies = {"http": proxy, "https": proxy}
-            r = requests.get(url, proxies=proxies, timeout=timeout)
+            r = requests.get(url, proxies={"http": proxy, "https": proxy}, timeout=timeout)
             if r.status_code == 200:
                 try:
                     return r.json()
                 except Exception:
                     pass
-            elif r.status_code == 451:
-                pass
         except Exception:
-            _PROXY_DEAD.add(proxy)
-            pool = [p for p in pool if p not in _PROXY_DEAD]
             continue
     return None
 
@@ -352,7 +268,7 @@ def get_futures_symbols():
     if _FUTURES_SYMBOLS is not None:
         return _FUTURES_SYMBOLS
     url = f"{FAPI}/fapi/v1/exchangeInfo"
-    data = rotate_get_small(url, timeout=15, max_attempts=50)
+    data = rotate_get(url, timeout=15, max_attempts=50)
     if not isinstance(data, dict):
         print("Failed to fetch futures exchange info")
         _FUTURES_SYMBOLS = set()
@@ -372,10 +288,9 @@ def get_candidates_from_spot():
     spot_symbols = get_spot_symbols()
     futures_symbols = get_futures_symbols()
     if not futures_symbols:
-        print("Cannot fetch futures symbols, abort")
         return []
     candidates = []
-    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0, "not_futures": 0}
+    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "not_futures": 0}
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
@@ -385,11 +300,7 @@ def get_candidates_from_spot():
         if symbol not in futures_symbols:
             rejected["not_futures"] += 1
             continue
-        if symbol in MAJORS:
-            rejected["major"] += 1
-            continue
-        if symbol in BLACKLIST:
-            rejected["blacklist"] += 1
+        if symbol in MAJORS or symbol in BLACKLIST:
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
             continue
@@ -417,44 +328,25 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
-def get_oi_history(symbol, period="5m", limit=13):
-    url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
-    data = rotate_get_small(url, timeout=10, max_attempts=30)
-    if not isinstance(data, list):
-        return []
-    return data
-
-def get_funding_rate(symbol):
-    url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
-    data = rotate_get_small(url, timeout=10, max_attempts=30)
-    if not isinstance(data, dict):
-        return None
-    try:
-        return float(data.get("lastFundingRate", 0))
-    except Exception:
-        return None
-
-def get_top_trader_ratio(symbol):
-    url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
-    data = rotate_get_small(url, timeout=10, max_attempts=30)
-    if not isinstance(data, list) or not data:
-        return None
-    try:
-        return float(data[-1].get("longShortRatio", 1))
-    except Exception:
-        return None
+# ================= SEQUENTIAL CHECK =================
 
 def check_pre_pump(symbol, price):
+    """
+    SEQUENTIAL: OI first. Only if OI passes, fetch funding/LS.
+    Cuts requests from 27 → ~12 per scan.
+    """
     reasons = []
     try:
         spot_1h = get_spot_1h_change(symbol)
         if spot_1h > 10:
-            return None, [f"already_moved_{spot_1h:.1f}%"]
+            return None, [f"already_moved"]
         if spot_1h < -5:
-            return None, [f"dumping_{spot_1h:.1f}%"]
+            return None, [f"dumping"]
 
-        oi_data = get_oi_history(symbol, "5m", 13)
-        if not oi_data or len(oi_data) < 6:
+        # STEP 1: OI (mandatory)
+        url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=13"
+        oi_data = rotate_get(url, timeout=10, max_attempts=25)
+        if not isinstance(oi_data, list) or len(oi_data) < 6:
             return None, ["no_oi"]
 
         try:
@@ -462,7 +354,7 @@ def check_pre_pump(symbol, price):
             oi_15m_ago = float(oi_data[-4]["sumOpenInterestValue"])
             oi_1h_ago = float(oi_data[0]["sumOpenInterestValue"])
         except (KeyError, ValueError, IndexError):
-            return None, ["oi_parse_error"]
+            return None, ["oi_parse"]
 
         if oi_15m_ago == 0 or oi_1h_ago == 0:
             return None, ["oi_zero"]
@@ -470,26 +362,39 @@ def check_pre_pump(symbol, price):
         oi_15m_change = ((current_oi - oi_15m_ago) / oi_15m_ago) * 100
         oi_1h_change = ((current_oi - oi_1h_ago) / oi_1h_ago) * 100
 
+        # EARLY REJECT: if OI flat, stop here (no more requests)
         if oi_15m_change < 5 and oi_1h_change < 10:
-            reasons.append(f"oi_flat_{oi_15m_change:.1f}%_{oi_1h_change:.1f}%")
+            return None, ["oi_flat"]
 
-        funding = get_funding_rate(symbol)
-        if funding is None:
+        # STEP 2: Funding (only if OI passed)
+        url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
+        fund_data = rotate_get(url, timeout=8, max_attempts=15)
+        if not isinstance(fund_data, dict):
             return None, ["funding_fail"]
+        try:
+            funding = float(fund_data.get("lastFundingRate", 0))
+        except Exception:
+            return None, ["funding_parse"]
+
         if funding >= 0:
-            reasons.append(f"funding_pos_{funding*100:.4f}%")
-        elif funding > -0.0001:
-            reasons.append(f"funding_weak_{funding*100:.4f}%")
+            return None, ["funding_pos"]
+        if funding > -0.0001:
+            return None, ["funding_weak"]
 
-        ls_ratio = get_top_trader_ratio(symbol)
-        if ls_ratio is None:
+        # STEP 3: L/S (only if funding passed)
+        url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
+        ls_data = rotate_get(url, timeout=8, max_attempts=15)
+        if not isinstance(ls_data, list) or not ls_data:
             return None, ["ls_fail"]
+        try:
+            ls_ratio = float(ls_data[-1].get("longShortRatio", 1))
+        except Exception:
+            return None, ["ls_parse"]
+
         if ls_ratio < 1.2:
-            reasons.append(f"ls_low_{ls_ratio:.2f}")
+            return None, ["ls_low"]
 
-        if reasons:
-            return None, reasons
-
+        # ALL 3 PASSED
         return {
             "oi_15m_change": oi_15m_change,
             "oi_1h_change": oi_1h_change,
@@ -499,7 +404,7 @@ def check_pre_pump(symbol, price):
             "spot_1h": spot_1h,
         }, []
     except Exception as e:
-        return None, [f"exception_{e}"]
+        return None, [f"exception"]
 
 def get_session_label(hour, minute):
     if hour == 5 and minute >= 30:
@@ -532,21 +437,20 @@ def main():
         return
 
     print("Building verified proxy pool...")
-    verified = build_verified_pool()
+    verified = build_proxy_pool()
     if not verified:
-        print("No verified proxies. Exiting.")
+        print("No proxies. Exiting.")
         return
-    print(f"Proceeding with {len(verified)} proxies")
 
     candidates = get_candidates_from_spot()
     print(f"Candidates from spot: {len(candidates)}")
-
     if not candidates:
         print("No candidates. Exiting.")
         return
 
+    # Top 10 only - sequential checks keep it fast
     candidates.sort(key=lambda x: x["quote_vol"], reverse=True)
-    candidates = candidates[:15]
+    candidates = candidates[:10]
     print(f"Scanning top {len(candidates)} by volume...")
 
     cooldown = load_cooldown()
@@ -590,9 +494,6 @@ def main():
             f"<b>L/S:</b> {h['ls_ratio']:.2f}\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"📋 <b>PLAN</b>\n"
-            f"Entry: {format_price(h['price'])}\n"
-            f"Stop: {format_price(stop)} (-3%)\n\n"
             f"⚠️ WAIT for Volume Breakout before entering."
         )
         send_telegram(msg)
