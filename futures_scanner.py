@@ -4,68 +4,15 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import random
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-FAPI = "https://fapi.binance.com"
 SPOT_API = "https://data-api.binance.vision"
+COINGECKO_API = "https://api.coingecko.com/api/v3"
 COOLDOWN_FILE = Path("futures_cooldown.json")
 REJECT_FILE = Path("futures_rejections.json")
 COOLDOWN_MINUTES = 60
-
-# Japan proxies - use your list (highest uptime first)
-JAPAN_PROXIES = [
-    "https://140.238.32.108:3128",
-    "http://45.43.60.220:8080",
-    "https://64.176.51.83:8443",
-    "https://160.16.144.120:443",
-    "http://43.167.166.56:1080",
-    "http://47.79.86.137:1080",
-    "https://3.113.38.132:443",
-    "http://103.75.118.84:1080",
-    "http://101.36.104.46:10808",
-    "https://153.126.214.29:443",
-    "http://211.128.96.206:80",
-    "https://140.238.50.134:1234",
-    "http://8.209.255.13:3128",
-    "http://47.74.46.81:11310",
-    "https://14.137.237.91:443",
-    "http://172.237.11.129:3128",
-    "http://8.221.138.111:6379",
-    "http://47.91.29.151:4145",
-    "http://56.155.73.159:27549",
-    "http://138.3.218.141:54261",
-    "http://213.165.43.73:46650",
-    "http://47.91.29.151:9200",
-    "https://210.236.6.167:443",
-    "http://8.221.138.111:18080",
-    "http://35.78.212.217:35679",
-    "http://47.91.29.151:194",
-    "https://56.155.73.159:29393",
-    "https://210.236.6.162:443",
-    "http://47.74.46.81:1080",
-    "https://56.155.73.159:28082",
-    "http://35.78.212.217:50469",
-    "http://56.155.73.159:29191",
-    "http://52.195.147.51:8082",
-    "http://8.221.139.222:31433",
-    "http://8.221.138.111:46691",
-    "http://56.155.73.159:35512",
-    "http://35.78.212.217:58837",
-    "https://35.78.212.217:8443",
-    "http://8.221.138.111:100",
-    "http://47.91.29.151:7890",
-    "http://47.91.29.151:6666",
-    "http://56.155.73.159:7280",
-    "https://175.134.18.237:443",
-    "http://35.78.212.217:8585",
-    "https://52.195.147.51:20341",
-    "http://45.146.163.31:80",
-    "http://35.78.212.217:44573",
-    "http://35.78.252.142:33946",
-]
 
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -90,73 +37,9 @@ BLACKLIST = {
 }
 
 _SPOT_SYMBOLS = None
-_FUTURES_SYMBOLS = None
-_VERIFIED_PROXIES = []
-
-# ================= PROXY =================
-
-def test_proxy(proxy_str):
-    try:
-        proxies = {"http": proxy_str, "https": proxy_str}
-        url = f"{FAPI}/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=5"
-        r = requests.get(url, proxies=proxies, timeout=6)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and len(data) >= 3:
-                return proxy_str
-    except Exception:
-        pass
-    return None
-
-def build_proxy_pool():
-    global _VERIFIED_PROXIES
-    if _VERIFIED_PROXIES:
-        return _VERIFIED_PROXIES
-    print(f"Testing {len(JAPAN_PROXIES)} Japan proxies...")
-    verified = []
-    with ThreadPoolExecutor(max_workers=40) as executor:
-        futures = {executor.submit(test_proxy, p): p for p in JAPAN_PROXIES}
-        try:
-            for future in as_completed(futures, timeout=25):
-                try:
-                    result = future.result()
-                    if result:
-                        verified.append(result)
-                        print(f"VERIFIED ({len(verified)}): {result}")
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    _VERIFIED_PROXIES = verified
-    print(f"Verified pool: {len(verified)} proxies")
-    return _VERIFIED_PROXIES
-
-def rotate_get(url, timeout=8, max_attempts=40):
-    if not _VERIFIED_PROXIES:
-        return None
-    for _ in range(max_attempts):
-        proxy = random.choice(_VERIFIED_PROXIES)
-        try:
-            r = requests.get(url, proxies={"http": proxy, "https": proxy}, timeout=timeout)
-            if r.status_code == 200:
-                try:
-                    return r.json()
-                except Exception:
-                    pass
-        except Exception:
-            continue
-    return None
-
-# ================= TELEGRAM =================
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram error: {e}")
 
 # ================= HELPERS =================
+
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -165,6 +48,14 @@ def format_price(p):
     if p >= 0.0001:
         return f"${p:.6f}"
     return f"${p:.8f}"
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
 def load_json(path):
     if path.exists():
@@ -263,44 +154,55 @@ def get_spot_symbols():
         _SPOT_SYMBOLS = set()
         return _SPOT_SYMBOLS
 
-def get_futures_symbols():
-    global _FUTURES_SYMBOLS
-    if _FUTURES_SYMBOLS is not None:
-        return _FUTURES_SYMBOLS
-    url = f"{FAPI}/fapi/v1/exchangeInfo"
-    data = rotate_get(url, timeout=15, max_attempts=50)
-    if not isinstance(data, dict):
-        print("Failed to fetch futures exchange info")
-        _FUTURES_SYMBOLS = set()
-        return _FUTURES_SYMBOLS
-    symbols = set()
-    for s in data.get("symbols", []):
-        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
-            symbols.add(s["symbol"])
-    _FUTURES_SYMBOLS = symbols
-    print(f"Loaded {len(symbols)} futures USDT symbols")
-    return symbols
+# ================= COINGECKO DERIVATIVES =================
+
+def get_derivatives_data():
+    """
+    One API call to CoinGecko. Returns all Binance Futures perpetuals
+    with funding rate, open interest, price, volume.
+    """
+    url = f"{COINGECKO_API}/derivatives?include_tickers=unexpired"
+    try:
+        r = requests.get(url, timeout=20, headers={"Accept": "application/json"})
+        if r.status_code != 200:
+            print(f"CoinGecko status: {r.status_code}")
+            return []
+        data = r.json()
+        if not isinstance(data, list):
+            print(f"CoinGecko unexpected type: {type(data)}")
+            return []
+        # Filter to Binance Futures only
+        binance_data = [
+            d for d in data
+            if d.get("market") == "Binance (Futures)"
+            and d.get("contract_type") == "perpetual"
+        ]
+        print(f"CoinGecko: {len(binance_data)} Binance perps")
+        return binance_data
+    except Exception as e:
+        print(f"CoinGecko error: {e}")
+        return []
+
+# ================= CANDIDATES =================
 
 def get_candidates_from_spot():
     url = f"{SPOT_API}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
     tickers = r.json()
     spot_symbols = get_spot_symbols()
-    futures_symbols = get_futures_symbols()
-    if not futures_symbols:
-        return []
     candidates = []
-    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "not_futures": 0}
+    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0}
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
         if symbol not in spot_symbols:
             continue
-        if symbol not in futures_symbols:
-            rejected["not_futures"] += 1
+        if symbol in MAJORS:
+            rejected["major"] += 1
             continue
-        if symbol in MAJORS or symbol in BLACKLIST:
+        if symbol in BLACKLIST:
+            rejected["blacklist"] += 1
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
             continue
@@ -328,83 +230,50 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
-# ================= SEQUENTIAL CHECK =================
+# ================= SIGNAL CHECK =================
 
-def check_pre_pump(symbol, price):
+def check_pre_pump(candidate, derivatives_map):
     """
-    SEQUENTIAL: OI first. Only if OI passes, fetch funding/LS.
-    Cuts requests from 27 → ~12 per scan.
+    Check candidate against CoinGecko derivatives data.
+    Filters: OI > $10M, funding < 0, valid price.
     """
-    reasons = []
+    symbol = candidate["symbol"]
+    # CoinGecko uses format "BTCUSDT" or "BTC"
+    # Try both symbol formats
+    deriv = derivatives_map.get(symbol)
+    if not deriv:
+        # Try without USDT suffix
+        base = symbol.replace("USDT", "")
+        deriv = derivatives_map.get(base)
+        if not deriv:
+            return None, ["not_on_coingecko"]
+
     try:
-        spot_1h = get_spot_1h_change(symbol)
-        if spot_1h > 10:
-            return None, [f"already_moved"]
-        if spot_1h < -5:
-            return None, [f"dumping"]
+        funding = float(deriv.get("funding_rate", 0))
+        oi_usd = float(deriv.get("open_interest", 0) or 0)
+    except (ValueError, TypeError):
+        return None, ["parse_error"]
 
-        # STEP 1: OI (mandatory)
-        url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=13"
-        oi_data = rotate_get(url, timeout=10, max_attempts=25)
-        if not isinstance(oi_data, list) or len(oi_data) < 6:
-            return None, ["no_oi"]
+    # Funding must be negative (shorts trapped)
+    if funding >= 0:
+        return None, ["funding_pos"]
 
-        try:
-            current_oi = float(oi_data[-1]["sumOpenInterestValue"])
-            oi_15m_ago = float(oi_data[-4]["sumOpenInterestValue"])
-            oi_1h_ago = float(oi_data[0]["sumOpenInterestValue"])
-        except (KeyError, ValueError, IndexError):
-            return None, ["oi_parse"]
+    # OI must be meaningful
+    if oi_usd < 5_000_000:
+        return None, ["oi_too_small"]
 
-        if oi_15m_ago == 0 or oi_1h_ago == 0:
-            return None, ["oi_zero"]
+    # Spot 1h check
+    spot_1h = get_spot_1h_change(symbol)
+    if spot_1h > 10:
+        return None, ["already_moved"]
+    if spot_1h < -5:
+        return None, ["dumping"]
 
-        oi_15m_change = ((current_oi - oi_15m_ago) / oi_15m_ago) * 100
-        oi_1h_change = ((current_oi - oi_1h_ago) / oi_1h_ago) * 100
-
-        # EARLY REJECT: if OI flat, stop here (no more requests)
-        if oi_15m_change < 5 and oi_1h_change < 10:
-            return None, ["oi_flat"]
-
-        # STEP 2: Funding (only if OI passed)
-        url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
-        fund_data = rotate_get(url, timeout=8, max_attempts=15)
-        if not isinstance(fund_data, dict):
-            return None, ["funding_fail"]
-        try:
-            funding = float(fund_data.get("lastFundingRate", 0))
-        except Exception:
-            return None, ["funding_parse"]
-
-        if funding >= 0:
-            return None, ["funding_pos"]
-        if funding > -0.0001:
-            return None, ["funding_weak"]
-
-        # STEP 3: L/S (only if funding passed)
-        url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
-        ls_data = rotate_get(url, timeout=8, max_attempts=15)
-        if not isinstance(ls_data, list) or not ls_data:
-            return None, ["ls_fail"]
-        try:
-            ls_ratio = float(ls_data[-1].get("longShortRatio", 1))
-        except Exception:
-            return None, ["ls_parse"]
-
-        if ls_ratio < 1.2:
-            return None, ["ls_low"]
-
-        # ALL 3 PASSED
-        return {
-            "oi_15m_change": oi_15m_change,
-            "oi_1h_change": oi_1h_change,
-            "oi_value": current_oi,
-            "funding": funding,
-            "ls_ratio": ls_ratio,
-            "spot_1h": spot_1h,
-        }, []
-    except Exception as e:
-        return None, [f"exception"]
+    return {
+        "funding": funding,
+        "oi_value": oi_usd,
+        "spot_1h": spot_1h,
+    }, []
 
 def get_session_label(hour, minute):
     if hour == 5 and minute >= 30:
@@ -427,20 +296,32 @@ def get_session_label(hour, minute):
         return "US"
     return "Dead-Zone"
 
+# ================= MAIN =================
+
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
-    print(f"Futures Scanner starting at {ist} IST — Session: {session}")
+    print(f"Futures Scanner (CoinGecko) starting at {ist} IST — Session: {session}")
 
     if not btc_is_healthy():
         print("BTC dumping >2%. Skipping.")
         return
 
-    print("Building verified proxy pool...")
-    verified = build_proxy_pool()
-    if not verified:
-        print("No proxies. Exiting.")
+    print("Fetching CoinGecko derivatives...")
+    derivatives = get_derivatives_data()
+    if not derivatives:
+        print("No CoinGecko data. Exiting.")
         return
+
+    # Build lookup: symbol -> derivative info
+    deriv_map = {}
+    for d in derivatives:
+        sym = d.get("symbol", "").upper()
+        if sym:
+            deriv_map[sym] = d
+            # Also strip "USDT" suffix
+            if sym.endswith("USDT"):
+                deriv_map[sym.replace("USDT", "")] = d
 
     candidates = get_candidates_from_spot()
     print(f"Candidates from spot: {len(candidates)}")
@@ -448,9 +329,8 @@ def main():
         print("No candidates. Exiting.")
         return
 
-    # Top 10 only - sequential checks keep it fast
     candidates.sort(key=lambda x: x["quote_vol"], reverse=True)
-    candidates = candidates[:10]
+    candidates = candidates[:30]
     print(f"Scanning top {len(candidates)} by volume...")
 
     cooldown = load_cooldown()
@@ -458,8 +338,8 @@ def main():
 
     hits = []
     rejection = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(check_pre_pump, c["symbol"], c["price"]): c for c in candidates}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(check_pre_pump, c, deriv_map): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
             if c["symbol"] in cooldown:
@@ -483,17 +363,18 @@ def main():
         stop = h["price"] * 0.97
         msg = (
             f"🔮 <b>PRE-PUMP DETECTED</b> [{session}]\n\n"
+            f"<b>Source:</b> CoinGecko\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])} (flat)\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
             f"<b>1h Spot:</b> {h['spot_1h']:+.2f}%\n"
-            f"<b>OI 15m:</b> +{h['oi_15m_change']:.2f}%\n"
-            f"<b>OI 1h:</b> +{h['oi_1h_change']:.2f}%\n"
             f"<b>OI Val:</b> ${h['oi_value']:,.0f}\n"
             f"<b>Funding:</b> {h['funding']*100:.4f}%\n"
-            f"<b>L/S:</b> {h['ls_ratio']:.2f}\n"
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
+            f"📋 <b>PLAN</b>\n"
+            f"Entry: {format_price(h['price'])}\n"
+            f"Stop: {format_price(stop)} (-3%)\n\n"
             f"⚠️ WAIT for Volume Breakout before entering."
         )
         send_telegram(msg)
