@@ -4,6 +4,7 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -14,7 +15,7 @@ PROXY_LIST_URL_1 = "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main
 PROXY_LIST_URL_2 = "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/http.txt"
 COOLDOWN_FILE = Path("futures_cooldown.json")
 REJECT_FILE = Path("futures_rejections.json")
-PROXY_CACHE_FILE = Path("working_proxy.json")
+PROXY_POOL_FILE = Path("proxy_pool.json")
 COOLDOWN_MINUTES = 60
 
 MAJORS = {
@@ -40,15 +41,85 @@ BLACKLIST = {
 }
 
 _SPOT_SYMBOLS = None
+_PROXY_POOL = []
 
-def format_price(p):
-    if p >= 1:
-        return f"${p:.4f}"
-    if p >= 0.01:
-        return f"${p:.5f}"
-    if p >= 0.0001:
-        return f"${p:.6f}"
-    return f"${p:.8f}"
+# ---------- PROXY POOL ----------
+
+def load_proxy_pool():
+    """Fetch fresh proxy list and build in-memory pool."""
+    global _PROXY_POOL
+    all_proxies = []
+    
+    # Source 1: ProxyScrape
+    try:
+        r = requests.get(PROXY_LIST_URL_1, timeout=15)
+        data = r.json()
+        if isinstance(data, list):
+            for p in data:
+                if p.get("protocol") == "http" and p.get("ssl") is True:
+                    ip = p.get("ip")
+                    port = p.get("port")
+                    if ip and port:
+                        all_proxies.append(f"http://{ip}:{port}")
+    except Exception as e:
+        print(f"ProxyScrape error: {e}")
+
+    # Source 2: ProxRipper
+    try:
+        r = requests.get(PROXY_LIST_URL_2, timeout=15)
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line and ":" in line and not line.startswith("#"):
+                if not line.startswith("http"):
+                    line = f"http://{line}"
+                all_proxies.append(line)
+    except Exception as e:
+        print(f"ProxRipper error: {e}")
+
+    # Dedupe + shuffle
+    all_proxies = list(set(all_proxies))
+    random.shuffle(all_proxies)
+    _PROXY_POOL = all_proxies
+    print(f"Proxy pool loaded: {len(_PROXY_POOL)} proxies")
+    return _PROXY_POOL
+
+def get_random_proxy():
+    """Get random proxy from pool."""
+    if not _PROXY_POOL:
+        load_proxy_pool()
+    if not _PROXY_POOL:
+        return None
+    return random.choice(_PROXY_POOL)
+
+def rotate_get(url, timeout=10, max_attempts=8):
+    """
+    Try up to max_attempts proxies. Each request uses a DIFFERENT proxy.
+    Returns parsed JSON or None.
+    """
+    for attempt in range(max_attempts):
+        proxy = get_random_proxy()
+        if not proxy:
+            break
+        try:
+            r = requests.get(
+                url,
+                proxies={"http": proxy, "https": proxy},
+                timeout=timeout
+            )
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception:
+                    continue
+            elif r.status_code == 451:
+                # Blocked - try different proxy
+                continue
+        except Exception:
+            # Timeout/error - try different proxy
+            continue
+    return None
+
+# ---------- TELEGRAM ----------
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -58,121 +129,16 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ---------- PROXY MANAGER ----------
+# ---------- HELPERS ----------
 
-def test_proxy(proxy_str):
-    """Test proxy against real Binance Futures endpoint."""
-    proxies = {"http": proxy_str, "https": proxy_str}
-    try:
-        url = f"{FAPI}/fapi/v1/ticker/24hr"
-        r = requests.get(url, proxies=proxies, timeout=12)
-        if r.status_code != 200:
-            return False
-        data = r.json()
-        return isinstance(data, list) and len(data) > 10
-    except Exception:
-        return False
-
-def fetch_proxy_list():
-    """Fetch proxy list from both sources. Return list of 'ip:port' strings."""
-    all_proxies = []
-
-    # Source 1: ProxyScrape JSON (filter HTTP+SSL)
-    try:
-        print("Fetching ProxyScrape list...")
-        r = requests.get(PROXY_LIST_URL_1, timeout=15)
-        data = r.json()
-        if isinstance(data, list):
-            for p in data:
-                if p.get("protocol") == "http" and p.get("ssl") is True:
-                    ip = p.get("ip")
-                    port = p.get("port")
-                    if ip and port:
-                        all_proxies.append(f"{ip}:{port}")
-            print(f"ProxyScrape: {len(all_proxies)} candidates")
-    except Exception as e:
-        print(f"ProxyScrape error: {e}")
-
-    # Source 2: ProxRipper plain text
-    try:
-        print("Fetching ProxRipper list...")
-        r = requests.get(PROXY_LIST_URL_2, timeout=15)
-        count_before = len(all_proxies)
-        for line in r.text.splitlines():
-            line = line.strip()
-            if line and ":" in line and not line.startswith("#"):
-                all_proxies.append(line)
-        print(f"ProxRipper: added {len(all_proxies) - count_before}")
-    except Exception as e:
-        print(f"ProxRipper error: {e}")
-
-    # Remove duplicates
-    all_proxies = list(set(all_proxies))
-    print(f"Total unique proxies: {len(all_proxies)}")
-    return all_proxies
-
-def get_working_proxy():
-    """Find a working proxy. Cache for 5 min."""
-    # Check cache
-    if PROXY_CACHE_FILE.exists():
-        try:
-            cached = json.loads(PROXY_CACHE_FILE.read_text())
-            ts = datetime.fromisoformat(cached["ts"])
-            if (datetime.utcnow() - ts).total_seconds() < 300:
-                proxy = cached["proxy"]
-                if test_proxy(proxy):
-                    print(f"Using cached proxy: {proxy[:40]}")
-                    return proxy
-                else:
-                    print("Cached proxy dead, fetching new...")
-        except Exception:
-            pass
-
-    # Fetch fresh list
-    all_proxies = fetch_proxy_list()
-    if not all_proxies:
-        print("No proxies fetched")
-        return None
-
-    # Limit to 60 for speed
-    test_list = all_proxies[:60]
-    print(f"Testing {len(test_list)} proxies in parallel...")
-
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        futures = {executor.submit(test_proxy, p): p for p in test_list}
-        for future in as_completed(futures):
-            proxy = futures[future]
-            try:
-                if future.result():
-                    print(f"WORKING: {proxy}")
-                    PROXY_CACHE_FILE.write_text(json.dumps({
-                        "proxy": proxy,
-                        "ts": datetime.utcnow().isoformat()
-                    }))
-                    return proxy
-            except Exception:
-                continue
-
-    print("No working proxy found")
-    return None
-
-# ---------- BINANCE API VIA PROXY ----------
-
-def safe_get(url, proxy, timeout=15):
-    if not proxy:
-        return None
-    proxies = {"http": proxy, "https": proxy}
-    try:
-        r = requests.get(url, proxies=proxies, timeout=timeout)
-        if r.status_code == 451:
-            print(f"451 blocked")
-            return None
-        return r.json()
-    except Exception as e:
-        print(f"Proxy request error: {e}")
-        return None
-
-# ---------- LOAD/SAVE HELPERS ----------
+def format_price(p):
+    if p >= 1:
+        return f"${p:.4f}"
+    if p >= 0.01:
+        return f"${p:.5f}"
+    if p >= 0.0001:
+        return f"${p:.6f}"
+    return f"${p:.8f}"
 
 def load_json(path):
     if path.exists():
@@ -219,8 +185,6 @@ def log_rejection(symbol, reasons, price, change_24h):
     except Exception as e:
         print(f"reject log error: {e}")
 
-# ---------- BTC CHECK ----------
-
 def btc_is_healthy():
     try:
         url = f"{SPOT_API}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
@@ -253,8 +217,6 @@ def get_spot_1h_change(symbol):
     except Exception:
         return 0
 
-# ---------- SPOT SYMBOLS ----------
-
 def get_spot_symbols():
     global _SPOT_SYMBOLS
     if _SPOT_SYMBOLS is not None:
@@ -275,13 +237,35 @@ def get_spot_symbols():
         _SPOT_SYMBOLS = set()
         return _SPOT_SYMBOLS
 
-# ---------- FUTURES DATA ----------
+# ---------- FUTURES DATA (VIA ROTATING PROXIES) ----------
 
-def get_futures_candidates(proxy):
-    data = safe_get(f"{FAPI}/fapi/v1/ticker/24hr", proxy, timeout=20)
-    if not isinstance(data, list):
-        print(f"Ticker response invalid: {type(data)}")
+def get_futures_candidates():
+    """Get ticker data via rotating proxies."""
+    # First, get all futures tickers with ONE good proxy
+    data = None
+    for attempt in range(15):
+        proxy = get_random_proxy()
+        if not proxy:
+            break
+        try:
+            r = requests.get(
+                f"{FAPI}/fapi/v1/ticker/24hr",
+                proxies={"http": proxy, "https": proxy},
+                timeout=15
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, list) and len(d) > 100:
+                    data = d
+                    print(f"Got ticker data on attempt {attempt+1}")
+                    break
+        except Exception:
+            continue
+    
+    if not data:
+        print("Failed to get ticker data after 15 attempts")
         return []
+    
     spot_symbols = get_spot_symbols()
     candidates = []
     rejected_stage1 = {
@@ -329,14 +313,16 @@ def get_futures_candidates(proxy):
     print(f"Stage1 rejections: {rejected_stage1}")
     return candidates
 
-def get_oi_history(symbol, proxy, period="5m", limit=13):
-    data = safe_get(f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}", proxy)
+def get_oi_history(symbol, period="5m", limit=13):
+    url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
+    data = rotate_get(url, timeout=8, max_attempts=6)
     if not isinstance(data, list):
         return []
     return data
 
-def get_funding_rate(symbol, proxy):
-    data = safe_get(f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}", proxy)
+def get_funding_rate(symbol):
+    url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
+    data = rotate_get(url, timeout=8, max_attempts=6)
     if not isinstance(data, dict):
         return 0
     try:
@@ -344,8 +330,9 @@ def get_funding_rate(symbol, proxy):
     except Exception:
         return 0
 
-def get_top_trader_ratio(symbol, proxy):
-    data = safe_get(f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1", proxy)
+def get_top_trader_ratio(symbol):
+    url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
+    data = rotate_get(url, timeout=8, max_attempts=6)
     if not isinstance(data, list) or not data:
         return 1
     try:
@@ -353,7 +340,7 @@ def get_top_trader_ratio(symbol, proxy):
     except Exception:
         return 1
 
-def check_pre_pump(symbol, price, proxy):
+def check_pre_pump(symbol, price):
     reasons = []
     try:
         spot_1h = get_spot_1h_change(symbol)
@@ -362,7 +349,7 @@ def check_pre_pump(symbol, price, proxy):
         if spot_1h < -5:
             return None, [f"dumping_{spot_1h:.1f}%"]
 
-        oi_data = get_oi_history(symbol, proxy, "5m", 13)
+        oi_data = get_oi_history(symbol, "5m", 13)
         if not oi_data or len(oi_data) < 6:
             return None, ["no_oi"]
 
@@ -382,13 +369,13 @@ def check_pre_pump(symbol, price, proxy):
         if oi_15m_change < 5 and oi_1h_change < 10:
             reasons.append(f"oi_flat_{oi_15m_change:.1f}%_{oi_1h_change:.1f}%")
 
-        funding = get_funding_rate(symbol, proxy)
+        funding = get_funding_rate(symbol)
         if funding >= 0:
             reasons.append(f"funding_pos_{funding*100:.4f}%")
         elif funding > -0.0001:
             reasons.append(f"funding_weak_{funding*100:.4f}%")
 
-        ls_ratio = get_top_trader_ratio(symbol, proxy)
+        ls_ratio = get_top_trader_ratio(symbol)
         if ls_ratio < 1.2:
             reasons.append(f"ls_low_{ls_ratio:.2f}")
 
@@ -436,12 +423,13 @@ def main():
         print("BTC dumping >2%. Skipping.")
         return
 
-    proxy = get_working_proxy()
-    if not proxy:
-        print("No working proxy available. Skipping scan.")
+    print("Loading proxy pool...")
+    load_proxy_pool()
+    if not _PROXY_POOL:
+        print("No proxies available. Exiting.")
         return
 
-    candidates = get_futures_candidates(proxy)
+    candidates = get_futures_candidates()
     print(f"Futures candidates (spot-verified): {len(candidates)}")
 
     if not candidates:
@@ -454,7 +442,7 @@ def main():
     hits = []
     rejection = {}
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(check_pre_pump, c["symbol"], c["price"], proxy): c for c in candidates}
+        futures = {executor.submit(check_pre_pump, c["symbol"], c["price"]): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
             if c["symbol"] in cooldown:
@@ -478,7 +466,7 @@ def main():
         stop = h["price"] * 0.97
         msg = (
             f"🔮 <b>PRE-PUMP DETECTED</b> [{session}]\n\n"
-            f"<b>Type:</b> WHALE LOADING (warning only)\n"
+            f"<b>Type:</b> WHALE LOADING\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])} (flat)\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
@@ -493,8 +481,7 @@ def main():
             f"📋 <b>IF ENTERED</b>\n"
             f"Entry: {format_price(h['price'])}\n"
             f"Stop: {format_price(stop)} (-3%)\n\n"
-            f"⚠️ <b>WAIT</b> for Volume Breakout or Grind before entering.\n"
-            f"⚠️ Check tag: Seed(half) / Monitoring(half)"
+            f"⚠️ WAIT for Volume Breakout or Grind before entering."
         )
         send_telegram(msg)
 
