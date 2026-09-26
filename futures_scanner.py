@@ -40,6 +40,7 @@ BLACKLIST = {
 }
 
 _SPOT_SYMBOLS = None
+_FUTURES_SYMBOLS = None
 _PROXY_POOL = []
 
 # ---------- PROXY POOL ----------
@@ -86,10 +87,7 @@ def get_random_proxy():
     return random.choice(_PROXY_POOL)
 
 def rotate_get_small(url, timeout=8, max_attempts=30):
-    """
-    For SMALL endpoints only (< 5KB response).
-    Rotates proxy on each attempt. Tries up to 30 proxies.
-    """
+    """For small endpoints (<5KB). Rotates proxy on each attempt."""
     for attempt in range(max_attempts):
         proxy = get_random_proxy()
         if not proxy:
@@ -209,7 +207,7 @@ def get_spot_1h_change(symbol):
     except Exception:
         return 0
 
-# ---------- CANDIDATES VIA SPOT API (NO PROXY NEEDED) ----------
+# ---------- SYMBOL LISTS ----------
 
 def get_spot_symbols():
     global _SPOT_SYMBOLS
@@ -231,23 +229,47 @@ def get_spot_symbols():
         _SPOT_SYMBOLS = set()
         return _SPOT_SYMBOLS
 
+def get_futures_symbols():
+    """Fetch futures USDT symbols via rotating proxy. Small single request."""
+    global _FUTURES_SYMBOLS
+    if _FUTURES_SYMBOLS is not None:
+        return _FUTURES_SYMBOLS
+    url = f"{FAPI}/fapi/v1/exchangeInfo"
+    data = rotate_get_small(url, timeout=10, max_attempts=40)
+    if not isinstance(data, dict):
+        print("Failed to fetch futures exchange info")
+        _FUTURES_SYMBOLS = set()
+        return _FUTURES_SYMBOLS
+    symbols = set()
+    for s in data.get("symbols", []):
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+            symbols.add(s["symbol"])
+    _FUTURES_SYMBOLS = symbols
+    print(f"Loaded {len(symbols)} futures USDT symbols")
+    return symbols
+
+# ---------- CANDIDATES ----------
+
 def get_candidates_from_spot():
-    """
-    Get candidate list from Binance SPOT API (no proxy needed).
-    Filter: price <$1, 24h change -3% to +10%, volume >$10M.
-    Then verify futures availability later via OI call.
-    """
+    """Candidates from Binance SPOT API. Filter to futures-listed only."""
     url = f"{SPOT_API}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
     tickers = r.json()
     spot_symbols = get_spot_symbols()
+    futures_symbols = get_futures_symbols()
+    if not futures_symbols:
+        print("Cannot fetch futures symbols, abort")
+        return []
     candidates = []
-    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0}
+    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0, "not_futures": 0}
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
         if symbol not in spot_symbols:
+            continue
+        if symbol not in futures_symbols:
+            rejected["not_futures"] += 1
             continue
         if symbol in MAJORS:
             rejected["major"] += 1
@@ -281,10 +303,9 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
-# ---------- FUTURES DATA VIA PROXY (SMALL RESPONSES ONLY) ----------
+# ---------- FUTURES DATA (SMALL PROXY REQUESTS) ----------
 
 def get_oi_history(symbol, period="5m", limit=13):
-    """OI history: small JSON (~1KB). Works with rotating proxies."""
     url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
     data = rotate_get_small(url, timeout=6, max_attempts=15)
     if not isinstance(data, list):
@@ -292,7 +313,6 @@ def get_oi_history(symbol, period="5m", limit=13):
     return data
 
 def get_funding_rate(symbol):
-    """Funding: tiny JSON. Fast."""
     url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
     data = rotate_get_small(url, timeout=6, max_attempts=15)
     if not isinstance(data, dict):
@@ -303,7 +323,6 @@ def get_funding_rate(symbol):
         return None
 
 def get_top_trader_ratio(symbol):
-    """L/S ratio: tiny JSON."""
     url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
     data = rotate_get_small(url, timeout=6, max_attempts=15)
     if not isinstance(data, list) or not data:
@@ -314,10 +333,6 @@ def get_top_trader_ratio(symbol):
         return None
 
 def check_pre_pump(symbol, price):
-    """
-    If OI call returns [] → coin not on futures. Skip silently.
-    Only alert if all 3 futures calls return valid data.
-    """
     reasons = []
     try:
         spot_1h = get_spot_1h_change(symbol)
@@ -326,10 +341,9 @@ def check_pre_pump(symbol, price):
         if spot_1h < -5:
             return None, [f"dumping_{spot_1h:.1f}%"]
 
-        # OI history check - if empty, not on futures
         oi_data = get_oi_history(symbol, "5m", 13)
         if not oi_data or len(oi_data) < 6:
-            return None, ["not_on_futures"]
+            return None, ["no_oi"]
 
         try:
             current_oi = float(oi_data[-1]["sumOpenInterestValue"])
@@ -411,7 +425,6 @@ def main():
         print("No proxies available. Exiting.")
         return
 
-    # Get candidates from SPOT API (no proxy)
     candidates = get_candidates_from_spot()
     print(f"Candidates from spot: {len(candidates)}")
 
@@ -419,7 +432,6 @@ def main():
         print("No candidates. Exiting.")
         return
 
-    # Limit to top 40 by volume (fewer = faster scan)
     candidates.sort(key=lambda x: x["quote_vol"], reverse=True)
     candidates = candidates[:40]
     print(f"Scanning top {len(candidates)} by volume...")
