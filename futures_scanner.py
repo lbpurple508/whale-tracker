@@ -11,17 +11,67 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 FAPI = "https://fapi.binance.com"
 SPOT_API = "https://data-api.binance.vision"
-
-PROXY_SOURCES = [
-    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.json",
-    "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/http.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-]
-
 COOLDOWN_FILE = Path("futures_cooldown.json")
 REJECT_FILE = Path("futures_rejections.json")
 COOLDOWN_MINUTES = 60
+
+# ================= HARDCODED JAPAN PROXY POOL =================
+# Fresh Japan proxies (not US-blocked, works with Binance Futures)
+JAPAN_PROXIES = [
+    "http://3.113.38.132:443",
+    "https://3.113.38.132:443",
+    "http://211.128.96.206:80",
+    "https://140.238.50.134:1234",
+    "http://8.209.255.13:3128",
+    "http://45.43.60.220:8080",
+    "http://47.74.46.81:11310",
+    "https://14.137.237.91:443",
+    "http://172.237.11.129:3128",
+    "http://8.221.138.111:6379",
+    "http://47.91.29.151:4145",
+    "http://56.155.73.159:27549",
+    "http://138.3.218.141:54261",
+    "http://213.165.43.73:46650",
+    "https://153.126.214.29:443",
+    "http://47.91.29.151:9200",
+    "http://101.36.104.46:10808",
+    "https://210.236.6.167:443",
+    "http://140.238.32.108:3128",
+    "http://8.221.138.111:18080",
+    "http://35.78.212.217:35679",
+    "http://47.91.29.151:194",
+    "https://56.155.73.159:29393",
+    "https://210.236.6.162:443",
+    "http://47.74.46.81:1080",
+    "http://47.79.86.137:1080",
+    "https://56.155.73.159:28082",
+    "http://43.167.166.56:1080",
+    "https://64.176.51.83:8443",
+    "http://35.78.212.217:50469",
+    "http://56.155.73.159:29191",
+    "http://52.195.147.51:8082",
+    "http://8.221.139.222:31433",
+    "http://8.221.138.111:46691",
+    "http://56.155.73.159:35512",
+    "http://35.78.212.217:58837",
+    "https://35.78.212.217:8443",
+    "https://160.16.144.120:443",
+    "http://8.221.138.111:100",
+    "http://47.91.29.151:7890",
+    "http://103.75.118.84:1080",
+    "http://47.91.29.151:6666",
+    "http://56.155.73.159:7280",
+    "https://175.134.18.237:443",
+    "http://35.78.212.217:8585",
+    "https://52.195.147.51:20341",
+    "http://45.146.163.31:80",
+    "http://35.78.212.217:44573",
+    "http://35.78.252.142:33946",
+]
+
+# Fallback sources if Japan pool fails
+PROXY_LIST_URL_1 = "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.json"
+PROXY_LIST_URL_2 = "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/http.txt"
 
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -45,72 +95,20 @@ BLACKLIST = {
     "XPLUSDT",
 }
 
-# ================= PROXY POOL =================
+# ================= STATE =================
 _SPOT_SYMBOLS = None
 _FUTURES_SYMBOLS = None
 _VERIFIED_PROXIES = []
 _PROXY_DEAD = set()
 
-def load_all_proxies():
-    """Fetch proxies from 4 sources in parallel."""
-    all_proxies = []
-
-    def fetch_json(url):
-        try:
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            result = []
-            if isinstance(data, list):
-                for p in data:
-                    if p.get("protocol") == "http" and p.get("ssl") is True:
-                        ip = p.get("ip")
-                        port = p.get("port")
-                        if ip and port:
-                            result.append(f"http://{ip}:{port}")
-            return result
-        except Exception:
-            return []
-
-    def fetch_text(url):
-        try:
-            r = requests.get(url, timeout=10)
-            result = []
-            for line in r.text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if ":" in line:
-                    if not line.startswith("http"):
-                        line = f"http://{line}"
-                    result.append(line)
-            return result
-        except Exception:
-            return []
-
-    # Fetch all sources in parallel
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = []
-        for i, src in enumerate(PROXY_SOURCES):
-            if src.endswith(".json"):
-                futures.append(executor.submit(fetch_json, src))
-            else:
-                futures.append(executor.submit(fetch_text, src))
-        for f in as_completed(futures):
-            try:
-                all_proxies.extend(f.result())
-            except Exception:
-                pass
-
-    all_proxies = list(set(all_proxies))
-    print(f"Loaded {len(all_proxies)} unique proxies")
-    return all_proxies
+# ================= PROXY VERIFICATION =================
 
 def test_proxy_oi(proxy_str):
-    """Test proxy against OI endpoint. 1 quick test."""
-    proxies = {"http": proxy_str, "https": proxy_str}
-    url = f"{FAPI}/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=5"
+    """Test against OI endpoint. Returns proxy or None."""
     try:
-        r = requests.get(url, proxies=proxies, timeout=4)
+        proxies = {"http": proxy_str, "https": proxy_str}
+        url = f"{FAPI}/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=5"
+        r = requests.get(url, proxies=proxies, timeout=6)
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list) and len(data) >= 3:
@@ -119,28 +117,80 @@ def test_proxy_oi(proxy_str):
         pass
     return None
 
-def build_verified_pool(target=25, max_test=400):
-    """Test up to 400 proxies in parallel until target reached."""
+def load_external_proxies():
+    """Fetch external proxy list as backup."""
+    proxies = []
+    try:
+        r = requests.get(PROXY_LIST_URL_1, timeout=10)
+        data = r.json()
+        if isinstance(data, list):
+            for p in data:
+                if p.get("protocol") == "http" and p.get("ssl") is True:
+                    ip = p.get("ip")
+                    port = p.get("port")
+                    if ip and port:
+                        proxies.append(f"http://{ip}:{port}")
+    except Exception:
+        pass
+    try:
+        r = requests.get(PROXY_LIST_URL_2, timeout=10)
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line and ":" in line and not line.startswith("#"):
+                if not line.startswith("http"):
+                    line = f"http://{line}"
+                proxies.append(line)
+    except Exception:
+        pass
+    return proxies
+
+def build_verified_pool():
+    """Test Japan proxies first. If too few, add external."""
     global _VERIFIED_PROXIES
     if _VERIFIED_PROXIES:
         return _VERIFIED_PROXIES
 
-    all_proxies = load_all_proxies()
-    random.shuffle(all_proxies)
-    test_list = all_proxies[:max_test]
-    print(f"Testing {len(test_list)} proxies against OI (parallel)...")
-
+    print(f"Testing {len(JAPAN_PROXIES)} Japan proxies (parallel)...")
     verified = []
-    with ThreadPoolExecutor(max_workers=100) as executor:
-        futures = {executor.submit(test_proxy_oi, p): p for p in test_list}
+
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(test_proxy_oi, p): p for p in JAPAN_PROXIES}
         try:
-            for future in as_completed(futures, timeout=45):
+            for future in as_completed(futures, timeout=30):
                 try:
                     result = future.result()
                     if result:
                         verified.append(result)
-                        print(f"VERIFIED ({len(verified)}/{target}): {result}")
-                        if len(verified) >= target:
+                        print(f"JP VERIFIED ({len(verified)}): {result}")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    print(f"Japan proxies verified: {len(verified)}")
+
+    # If we have enough Japan proxies, use them
+    if len(verified) >= 5:
+        _VERIFIED_PROXIES = verified
+        print(f"Using {len(verified)} Japan proxies")
+        return _VERIFIED_PROXIES
+
+    # Otherwise, add external
+    print("Not enough Japan proxies. Adding external...")
+    external = load_external_proxies()
+    random.shuffle(external)
+    test_list = external[:200]
+
+    with ThreadPoolExecutor(max_workers=80) as executor:
+        futures = {executor.submit(test_proxy_oi, p): p for p in test_list}
+        try:
+            for future in as_completed(futures, timeout=40):
+                try:
+                    result = future.result()
+                    if result:
+                        verified.append(result)
+                        print(f"EXT VERIFIED ({len(verified)}): {result}")
+                        if len(verified) >= 25:
                             for f in futures:
                                 f.cancel()
                             break
@@ -153,18 +203,21 @@ def build_verified_pool(target=25, max_test=400):
     print(f"Final verified pool: {len(verified)} proxies")
     return _VERIFIED_PROXIES
 
-def rotate_get_small(url, timeout=8, max_attempts=40):
-    """Get request via verified proxy pool with many retries."""
+def rotate_get_small(url, timeout=8, max_attempts=30):
+    """Rotate through verified proxies on every retry."""
     global _VERIFIED_PROXIES
     if not _VERIFIED_PROXIES:
         return None
+    pool = [p for p in _VERIFIED_PROXIES if p not in _PROXY_DEAD]
+    if not pool:
+        pool = list(_VERIFIED_PROXIES)
     for _ in range(max_attempts):
-        pool = [p for p in _VERIFIED_PROXIES if p not in _PROXY_DEAD]
         if not pool:
             break
         proxy = random.choice(pool)
         try:
-            r = requests.get(url, proxies={"http": proxy, "https": proxy}, timeout=timeout)
+            proxies = {"http": proxy, "https": proxy}
+            r = requests.get(url, proxies=proxies, timeout=timeout)
             if r.status_code == 200:
                 try:
                     return r.json()
@@ -174,6 +227,7 @@ def rotate_get_small(url, timeout=8, max_attempts=40):
                 pass
         except Exception:
             _PROXY_DEAD.add(proxy)
+            pool = [p for p in pool if p not in _PROXY_DEAD]
             continue
     return None
 
@@ -273,7 +327,6 @@ def get_spot_1h_change(symbol):
     except Exception:
         return 0
 
-# ================= SYMBOLS =================
 def get_spot_symbols():
     global _SPOT_SYMBOLS
     if _SPOT_SYMBOLS is not None:
@@ -299,7 +352,7 @@ def get_futures_symbols():
     if _FUTURES_SYMBOLS is not None:
         return _FUTURES_SYMBOLS
     url = f"{FAPI}/fapi/v1/exchangeInfo"
-    data = rotate_get_small(url, timeout=12, max_attempts=50)
+    data = rotate_get_small(url, timeout=15, max_attempts=50)
     if not isinstance(data, dict):
         print("Failed to fetch futures exchange info")
         _FUTURES_SYMBOLS = set()
@@ -312,7 +365,6 @@ def get_futures_symbols():
     print(f"Loaded {len(symbols)} futures USDT symbols")
     return symbols
 
-# ================= CANDIDATES =================
 def get_candidates_from_spot():
     url = f"{SPOT_API}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
@@ -365,17 +417,16 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
-# ================= FUTURES DATA =================
 def get_oi_history(symbol, period="5m", limit=13):
     url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
-    data = rotate_get_small(url, timeout=8, max_attempts=40)
+    data = rotate_get_small(url, timeout=10, max_attempts=30)
     if not isinstance(data, list):
         return []
     return data
 
 def get_funding_rate(symbol):
     url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
-    data = rotate_get_small(url, timeout=8, max_attempts=40)
+    data = rotate_get_small(url, timeout=10, max_attempts=30)
     if not isinstance(data, dict):
         return None
     try:
@@ -385,7 +436,7 @@ def get_funding_rate(symbol):
 
 def get_top_trader_ratio(symbol):
     url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
-    data = rotate_get_small(url, timeout=8, max_attempts=40)
+    data = rotate_get_small(url, timeout=10, max_attempts=30)
     if not isinstance(data, list) or not data:
         return None
     try:
@@ -471,7 +522,6 @@ def get_session_label(hour, minute):
         return "US"
     return "Dead-Zone"
 
-# ================= MAIN =================
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
@@ -482,7 +532,7 @@ def main():
         return
 
     print("Building verified proxy pool...")
-    verified = build_verified_pool(target=25, max_test=400)
+    verified = build_verified_pool()
     if not verified:
         print("No verified proxies. Exiting.")
         return
@@ -495,7 +545,6 @@ def main():
         print("No candidates. Exiting.")
         return
 
-    # Top 15 by volume only (reduces load)
     candidates.sort(key=lambda x: x["quote_vol"], reverse=True)
     candidates = candidates[:15]
     print(f"Scanning top {len(candidates)} by volume...")
