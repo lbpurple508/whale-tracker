@@ -57,6 +57,22 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
+def test_proxy(proxy_str):
+    """Test proxy with the ACTUAL endpoint we'll use - not ping."""
+    proxies = {"http": proxy_str, "https": proxy_str}
+    try:
+        # Test the real endpoint (small limit to keep it fast)
+        url = f"{FAPI}/fapi/v1/ticker/24hr"
+        r = requests.get(url, proxies=proxies, timeout=15)
+        if r.status_code != 200:
+            return False
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 10:
+            return False
+        return True
+    except Exception:
+        return False
+
 def get_working_proxy():
     if PROXY_CACHE_FILE.exists():
         try:
@@ -64,8 +80,11 @@ def get_working_proxy():
             ts = datetime.fromisoformat(cached["ts"])
             if (datetime.utcnow() - ts).total_seconds() < 300:
                 proxy = cached["proxy"]
-                print(f"Using cached proxy: {proxy[:40]}...")
-                return proxy
+                if test_proxy(proxy):
+                    print(f"Using cached proxy: {proxy[:40]}...")
+                    return proxy
+                else:
+                    print(f"Cached proxy dead, fetching new...")
         except Exception:
             pass
 
@@ -83,28 +102,23 @@ def get_working_proxy():
         ]
         candidates.sort(key=lambda x: (-x.get("uptime_percent", 0), x.get("latency_ms", 9999)))
 
-        print(f"Testing {len(candidates[:50])} HTTP+SSL proxies...")
+        print(f"Testing {len(candidates[:30])} HTTP+SSL proxies with real endpoint...")
 
-        for p in candidates[:50]:
+        for p in candidates[:30]:
             ip = p.get("ip")
             port = p.get("port")
             if not ip or not port:
                 continue
             proxy_str = f"http://{ip}:{port}"
-            proxies = {"http": proxy_str, "https": proxy_str}
-            try:
-                test = requests.get(f"{FAPI}/fapi/v1/ping", proxies=proxies, timeout=6)
-                if test.status_code == 200:
-                    print(f"WORKING: {proxy_str} (uptime {p.get('uptime_percent')}%)")
-                    PROXY_CACHE_FILE.write_text(json.dumps({
-                        "proxy": proxy_str,
-                        "ts": datetime.utcnow().isoformat()
-                    }))
-                    return proxy_str
-            except Exception:
-                continue
+            if test_proxy(proxy_str):
+                print(f"WORKING: {proxy_str} (uptime {p.get('uptime_percent')}%)")
+                PROXY_CACHE_FILE.write_text(json.dumps({
+                    "proxy": proxy_str,
+                    "ts": datetime.utcnow().isoformat()
+                }))
+                return proxy_str
 
-        print("No working proxy found in first 50")
+        print("No working proxy found in first 30")
         return None
     except Exception as e:
         print(f"Proxy fetch error: {e}")
@@ -182,13 +196,7 @@ def log_rejection(symbol, reasons, price, change_24h):
                 data = {}
         key = f"{symbol}"
         if key not in data:
-            data[key] = {
-                "symbol": symbol,
-                "first_seen": datetime.utcnow().isoformat(),
-                "count": 0,
-                "price": price,
-                "change_24h": change_24h,
-            }
+            data[key] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
         data[key]["count"] += 1
         data[key]["last_seen"] = datetime.utcnow().isoformat()
         data[key]["price"] = price
@@ -235,7 +243,7 @@ def get_spot_1h_change(symbol):
         return 0
 
 def get_futures_candidates(proxy):
-    data = safe_get(f"{FAPI}/fapi/v1/ticker/24hr", proxy=proxy)
+    data = safe_get(f"{FAPI}/fapi/v1/ticker/24hr", proxy=proxy, timeout=20)
     if not isinstance(data, list):
         print(f"Ticker response invalid: {type(data)}")
         return []
@@ -395,8 +403,7 @@ def main():
 
     proxy = get_working_proxy()
     if not proxy:
-        print("No working proxy. Alerting Telegram.")
-        send_telegram("⚠️ <b>FUTURES SCANNER - NO PROXY</b>\n\nAll free proxies failed. Futures signals paused until next run.")
+        print("No working proxy. Skipping futures scan.")
         return
 
     candidates = get_futures_candidates(proxy)
@@ -451,7 +458,7 @@ def main():
             f"📋 <b>IF ENTERED</b>\n"
             f"Entry: {format_price(h['price'])}\n"
             f"Stop: {format_price(stop)} (-3%)\n\n"
-            f"⚠️ <b>WAIT</b> for 🚨 Volume Breakout or 📈 Grind before entering.\n"
+            f"⚠️ <b>WAIT</b> for Volume Breakout or Grind before entering.\n"
             f"⚠️ Check tag: Seed(half) / Monitoring(half)"
         )
         send_telegram(msg)
