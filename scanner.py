@@ -250,7 +250,6 @@ def check_signal(symbol, price, session):
             taker_min = 0.60
             depth_min = 60_000
 
-        # Volume spike OR acceleration
         last_4_vols = [float(k[5]) for k in klines[-4:]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
         recent_1h_vol = sum(float(k[5]) for k in klines[-4:])
@@ -428,5 +427,13 @@ def main():
         )
         send_telegram(msg)
 
+def safe_main():
+    try:
+        main()
+    except Exception as e:
+        err = str(e)[:300]
+        send_telegram(f"🚨 <b>SPIKE SCANNER CRASHED</b>\n\n<b>Error:</b> {err}")
+        raise
+
 if __name__ == "__main__":
-    main()
+    safe_main()
