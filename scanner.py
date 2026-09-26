@@ -37,7 +37,6 @@ BLACKLIST = {
     "XPLUSDT",
 }
 
-# Monitoring tokens - handled by separate scanner
 MONITORING_BLACKLIST = {
     "RAREUSDT", "ARKUSDT", "WIFUSDT", "QIUSDT", "MOVEUSDT",
     "STXUSDT", "LSKUSDT", "SYNUSDT", "MOVRUSDT", "NOMUSDT",
@@ -267,10 +266,10 @@ def check_signal(symbol, price, session):
             return None, ["avg_vol_zero"]
         vol_ratio = recent_1h_vol / avg_1h_vol
 
-        has_spike = vol_ratio >= 5
-        has_acceleration = vol_ratio >= 2 and accel_count >= 3
-        if not (has_spike or has_acceleration):
-            reasons.append(f"vol_{vol_ratio:.1f}x_acc{accel_count}")
+        # SPIKE SCANNER: ONLY fires on 5x+ volume spike
+        # Acceleration (2x + 3/4) is handled by slow_grind_scanner
+        if vol_ratio < 5:
+            reasons.append(f"vol_{vol_ratio:.1f}x_need5x")
 
         current_open = float(klines[-1][1])
         current_close = float(klines[-1][4])
@@ -322,7 +321,6 @@ def check_signal(symbol, price, session):
         return {
             "vol_ratio": vol_ratio,
             "accel_count": accel_count,
-            "is_spike": has_spike,
             "taker_pct": taker_pct * 100,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
@@ -406,14 +404,13 @@ def main():
             priority = "URGENT"
 
         record_alert(h["symbol"])
-        signal_type = "SPIKE" if h.get("is_spike") else f"ACCEL ({h['accel_count']}/3)"
         stop = h["price"] * 0.97
 
         msg = (
             f"{header}\n\n"
             f"<b>Priority:</b> {priority}\n"
             f"<b>Alerts (4h):</b> {count}\n"
-            f"<b>Signal:</b> {signal_type}\n"
+            f"<b>Signal:</b> SPIKE\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
@@ -421,7 +418,6 @@ def main():
             f"<b>4h:</b> {h['change_4h']:.2f}%\n"
             f"<b>RSI:</b> {h['rsi']:.1f}\n"
             f"<b>Vol (1h):</b> {h['vol_ratio']:.2f}x\n"
-            f"<b>Accel:</b> {h['accel_count']}/3\n"
             f"<b>Taker:</b> {h['taker_pct']:.1f}%\n"
             f"<b>Bid:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask:</b> ${h['ask_depth']:,.0f}\n"
