@@ -252,11 +252,11 @@ def check_acceleration(symbol, price):
             return None, ["avg_vol_zero"]
         vol_ratio_1h = recent_1h_vol / avg_1h_vol
 
-        has_spike = vol_ratio_1h >= 5
-        has_acceleration = vol_ratio_1h >= 2 and accel_count >= 3
-
-        if not (has_spike or has_acceleration):
-            reasons.append(f"novol_accel{accel_count}_vol{vol_ratio_1h:.1f}x")
+        # GRIND SCANNER: ONLY fires on acceleration (volume 1.5-4.9x)
+        # 5x+ volume is handled by spike scanner. No overlap.
+        has_acceleration = 1.5 <= vol_ratio_1h < 5 and accel_count >= 3
+        if not has_acceleration:
+            reasons.append(f"no_accel_{accel_count}_vol{vol_ratio_1h:.1f}x")
 
         current_close = float(klines[-1][4])
         price_1h_ago = float(klines[-5][4])
@@ -300,7 +300,6 @@ def check_acceleration(symbol, price):
         return {
             "accel_count": accel_count,
             "vol_ratio_1h": vol_ratio_1h,
-            "is_spike": has_spike,
             "change_1h": change_1h,
             "change_4h": change_4h,
             "greens": greens,
@@ -386,14 +385,13 @@ def main():
             priority = "URGENT"
 
         record_alert(h["symbol"])
-        signal_type = "SPIKE" if h.get("is_spike") else f"ACCEL ({h['accel_count']}/3)"
         stop = h["price"] * 0.97
 
         msg = (
             f"{header}\n\n"
             f"<b>Priority:</b> {priority}\n"
             f"<b>Alerts (4h):</b> {count}\n"
-            f"<b>Signal:</b> {signal_type}\n"
+            f"<b>Signal:</b> ACCEL ({h['accel_count']}/3)\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
