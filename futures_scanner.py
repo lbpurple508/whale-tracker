@@ -11,8 +11,14 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 FAPI = "https://fapi.binance.com"
 SPOT_API = "https://data-api.binance.vision"
-PROXY_LIST_URL_1 = "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.json"
-PROXY_LIST_URL_2 = "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/http.txt"
+
+PROXY_SOURCES = [
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.json",
+    "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+]
+
 COOLDOWN_FILE = Path("futures_cooldown.json")
 REJECT_FILE = Path("futures_rejections.json")
 COOLDOWN_MINUTES = 60
@@ -39,110 +45,139 @@ BLACKLIST = {
     "XPLUSDT",
 }
 
+# ================= PROXY POOL =================
 _SPOT_SYMBOLS = None
 _FUTURES_SYMBOLS = None
 _VERIFIED_PROXIES = []
+_PROXY_DEAD = set()
 
-# ---------- PROXY POOL + VERIFICATION ----------
-
-def load_proxy_list():
+def load_all_proxies():
+    """Fetch proxies from 4 sources in parallel."""
     all_proxies = []
-    try:
-        r = requests.get(PROXY_LIST_URL_1, timeout=15)
-        data = r.json()
-        if isinstance(data, list):
-            for p in data:
-                if p.get("protocol") == "http" and p.get("ssl") is True:
-                    ip = p.get("ip")
-                    port = p.get("port")
-                    if ip and port:
-                        all_proxies.append(f"http://{ip}:{port}")
-    except Exception as e:
-        print(f"ProxyScrape error: {e}")
-    try:
-        r = requests.get(PROXY_LIST_URL_2, timeout=15)
-        for line in r.text.splitlines():
-            line = line.strip()
-            if line and ":" in line and not line.startswith("#"):
-                if not line.startswith("http"):
-                    line = f"http://{line}"
-                all_proxies.append(line)
-    except Exception as e:
-        print(f"ProxRipper error: {e}")
-    return list(set(all_proxies))
 
-def verify_proxy_against_oi(proxy_str):
-    """Test proxy against the OI endpoint with a known futures coin (BTCUSDT)."""
+    def fetch_json(url):
+        try:
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            result = []
+            if isinstance(data, list):
+                for p in data:
+                    if p.get("protocol") == "http" and p.get("ssl") is True:
+                        ip = p.get("ip")
+                        port = p.get("port")
+                        if ip and port:
+                            result.append(f"http://{ip}:{port}")
+            return result
+        except Exception:
+            return []
+
+    def fetch_text(url):
+        try:
+            r = requests.get(url, timeout=10)
+            result = []
+            for line in r.text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" in line:
+                    if not line.startswith("http"):
+                        line = f"http://{line}"
+                    result.append(line)
+            return result
+        except Exception:
+            return []
+
+    # Fetch all sources in parallel
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for i, src in enumerate(PROXY_SOURCES):
+            if src.endswith(".json"):
+                futures.append(executor.submit(fetch_json, src))
+            else:
+                futures.append(executor.submit(fetch_text, src))
+        for f in as_completed(futures):
+            try:
+                all_proxies.extend(f.result())
+            except Exception:
+                pass
+
+    all_proxies = list(set(all_proxies))
+    print(f"Loaded {len(all_proxies)} unique proxies")
+    return all_proxies
+
+def test_proxy_oi(proxy_str):
+    """Test proxy against OI endpoint. 1 quick test."""
     proxies = {"http": proxy_str, "https": proxy_str}
     url = f"{FAPI}/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=5"
     try:
-        r = requests.get(url, proxies=proxies, timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if isinstance(data, list) and len(data) >= 3:
-            return proxy_str
+        r = requests.get(url, proxies=proxies, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) >= 3:
+                return proxy_str
     except Exception:
-        return None
+        pass
     return None
 
-def build_verified_pool(max_workers=50, target=30):
-    """Verify proxies in parallel. Stop when we have enough working ones."""
+def build_verified_pool(target=25, max_test=400):
+    """Test up to 400 proxies in parallel until target reached."""
     global _VERIFIED_PROXIES
     if _VERIFIED_PROXIES:
         return _VERIFIED_PROXIES
 
-    all_proxies = load_proxy_list()
+    all_proxies = load_all_proxies()
     random.shuffle(all_proxies)
-    print(f"Testing up to {min(len(all_proxies), 500)} proxies against OI endpoint...")
+    test_list = all_proxies[:max_test]
+    print(f"Testing {len(test_list)} proxies against OI (parallel)...")
 
-    test_list = all_proxies[:500]
     verified = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(verify_proxy_against_oi, p): p for p in test_list}
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    verified.append(result)
-                    print(f"VERIFIED: {result}")
-                    if len(verified) >= target:
-                        # Cancel remaining
-                        for f in futures:
-                            f.cancel()
-                        break
-            except Exception:
-                continue
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        futures = {executor.submit(test_proxy_oi, p): p for p in test_list}
+        try:
+            for future in as_completed(futures, timeout=45):
+                try:
+                    result = future.result()
+                    if result:
+                        verified.append(result)
+                        print(f"VERIFIED ({len(verified)}/{target}): {result}")
+                        if len(verified) >= target:
+                            for f in futures:
+                                f.cancel()
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     _VERIFIED_PROXIES = verified
-    print(f"Verified pool: {len(verified)} proxies")
+    print(f"Final verified pool: {len(verified)} proxies")
     return _VERIFIED_PROXIES
 
-def rotate_get_small(url, timeout=10, max_attempts=20):
-    """Use ONLY verified proxies for requests."""
+def rotate_get_small(url, timeout=8, max_attempts=40):
+    """Get request via verified proxy pool with many retries."""
+    global _VERIFIED_PROXIES
     if not _VERIFIED_PROXIES:
         return None
-    for attempt in range(max_attempts):
-        proxy = random.choice(_VERIFIED_PROXIES)
+    for _ in range(max_attempts):
+        pool = [p for p in _VERIFIED_PROXIES if p not in _PROXY_DEAD]
+        if not pool:
+            break
+        proxy = random.choice(pool)
         try:
-            r = requests.get(
-                url,
-                proxies={"http": proxy, "https": proxy},
-                timeout=timeout
-            )
+            r = requests.get(url, proxies={"http": proxy, "https": proxy}, timeout=timeout)
             if r.status_code == 200:
                 try:
                     return r.json()
                 except Exception:
-                    continue
+                    pass
             elif r.status_code == 451:
-                continue
+                pass
         except Exception:
+            _PROXY_DEAD.add(proxy)
             continue
     return None
 
-# ---------- TELEGRAM ----------
-
+# ================= TELEGRAM =================
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -151,8 +186,7 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ---------- HELPERS ----------
-
+# ================= HELPERS =================
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -239,8 +273,7 @@ def get_spot_1h_change(symbol):
     except Exception:
         return 0
 
-# ---------- SYMBOLS ----------
-
+# ================= SYMBOLS =================
 def get_spot_symbols():
     global _SPOT_SYMBOLS
     if _SPOT_SYMBOLS is not None:
@@ -266,7 +299,7 @@ def get_futures_symbols():
     if _FUTURES_SYMBOLS is not None:
         return _FUTURES_SYMBOLS
     url = f"{FAPI}/fapi/v1/exchangeInfo"
-    data = rotate_get_small(url, timeout=15, max_attempts=30)
+    data = rotate_get_small(url, timeout=12, max_attempts=50)
     if not isinstance(data, dict):
         print("Failed to fetch futures exchange info")
         _FUTURES_SYMBOLS = set()
@@ -279,8 +312,7 @@ def get_futures_symbols():
     print(f"Loaded {len(symbols)} futures USDT symbols")
     return symbols
 
-# ---------- CANDIDATES ----------
-
+# ================= CANDIDATES =================
 def get_candidates_from_spot():
     url = f"{SPOT_API}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
@@ -333,18 +365,17 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
-# ---------- FUTURES DATA ----------
-
+# ================= FUTURES DATA =================
 def get_oi_history(symbol, period="5m", limit=13):
     url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
-    data = rotate_get_small(url, timeout=10, max_attempts=20)
+    data = rotate_get_small(url, timeout=8, max_attempts=40)
     if not isinstance(data, list):
         return []
     return data
 
 def get_funding_rate(symbol):
     url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
-    data = rotate_get_small(url, timeout=10, max_attempts=20)
+    data = rotate_get_small(url, timeout=8, max_attempts=40)
     if not isinstance(data, dict):
         return None
     try:
@@ -354,7 +385,7 @@ def get_funding_rate(symbol):
 
 def get_top_trader_ratio(symbol):
     url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
-    data = rotate_get_small(url, timeout=10, max_attempts=20)
+    data = rotate_get_small(url, timeout=8, max_attempts=40)
     if not isinstance(data, list) or not data:
         return None
     try:
@@ -440,6 +471,7 @@ def get_session_label(hour, minute):
         return "US"
     return "Dead-Zone"
 
+# ================= MAIN =================
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
@@ -450,10 +482,11 @@ def main():
         return
 
     print("Building verified proxy pool...")
-    verified = build_verified_pool(max_workers=50, target=30)
+    verified = build_verified_pool(target=25, max_test=400)
     if not verified:
         print("No verified proxies. Exiting.")
         return
+    print(f"Proceeding with {len(verified)} proxies")
 
     candidates = get_candidates_from_spot()
     print(f"Candidates from spot: {len(candidates)}")
@@ -462,8 +495,9 @@ def main():
         print("No candidates. Exiting.")
         return
 
+    # Top 15 by volume only (reduces load)
     candidates.sort(key=lambda x: x["quote_vol"], reverse=True)
-    candidates = candidates[:40]
+    candidates = candidates[:15]
     print(f"Scanning top {len(candidates)} by volume...")
 
     cooldown = load_cooldown()
@@ -471,7 +505,7 @@ def main():
 
     hits = []
     rejection = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(check_pre_pump, c["symbol"], c["price"]): c for c in candidates}
         for future in as_completed(futures):
             c = futures[future]
