@@ -1,0 +1,50 @@
+name: Monitoring Token Scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            monitor_cooldown.json
+            monitor_rejections.json
+            monitor_history.json
+          key: monitor-cooldown-${{ github.run_id }}
+          restore-keys: |
+            monitor-cooldown-
+      - name: Run monitoring scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitoring_scanner.py
+      - name: Save cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            monitor_cooldown.json
+            monitor_rejections.json
+            monitor_history.json
+          key: monitor-cooldown-${{ github.run_id }}
+      - name: Upload rejections
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: monitoring-rejections
+          path: monitor_rejections.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
