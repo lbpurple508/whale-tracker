@@ -41,14 +41,12 @@ BLACKLIST = {
 
 _SPOT_SYMBOLS = None
 _FUTURES_SYMBOLS = None
-_PROXY_POOL = []
+_VERIFIED_PROXIES = []
 
-# ---------- PROXY POOL ----------
+# ---------- PROXY POOL + VERIFICATION ----------
 
-def load_proxy_pool():
-    global _PROXY_POOL
+def load_proxy_list():
     all_proxies = []
-
     try:
         r = requests.get(PROXY_LIST_URL_1, timeout=15)
         data = r.json()
@@ -61,7 +59,6 @@ def load_proxy_pool():
                         all_proxies.append(f"http://{ip}:{port}")
     except Exception as e:
         print(f"ProxyScrape error: {e}")
-
     try:
         r = requests.get(PROXY_LIST_URL_2, timeout=15)
         for line in r.text.splitlines():
@@ -72,26 +69,61 @@ def load_proxy_pool():
                 all_proxies.append(line)
     except Exception as e:
         print(f"ProxRipper error: {e}")
+    return list(set(all_proxies))
 
-    all_proxies = list(set(all_proxies))
-    random.shuffle(all_proxies)
-    _PROXY_POOL = all_proxies
-    print(f"Proxy pool loaded: {len(_PROXY_POOL)} proxies")
-    return _PROXY_POOL
-
-def get_random_proxy():
-    if not _PROXY_POOL:
-        load_proxy_pool()
-    if not _PROXY_POOL:
+def verify_proxy_against_oi(proxy_str):
+    """Test proxy against the OI endpoint with a known futures coin (BTCUSDT)."""
+    proxies = {"http": proxy_str, "https": proxy_str}
+    url = f"{FAPI}/futures/data/openInterestHist?symbol=BTCUSDT&period=5m&limit=5"
+    try:
+        r = requests.get(url, proxies=proxies, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if isinstance(data, list) and len(data) >= 3:
+            return proxy_str
+    except Exception:
         return None
-    return random.choice(_PROXY_POOL)
+    return None
 
-def rotate_get_small(url, timeout=8, max_attempts=30):
-    """For small endpoints (<5KB). Rotates proxy on each attempt."""
+def build_verified_pool(max_workers=50, target=30):
+    """Verify proxies in parallel. Stop when we have enough working ones."""
+    global _VERIFIED_PROXIES
+    if _VERIFIED_PROXIES:
+        return _VERIFIED_PROXIES
+
+    all_proxies = load_proxy_list()
+    random.shuffle(all_proxies)
+    print(f"Testing up to {min(len(all_proxies), 500)} proxies against OI endpoint...")
+
+    test_list = all_proxies[:500]
+    verified = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(verify_proxy_against_oi, p): p for p in test_list}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    verified.append(result)
+                    print(f"VERIFIED: {result}")
+                    if len(verified) >= target:
+                        # Cancel remaining
+                        for f in futures:
+                            f.cancel()
+                        break
+            except Exception:
+                continue
+
+    _VERIFIED_PROXIES = verified
+    print(f"Verified pool: {len(verified)} proxies")
+    return _VERIFIED_PROXIES
+
+def rotate_get_small(url, timeout=10, max_attempts=20):
+    """Use ONLY verified proxies for requests."""
+    if not _VERIFIED_PROXIES:
+        return None
     for attempt in range(max_attempts):
-        proxy = get_random_proxy()
-        if not proxy:
-            break
+        proxy = random.choice(_VERIFIED_PROXIES)
         try:
             r = requests.get(
                 url,
@@ -207,7 +239,7 @@ def get_spot_1h_change(symbol):
     except Exception:
         return 0
 
-# ---------- SYMBOL LISTS ----------
+# ---------- SYMBOLS ----------
 
 def get_spot_symbols():
     global _SPOT_SYMBOLS
@@ -230,12 +262,11 @@ def get_spot_symbols():
         return _SPOT_SYMBOLS
 
 def get_futures_symbols():
-    """Fetch futures USDT symbols via rotating proxy. Small single request."""
     global _FUTURES_SYMBOLS
     if _FUTURES_SYMBOLS is not None:
         return _FUTURES_SYMBOLS
     url = f"{FAPI}/fapi/v1/exchangeInfo"
-    data = rotate_get_small(url, timeout=10, max_attempts=40)
+    data = rotate_get_small(url, timeout=15, max_attempts=30)
     if not isinstance(data, dict):
         print("Failed to fetch futures exchange info")
         _FUTURES_SYMBOLS = set()
@@ -251,7 +282,6 @@ def get_futures_symbols():
 # ---------- CANDIDATES ----------
 
 def get_candidates_from_spot():
-    """Candidates from Binance SPOT API. Filter to futures-listed only."""
     url = f"{SPOT_API}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
     tickers = r.json()
@@ -303,18 +333,18 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
-# ---------- FUTURES DATA (SMALL PROXY REQUESTS) ----------
+# ---------- FUTURES DATA ----------
 
 def get_oi_history(symbol, period="5m", limit=13):
     url = f"{FAPI}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
-    data = rotate_get_small(url, timeout=6, max_attempts=15)
+    data = rotate_get_small(url, timeout=10, max_attempts=20)
     if not isinstance(data, list):
         return []
     return data
 
 def get_funding_rate(symbol):
     url = f"{FAPI}/fapi/v1/premiumIndex?symbol={symbol}"
-    data = rotate_get_small(url, timeout=6, max_attempts=15)
+    data = rotate_get_small(url, timeout=10, max_attempts=20)
     if not isinstance(data, dict):
         return None
     try:
@@ -324,7 +354,7 @@ def get_funding_rate(symbol):
 
 def get_top_trader_ratio(symbol):
     url = f"{FAPI}/futures/data/topLongShortAccountRatio?symbol={symbol}&period=5m&limit=1"
-    data = rotate_get_small(url, timeout=6, max_attempts=15)
+    data = rotate_get_small(url, timeout=10, max_attempts=20)
     if not isinstance(data, list) or not data:
         return None
     try:
@@ -419,10 +449,10 @@ def main():
         print("BTC dumping >2%. Skipping.")
         return
 
-    print("Loading proxy pool...")
-    load_proxy_pool()
-    if not _PROXY_POOL:
-        print("No proxies available. Exiting.")
+    print("Building verified proxy pool...")
+    verified = build_verified_pool(max_workers=50, target=30)
+    if not verified:
+        print("No verified proxies. Exiting.")
         return
 
     candidates = get_candidates_from_spot()
