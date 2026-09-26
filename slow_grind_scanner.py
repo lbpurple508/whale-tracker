@@ -252,8 +252,6 @@ def check_acceleration(symbol, price):
             return None, ["avg_vol_zero"]
         vol_ratio_1h = recent_1h_vol / avg_1h_vol
 
-        # GRIND SCANNER: ONLY fires on acceleration (volume 1.5-4.9x)
-        # 5x+ volume is handled by spike scanner. No overlap.
         has_acceleration = 1.5 <= vol_ratio_1h < 5 and accel_count >= 3
         if not has_acceleration:
             reasons.append(f"no_accel_{accel_count}_vol{vol_ratio_1h:.1f}x")
@@ -315,7 +313,6 @@ def scan():
     candidates = get_candidates()
     print(f"Candidates after Stage1: {len(candidates)}")
     cooldown = load_cooldown()
-    print(f"Cooldown: {list(cooldown.keys())}")
     hits = []
     rejection = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -374,42 +371,38 @@ def main():
     print(f"Found {len(hits)} signals")
     for h in hits:
         count = get_alert_count(h["symbol"]) + 1
-        if count == 1:
-            header = f"📈 <b>GRIND DETECTED</b> [{session}]"
-            priority = "NORMAL"
-        elif count == 2:
-            header = f"📈📈 <b>STRONG GRIND — 2ND</b> [{session}]"
-            priority = "STRONG"
-        else:
-            header = f"🚨🚨 <b>URGENT — {count}X</b> [{session}]"
-            priority = "URGENT"
-
         record_alert(h["symbol"])
         stop = h["price"] * 0.97
 
+        # ============ CLEAR HEADER AND ACTION ============
+        if count == 1:
+            header = f"📈 GRIND DETECTED [1/2] [{session}]"
+            action = "⏸️ WAIT — Do NOT enter yet. Wait for [2/2] alert."
+        elif count == 2:
+            header = f"📈📈 GRIND DETECTED [2/2] [{session}]"
+            action = "✅ ENTER NOW — Buy at current price."
+        else:
+            header = f"🚨 GRIND DETECTED [{count}/2+] [{session}]"
+            action = f"✅ ADD MORE — This is confirmation #{count}. Buy another $5."
+
         msg = (
             f"{header}\n\n"
-            f"<b>Priority:</b> {priority}\n"
-            f"<b>Alerts (4h):</b> {count}\n"
-            f"<b>Signal:</b> ACCEL ({h['accel_count']}/3)\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>24h:</b> {h['change_24h']:.2f}%\n"
             f"<b>1h:</b> {h['change_1h']:.2f}%\n"
             f"<b>4h:</b> {h['change_4h']:.2f}%\n"
             f"<b>RSI:</b> {h['rsi']:.1f}\n"
-            f"<b>Vol (1h):</b> {h['vol_ratio_1h']:.2f}x\n"
-            f"<b>Accel:</b> {h['accel_count']}/3\n"
-            f"<b>Greens:</b> {h['greens']}/4\n"
-            f"<b>Taker:</b> {h['taker_pct']:.1f}%\n"
-            f"<b>Bid:</b> ${h['bid_depth']:,.0f}\n"
-            f"<b>Ask:</b> ${h['ask_depth']:,.0f}\n"
+            f"<b>Volume:</b> {h['vol_ratio_1h']:.2f}x normal\n"
+            f"<b>Acceleration:</b> {h['accel_count']}/3 candles\n"
+            f"<b>Green Candles:</b> {h['greens']}/4\n"
+            f"<b>Buyers:</b> {h['taker_pct']:.1f}%\n"
+            f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
+            f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"📋 <b>PLAN</b>\n"
-            f"Entry: {format_price(h['price'])}\n"
-            f"Stop: {format_price(stop)} (-3%)\n"
-            f"Trail: +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
-            f"⚠️ 2nd alert = ENTER"
+            f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
+            f"<b>Trail:</b> +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
+            f"{action}"
         )
         send_telegram(msg)
 
@@ -417,7 +410,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        send_telegram(f"🚨 <b>GRIND SCANNER CRASHED</b>\n\n<b>Error:</b> {str(e)[:300]}")
+        send_telegram(f"🚨 GRIND SCANNER CRASHED\n\nError: {str(e)[:300]}")
         raise
 
 if __name__ == "__main__":
