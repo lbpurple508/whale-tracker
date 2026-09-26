@@ -39,7 +39,6 @@ BLACKLIST = {
     "XPLUSDT",
 }
 
-# Global cache for spot symbols
 _SPOT_SYMBOLS = None
 
 def format_price(p):
@@ -60,7 +59,6 @@ def send_telegram(message):
         print(f"Telegram error: {e}")
 
 def get_spot_symbols():
-    """Fetch all USDT spot symbols from Binance Spot API (works from US)."""
     global _SPOT_SYMBOLS
     if _SPOT_SYMBOLS is not None:
         return _SPOT_SYMBOLS
@@ -80,45 +78,42 @@ def get_spot_symbols():
         _SPOT_SYMBOLS = set()
         return _SPOT_SYMBOLS
 
-def load_cooldown():
-    if COOLDOWN_FILE.exists():
+def load_json(path):
+    if path.exists():
         try:
-            data = json.loads(COOLDOWN_FILE.read_text())
-            now = datetime.utcnow()
-            cleaned = {}
-            for sym, ts in data.items():
-                try:
-                    t = datetime.fromisoformat(ts)
-                    if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
-                        cleaned[sym] = ts
-                except Exception:
-                    pass
-            return cleaned
+            return json.loads(path.read_text())
         except Exception:
             return {}
     return {}
 
-def save_cooldown(data):
+def save_json(path, data):
     try:
-        COOLDOWN_FILE.write_text(json.dumps(data))
+        path.write_text(json.dumps(data))
     except Exception as e:
-        print(f"cooldown save error: {e}")
+        print(f"save error {path}: {e}")
 
-def log_rejection(symbol, reasons, price, change_24h, reason_type):
+def load_cooldown():
+    data = load_json(COOLDOWN_FILE)
+    now = datetime.utcnow()
+    cleaned = {}
+    for sym, ts in data.items():
+        try:
+            t = datetime.fromisoformat(ts)
+            if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
+                cleaned[sym] = ts
+        except Exception:
+            pass
+    return cleaned
+
+def log_rejection(symbol, reasons, price, change_24h):
     try:
-        data = {}
-        if REJECT_FILE.exists():
-            try:
-                data = json.loads(REJECT_FILE.read_text())
-            except Exception:
-                data = {}
+        data = load_json(REJECT_FILE)
         key = f"{symbol}"
         if key not in data:
             data[key] = {
                 "symbol": symbol,
                 "first_seen": datetime.utcnow().isoformat(),
                 "count": 0,
-                "type": reason_type,
                 "price": price,
                 "change_24h": change_24h,
             }
@@ -127,11 +122,10 @@ def log_rejection(symbol, reasons, price, change_24h, reason_type):
         data[key]["price"] = price
         data[key]["change_24h"] = change_24h
         data[key]["top_reason"] = reasons[0] if reasons else "unknown"
-        data[key]["all_reasons"] = reasons[:3]
         if len(data) > 200:
             sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
             data = dict(sorted_items[:200])
-        REJECT_FILE.write_text(json.dumps(data))
+        save_json(REJECT_FILE, data)
     except Exception as e:
         print(f"reject log error: {e}")
 
@@ -171,12 +165,6 @@ def btc_is_healthy():
         print(f"BTC check error: {e}")
         return True
 
-def build_execution_plan(price):
-    return {
-        "entry": price,
-        "stop": price * 0.97,
-    }
-
 def get_spot_1h_change(symbol):
     try:
         url = f"{SPOT_API}/api/v3/klines?symbol={symbol}&interval=1h&limit=2"
@@ -197,14 +185,12 @@ def get_futures_candidates():
     if not isinstance(data, list):
         print(f"Ticker response invalid: {type(data)}")
         return []
-    
     spot_symbols = get_spot_symbols()
     candidates = []
     rejected_stage1 = {
         "vol_low": 0, "change_range": 0, "price_high": 0,
         "major": 0, "blacklist": 0, "not_on_spot": 0
     }
-    
     for t in data:
         if not isinstance(t, dict):
             continue
@@ -219,12 +205,9 @@ def get_futures_candidates():
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
             continue
-        
-        # NEW FIX: Cross-check symbol exists on Binance Spot
         if spot_symbols and symbol not in spot_symbols:
             rejected_stage1["not_on_spot"] += 1
             continue
-        
         try:
             quote_vol = float(t.get("quoteVolume", 0))
             change = float(t.get("priceChangePercent", 0))
@@ -382,7 +365,7 @@ def main():
                 if reasons:
                     top = reasons[0].split("_")[0]
                     rejection[top] = rejection.get(top, 0) + 1
-                    log_rejection(c["symbol"], reasons, c["price"], c["change_24h"], "prepump")
+                    log_rejection(c["symbol"], reasons, c["price"], c["change_24h"])
 
     print(f"Stage2 rejection: {rejection}")
     print(f"Found {len(hits)} pre-pump signals")
@@ -390,7 +373,7 @@ def main():
     now = datetime.utcnow()
     for h in hits:
         cooldown[h["symbol"]] = now.isoformat()
-        plan = build_execution_plan(h["price"])
+        stop = h["price"] * 0.97
         msg = (
             f"🔮 <b>PRE-PUMP DETECTED</b> [{session}]\n\n"
             f"<b>Type:</b> WHALE LOADING (warning only)\n"
@@ -406,14 +389,14 @@ def main():
             f"<b>24h Vol:</b> ${h['quote_vol']:,.0f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
             f"📋 <b>IF ENTERED</b>\n"
-            f"Entry: {format_price(plan['entry'])}\n"
-            f"Stop: {format_price(plan['stop'])} (-3%)\n\n"
-            f"⚠️ <b>WAIT</b> for 🚨 Volume Breakout before entering.\n"
-            f"⚠️ Check tag: Seed(half) / Monitoring(skip)"
+            f"Entry: {format_price(h['price'])}\n"
+            f"Stop: {format_price(stop)} (-3%)\n\n"
+            f"⚠️ <b>WAIT</b> for 🚨 Volume Breakout or 📈 Grind before entering.\n"
+            f"⚠️ Check tag: Seed(half) / Monitoring(half)"
         )
         send_telegram(msg)
 
-    save_cooldown(cooldown)
+    save_json(COOLDOWN_FILE, cooldown)
 
 if __name__ == "__main__":
     main()
