@@ -22,6 +22,7 @@ jobs:
             monitor_cooldown.json
             monitor_rejections.json
             monitor_history.json
+            monitor_signals.json
           key: monitor-cooldown-${{ github.run_id }}
           restore-keys: |
             monitor-cooldown-
@@ -38,6 +39,7 @@ jobs:
             monitor_cooldown.json
             monitor_rejections.json
             monitor_history.json
+            monitor_signals.json
           key: monitor-cooldown-${{ github.run_id }}
       - name: Upload rejections
         uses: actions/upload-artifact@v4
