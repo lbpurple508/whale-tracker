@@ -286,11 +286,16 @@ def check_acceleration(symbol, price):
         if taker_pct < 0.55:
             reasons.append(f"taker_{taker_pct*100:.1f}%")
 
+        # NEW: Bid/Ask ratio filter
         bid_depth, ask_depth = check_depth(symbol, price)
-        if bid_depth < 40_000:
+        bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
+
+        if bid_depth < 10_000:
             reasons.append(f"bid_{bid_depth:.0f}")
-        if ask_depth < 40_000:
+        if ask_depth < 10_000:
             reasons.append(f"ask_{ask_depth:.0f}")
+        if bid_ask_ratio < 0.7:
+            reasons.append(f"ratio_{bid_ask_ratio:.2f}")
 
         if reasons:
             return None, reasons
@@ -305,6 +310,7 @@ def check_acceleration(symbol, price):
             "taker_pct": taker_pct * 100,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
+            "bid_ask_ratio": bid_ask_ratio,
         }, []
     except Exception as e:
         return None, [f"exception_{e}"]
@@ -374,7 +380,6 @@ def main():
         record_alert(h["symbol"])
         stop = h["price"] * 0.97
 
-        # ============ CLEAR HEADER AND ACTION ============
         if count == 1:
             header = f"📈 GRIND DETECTED [1/2] [{session}]"
             action = "⏸️ WAIT — Do NOT enter yet. Wait for [2/2] alert."
@@ -383,7 +388,7 @@ def main():
             action = "✅ ENTER NOW — Buy at current price."
         else:
             header = f"🚨 GRIND DETECTED [{count}/2+] [{session}]"
-            action = f"✅ ADD MORE — This is confirmation #{count}. Buy another $5."
+            action = f"✅ ADD MORE — Confirmation #{count}. Buy another $5."
 
         msg = (
             f"{header}\n\n"
@@ -399,6 +404,7 @@ def main():
             f"<b>Buyers:</b> {h['taker_pct']:.1f}%\n"
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
+            f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
             f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
             f"<b>Trail:</b> +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
