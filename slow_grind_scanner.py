@@ -283,17 +283,16 @@ def check_acceleration(symbol, price):
         if total_vol == 0:
             reasons.append("vol_zero")
         taker_pct = taker_buy / total_vol if total_vol else 0
-        if taker_pct < 0.55:
+        if taker_pct < 0.50:
             reasons.append(f"taker_{taker_pct*100:.1f}%")
 
-        # NEW: Bid/Ask ratio filter
         bid_depth, ask_depth = check_depth(symbol, price)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        if bid_depth < 10_000:
-            reasons.append(f"bid_{bid_depth:.0f}")
-        if ask_depth < 10_000:
-            reasons.append(f"ask_{ask_depth:.0f}")
+        if bid_depth < 40_000:
+            reasons.append(f"bid_low_{bid_depth:.0f}")
+        if ask_depth < 40_000:
+            reasons.append(f"ask_low_{ask_depth:.0f}")
         if bid_ask_ratio < 0.7:
             reasons.append(f"ratio_{bid_ask_ratio:.2f}")
 
