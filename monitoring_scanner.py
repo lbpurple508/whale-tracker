@@ -75,14 +75,14 @@ def load_cooldown():
     return cleaned
 
 def is_on_cooldown(symbol, cooldown, stage):
-    """BREAKOUT bypasses COILING cooldown."""
+    """BREAKOUT bypasses COILING cooldown, but respects its own BREAKOUT cooldown."""
     if symbol not in cooldown:
         return False
     existing_stage = cooldown[symbol].get("stage", "COILING")
-    # If breakout signal, bypass coiling cooldown
-    if stage == "BREAKOUT":
+    # BREAKOUT bypasses COILING cooldown only
+    if stage == "BREAKOUT" and existing_stage == "COILING":
         return False
-    # If coiling signal, respect coiling cooldown
+    # Otherwise respect cooldown
     return True
 
 def get_alert_count(symbol):
@@ -231,7 +231,6 @@ def detect_stage(symbol):
         current_close = float(completed[4])
         current_open = float(completed[1])
         current_vol = float(completed[5])
-        current_taker = float(completed[9])
 
         # Prior 21 completed candles (not including current completed)
         prior_vols = [float(k[5]) for k in klines[-22:-2]]
@@ -247,12 +246,12 @@ def detect_stage(symbol):
             return None, ["zero_low"]
         range_pct = ((max(highs_6h) - min(lows_6h)) / min(lows_6h)) * 100
 
-        # 6h change
-        price_6h_ago = float(klines[-25][4])
+        # 6h change — 24 candles back from klines[-2] = klines[-26]
+        price_6h_ago = float(klines[-26][4])
         change_6h = ((current_close - price_6h_ago) / price_6h_ago) * 100
 
-        # 1h change (4 completed candles back)
-        price_1h_ago = float(klines[-5][4])
+        # 1h change — 4 candles back from klines[-2] = klines[-6]
+        price_1h_ago = float(klines[-6][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
 
         # RSI on completed candles only
@@ -299,7 +298,7 @@ def detect_stage(symbol):
                 "bid_ask_ratio": bid_ask_ratio,
             }
 
-        # COILING CHECK — added ratio filter
+        # COILING CHECK — includes ratio filter
         coiling_reasons = []
         if rsi_now < 30 or rsi_now > 55:
             coiling_reasons.append(f"RSI_{rsi_now:.1f}")
@@ -360,7 +359,6 @@ def scan(session):
             else:
                 stage, data = None, ["exception"]
             if stage:
-                # Check cooldown with stage awareness
                 if is_on_cooldown(symbol, cooldown, stage):
                     continue
                 data["symbol"] = symbol
