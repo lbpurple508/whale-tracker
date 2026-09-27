@@ -12,7 +12,9 @@ BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("monitor_cooldown.json")
 REJECT_FILE = Path("monitor_rejections.json")
 HISTORY_FILE = Path("monitor_history.json")
+SIGNALS_FILE = Path("monitor_signals.json")
 COOLDOWN_MINUTES = 45
+COOLDOWN_BREAKOUT_MINUTES = 5
 HISTORY_HOURS = 6
 
 MONITORING_TOKENS = [
@@ -60,14 +62,28 @@ def load_cooldown():
     data = load_json(COOLDOWN_FILE)
     now = datetime.utcnow()
     cleaned = {}
-    for sym, ts in data.items():
+    for sym, info in data.items():
         try:
+            ts = info.get("ts", "")
+            stage = info.get("stage", "COILING")
             t = datetime.fromisoformat(ts)
-            if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
-                cleaned[sym] = ts
+            minutes = COOLDOWN_BREAKOUT_MINUTES if stage == "BREAKOUT" else COOLDOWN_MINUTES
+            if (now - t).total_seconds() < minutes * 60:
+                cleaned[sym] = info
         except Exception:
             pass
     return cleaned
+
+def is_on_cooldown(symbol, cooldown, stage):
+    """BREAKOUT bypasses COILING cooldown."""
+    if symbol not in cooldown:
+        return False
+    existing_stage = cooldown[symbol].get("stage", "COILING")
+    # If breakout signal, bypass coiling cooldown
+    if stage == "BREAKOUT":
+        return False
+    # If coiling signal, respect coiling cooldown
+    return True
 
 def get_alert_count(symbol):
     history = load_json(HISTORY_FILE)
@@ -85,7 +101,7 @@ def get_alert_count(symbol):
             pass
     return count
 
-def record_alert(symbol):
+def record_alert(symbol, stage):
     history = load_json(HISTORY_FILE)
     now = datetime.utcnow()
     if symbol not in history:
@@ -97,12 +113,45 @@ def record_alert(symbol):
     ]
     save_json(HISTORY_FILE, history)
 
-def log_rejection(symbol, reasons, price, change_24h):
+    cooldown = load_json(COOLDOWN_FILE)
+    cooldown[symbol] = {"ts": now.isoformat(), "stage": stage}
+    save_json(COOLDOWN_FILE, cooldown)
+
+def log_signal(symbol, stage, data, session):
+    """Save full signal data for 30-trade dataset."""
+    try:
+        signals = load_json(SIGNALS_FILE)
+        if "signals" not in signals:
+            signals["signals"] = []
+        signals["signals"].append({
+            "ts": datetime.utcnow().isoformat(),
+            "session": session,
+            "symbol": symbol,
+            "stage": stage,
+            "price": data.get("price"),
+            "rsi_now": data.get("rsi"),
+            "rsi_2h_ago": data.get("rsi_2h_ago"),
+            "volume_ratio": data.get("vol_ratio"),
+            "buy_pressure": data.get("buy_pressure"),
+            "bid_depth": data.get("bid_depth"),
+            "ask_depth": data.get("ask_depth"),
+            "bid_ask_ratio": data.get("bid_ask_ratio"),
+            "change_1h": data.get("change_1h"),
+            "change_6h": data.get("change_6h"),
+            "range_pct": data.get("range_pct"),
+        })
+        if len(signals["signals"]) > 500:
+            signals["signals"] = signals["signals"][-500:]
+        save_json(SIGNALS_FILE, signals)
+    except Exception as e:
+        print(f"log_signal error: {e}")
+
+def log_rejection(symbol, reasons, price=0, change_24h=0):
     try:
         data = load_json(REJECT_FILE)
         key = symbol
         if key not in data:
-            data[key] = {"symbol": symbol, "count": 0}
+            data[key] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
         data[key]["count"] += 1
         data[key]["last_seen"] = datetime.utcnow().isoformat()
         data[key]["price"] = price
@@ -158,7 +207,7 @@ def compute_rsi_series(closes, period=14):
 
 def check_depth(symbol, price):
     try:
-        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
+        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
         r = requests.get(url, timeout=10)
         book = r.json()
         low, high = price * 0.98, price * 1.02
@@ -177,43 +226,53 @@ def detect_stage(symbol):
         if not isinstance(klines, list) or len(klines) < 30:
             return None, ["not_enough_klines"]
 
-        current_close = float(klines[-1][4])
-        current_open = float(klines[-1][1])
-        current_vol = float(klines[-1][5])
+        # USE LAST COMPLETED CANDLE (klines[-2]) for all checks
+        completed = klines[-2]
+        current_close = float(completed[4])
+        current_open = float(completed[1])
+        current_vol = float(completed[5])
+        current_taker = float(completed[9])
 
-        prior_vols = [float(k[5]) for k in klines[-21:-1]]
+        # Prior 21 completed candles (not including current completed)
+        prior_vols = [float(k[5]) for k in klines[-22:-2]]
         avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
         if avg_vol == 0:
             return None, ["avg_vol_zero"]
         vol_ratio = current_vol / avg_vol
 
-        highs_6h = [float(k[2]) for k in klines[-24:]]
-        lows_6h = [float(k[3]) for k in klines[-24:]]
+        # 6h range (last 24 completed candles)
+        highs_6h = [float(k[2]) for k in klines[-25:-1]]
+        lows_6h = [float(k[3]) for k in klines[-25:-1]]
+        if min(lows_6h) == 0:
+            return None, ["zero_low"]
         range_pct = ((max(highs_6h) - min(lows_6h)) / min(lows_6h)) * 100
 
+        # 6h change
         price_6h_ago = float(klines[-25][4])
         change_6h = ((current_close - price_6h_ago) / price_6h_ago) * 100
 
+        # 1h change (4 completed candles back)
         price_1h_ago = float(klines[-5][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
 
-        closes = [float(k[4]) for k in klines]
+        # RSI on completed candles only
+        closes = [float(k[4]) for k in klines[:-1]]
         rsi_series = compute_rsi_series(closes, 14)
         if not rsi_series:
             return None, ["rsi_fail"]
         rsi_now = rsi_series[-1]
         rsi_2h_ago = rsi_series[-9] if len(rsi_series) >= 9 else rsi_now
-
         rsi_declining = rsi_now < rsi_2h_ago
 
-        recent_taker = sum(float(k[9]) for k in klines[-8:])
-        recent_total = sum(float(k[5]) for k in klines[-8:])
+        # Buy pressure from last 8 completed candles
+        recent_taker = sum(float(k[9]) for k in klines[-9:-1])
+        recent_total = sum(float(k[5]) for k in klines[-9:-1])
         buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
 
         bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        # BREAKOUT CHECK
+        # BREAKOUT — 9 filters
         breakout_conditions = [
             current_close > current_open,
             vol_ratio >= 3,
@@ -240,7 +299,7 @@ def detect_stage(symbol):
                 "bid_ask_ratio": bid_ask_ratio,
             }
 
-        # COILING CHECK
+        # COILING CHECK — added ratio filter
         coiling_reasons = []
         if rsi_now < 30 or rsi_now > 55:
             coiling_reasons.append(f"RSI_{rsi_now:.1f}")
@@ -256,13 +315,15 @@ def detect_stage(symbol):
             coiling_reasons.append(f"vol_{vol_ratio:.1f}x_high")
         if buy_pressure < 0.50:
             coiling_reasons.append(f"buy_{buy_pressure*100:.1f}%")
-        greens = sum(1 for k in klines[-6:] if float(k[4]) > float(k[1]))
+        greens = sum(1 for k in klines[-7:-1] if float(k[4]) > float(k[1]))
         if greens < 3:
             coiling_reasons.append(f"greens_{greens}")
         if bid_depth < 5_000:
             coiling_reasons.append(f"bid_{bid_depth:.0f}")
         if ask_depth < 5_000:
             coiling_reasons.append(f"ask_{ask_depth:.0f}")
+        if bid_ask_ratio < 0.7:
+            coiling_reasons.append(f"ratio_{bid_ask_ratio:.2f}")
 
         if coiling_reasons:
             return None, coiling_reasons
@@ -284,7 +345,7 @@ def detect_stage(symbol):
     except Exception as e:
         return None, [f"exception_{e}"]
 
-def scan():
+def scan(session):
     print(f"Scanning {len(MONITORING_TOKENS)} monitoring tokens...")
     cooldown = load_cooldown()
     hits = []
@@ -293,10 +354,15 @@ def scan():
         futures = {executor.submit(detect_stage, s): s for s in MONITORING_TOKENS}
         for future in as_completed(futures):
             symbol = futures[future]
-            if symbol in cooldown:
-                continue
-            stage, data = future.result()
+            stage_data = future.result()
+            if isinstance(stage_data, tuple):
+                stage, data = stage_data
+            else:
+                stage, data = None, ["exception"]
             if stage:
+                # Check cooldown with stage awareness
+                if is_on_cooldown(symbol, cooldown, stage):
+                    continue
                 data["symbol"] = symbol
                 data["stage"] = stage
                 hits.append(data)
@@ -304,12 +370,8 @@ def scan():
                 if isinstance(data, list) and data:
                     top = data[0].split("_")[0]
                     rejection[top] = rejection.get(top, 0) + 1
-                    log_rejection(symbol, data, 0, 0)
+                    log_rejection(symbol, data)
     print(f"Rejection: {rejection}")
-    now = datetime.utcnow()
-    for h in hits:
-        cooldown[h["symbol"]] = now.isoformat()
-    save_json(COOLDOWN_FILE, cooldown)
     return hits
 
 def get_session_label(hour, minute):
@@ -342,7 +404,7 @@ def main():
         print("BTC dumping >3%. Skipping.")
         return
 
-    hits = scan()
+    hits = scan(session)
     print(f"Found {len(hits)} signals")
 
     for h in hits:
@@ -359,7 +421,8 @@ def main():
         else:
             header = f"🎯 MONITORING COILING — {count}X [{session}]"
 
-        record_alert(h["symbol"])
+        record_alert(h["symbol"], stage)
+        log_signal(h["symbol"], stage, h, session)
 
         msg = (
             f"{header}\n\n"
