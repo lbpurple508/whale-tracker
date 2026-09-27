@@ -203,6 +203,7 @@ def detect_stage(symbol):
             return None, ["rsi_fail"]
         rsi_now = rsi_series[-1]
         rsi_2h_ago = rsi_series[-9] if len(rsi_series) >= 9 else rsi_now
+
         rsi_declining = rsi_now < rsi_2h_ago
 
         recent_taker = sum(float(k[9]) for k in klines[-8:])
@@ -212,16 +213,17 @@ def detect_stage(symbol):
         bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        # ================= BREAKOUT CHECK (7 filters) =================
+        # BREAKOUT CHECK
         breakout_conditions = [
-            current_close > current_open,           # Green candle
-            vol_ratio >= 3,                         # Volume 3x+
-            3 <= change_1h <= 8,                    # Fresh but not extended
-            40 <= rsi_now <= 72,                    # RSI healthy
-            rsi_2h_ago < 65,                        # Not already pumped
-            buy_pressure >= 0.55,                   # Buyers dominate
-            bid_ask_ratio >= 0.7,                   # No sell wall
-            bid_depth >= 10000,                     # Decent liquidity
+            current_close > current_open,
+            vol_ratio >= 3,
+            3 <= change_1h <= 8,
+            40 <= rsi_now <= 72,
+            rsi_2h_ago < 65,
+            buy_pressure >= 0.50,
+            bid_ask_ratio >= 0.7,
+            bid_depth >= 15_000,
+            ask_depth >= 15_000,
         ]
         if all(breakout_conditions):
             return "BREAKOUT", {
@@ -238,7 +240,7 @@ def detect_stage(symbol):
                 "bid_ask_ratio": bid_ask_ratio,
             }
 
-        # ================= COILING CHECK =================
+        # COILING CHECK
         coiling_reasons = []
         if rsi_now < 30 or rsi_now > 55:
             coiling_reasons.append(f"RSI_{rsi_now:.1f}")
@@ -277,6 +279,7 @@ def detect_stage(symbol):
             "greens": greens,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
+            "bid_ask_ratio": bid_ask_ratio,
         }
     except Exception as e:
         return None, [f"exception_{e}"]
@@ -373,6 +376,7 @@ def main():
             f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
+            f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
             f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
             f"<b>Trail:</b> +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
