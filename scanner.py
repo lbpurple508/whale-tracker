@@ -250,12 +250,12 @@ def check_signal(symbol, price, session):
 
         if session == "US":
             rsi_max = 70
-            taker_min = 0.65
-            depth_min = 60_000
+            taker_min = 0.55
+            depth_min = 10_000
         else:
             rsi_max = 72
-            taker_min = 0.60
-            depth_min = 60_000
+            taker_min = 0.55
+            depth_min = 10_000
 
         last_4_vols = [float(k[5]) for k in klines[-4:]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
@@ -307,11 +307,16 @@ def check_signal(symbol, price, session):
         if taker_pct < taker_min:
             reasons.append(f"taker_{taker_pct*100:.1f}%")
 
+        # NEW: Bid/Ask ratio filter
         bid_depth, ask_depth = check_depth(symbol, price)
+        bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
+
         if bid_depth < depth_min:
             reasons.append(f"bid_{bid_depth:.0f}")
         if ask_depth < depth_min:
             reasons.append(f"ask_{ask_depth:.0f}")
+        if bid_ask_ratio < 0.7:
+            reasons.append(f"ratio_{bid_ask_ratio:.2f}")
 
         if reasons:
             return None, reasons
@@ -322,6 +327,7 @@ def check_signal(symbol, price, session):
             "taker_pct": taker_pct * 100,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
+            "bid_ask_ratio": bid_ask_ratio,
             "change_1h": change_1h,
             "change_4h": change_4h,
             "rsi": rsi,
@@ -394,7 +400,6 @@ def main():
         record_alert(h["symbol"])
         stop = h["price"] * 0.97
 
-        # ============ CLEAR HEADER AND ACTION ============
         if count == 1:
             header = f"🚨 VOLUME BREAKOUT [1/2] [{session}]"
             action = "⏸️ WAIT — Do NOT enter yet. Wait for [2/2] alert."
@@ -403,7 +408,7 @@ def main():
             action = "✅ ENTER NOW — Buy at current price."
         else:
             header = f"💥 VOLUME BREAKOUT [{count}/2+] [{session}]"
-            action = f"✅ ADD MORE — This is confirmation #{count}. Buy another $5."
+            action = f"✅ ADD MORE — Confirmation #{count}. Buy another $5."
 
         msg = (
             f"{header}\n\n"
@@ -417,6 +422,7 @@ def main():
             f"<b>Buyers:</b> {h['taker_pct']:.1f}%\n"
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
+            f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
             f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
             f"<b>Trail:</b> +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
