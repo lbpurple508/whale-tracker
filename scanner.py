@@ -250,12 +250,11 @@ def check_signal(symbol, price, session):
 
         if session == "US":
             rsi_max = 70
-            taker_min = 0.55
-            depth_min = 10_000
         else:
             rsi_max = 72
-            taker_min = 0.55
-            depth_min = 10_000
+
+        taker_min = 0.50
+        depth_min = 40_000
 
         last_4_vols = [float(k[5]) for k in klines[-4:]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
@@ -307,14 +306,13 @@ def check_signal(symbol, price, session):
         if taker_pct < taker_min:
             reasons.append(f"taker_{taker_pct*100:.1f}%")
 
-        # NEW: Bid/Ask ratio filter
         bid_depth, ask_depth = check_depth(symbol, price)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
         if bid_depth < depth_min:
-            reasons.append(f"bid_{bid_depth:.0f}")
+            reasons.append(f"bid_low_{bid_depth:.0f}")
         if ask_depth < depth_min:
-            reasons.append(f"ask_{ask_depth:.0f}")
+            reasons.append(f"ask_low_{ask_depth:.0f}")
         if bid_ask_ratio < 0.7:
             reasons.append(f"ratio_{bid_ask_ratio:.2f}")
 
