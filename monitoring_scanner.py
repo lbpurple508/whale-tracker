@@ -81,7 +81,6 @@ def load_cooldown():
     return cleaned
 
 def is_on_cooldown(symbol, cooldown, stage):
-    """BREAKOUT bypasses COILING cooldown, but respects its own BREAKOUT cooldown."""
     if symbol not in cooldown:
         return False
     existing_stage = cooldown[symbol].get("stage", "COILING")
@@ -217,6 +216,8 @@ def check_depth(symbol, price):
         url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
         r = requests.get(url, timeout=10)
         book = r.json()
+        if not isinstance(book, dict):
+            return 0, 0
         low, high = price * 0.98, price * 1.02
         bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
         ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
