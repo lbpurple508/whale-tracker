@@ -13,6 +13,8 @@ TRACKER_FILE = Path("tracker_state.json")
 
 STOP_PCT = -3.0
 PUMP_TARGET = 30.0
+MAX_SIGNAL_AGE_HOURS = 48
+MAX_PUMPED_AGE_HOURS = 72
 
 SIGNAL_SOURCES = [
     ("SPIKE", Path("spike/signals.json")),
@@ -87,6 +89,7 @@ def load_new_signals(state):
     seen = state.get("seen", {})
     signals = state.get("signals", [])
     added = 0
+    now = datetime.utcnow()
 
     for source, path in SIGNAL_SOURCES:
         data = load_json(path)
@@ -105,6 +108,14 @@ def load_new_signals(state):
 
             key = f"{source}|{ts}|{symbol}"
             if key in seen:
+                continue
+
+            entry_dt = parse_ts(ts)
+            if not entry_dt:
+                continue
+            age_hours = (now - entry_dt).total_seconds() / 3600
+            if age_hours > MAX_SIGNAL_AGE_HOURS:
+                seen[key] = True
                 continue
 
             signals.append({
@@ -183,6 +194,14 @@ def update_signals(state):
                 s["status"] = "STOPPED"
                 s["exit_pct"] = s["current_pct"]
                 s["closed_ts"] = now.isoformat()
+        elif s["status"] == "PUMPED":
+            entry_dt = parse_ts(s["entry_ts"])
+            if entry_dt:
+                age_hours = (now - entry_dt).total_seconds() / 3600
+                if age_hours > MAX_PUMPED_AGE_HOURS:
+                    s["status"] = "CLOSED"
+                    s["exit_pct"] = s["current_pct"]
+                    s["closed_ts"] = now.isoformat()
 
         s["last_update"] = now.isoformat()
         updated += 1
@@ -196,13 +215,15 @@ def build_report(state):
     active = [s for s in signals if s.get("status") == "ACTIVE"]
     pumped = [s for s in signals if s.get("status") == "PUMPED"]
     stopped = [s for s in signals if s.get("status") == "STOPPED"]
+    closed = [s for s in signals if s.get("status") == "CLOSED"]
 
     lines = ["📊 <b>SIGNAL TRACKER</b>", ""]
     lines.append(
         f"Total: <b>{total}</b> | "
         f"🟡 Active: <b>{len(active)}</b> | "
         f"🟢 Pumped: <b>{len(pumped)}</b> | "
-        f"🔴 Stopped: <b>{len(stopped)}</b>"
+        f"🔴 Stopped: <b>{len(stopped)}</b> | "
+        f"⚫ Closed: <b>{len(closed)}</b>"
     )
 
     if pumped:
