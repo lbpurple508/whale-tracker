@@ -5,9 +5,17 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: slow-grind-scanner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +29,8 @@ jobs:
           path: |
             grind_cooldown.json
             grind_rejections.json
+            grind_history.json
+            grind_signals.json
           key: grind-cooldown-${{ github.run_id }}
           restore-keys: |
             grind-cooldown-
@@ -36,7 +46,10 @@ jobs:
           path: |
             grind_cooldown.json
             grind_rejections.json
+            grind_history.json
+            grind_signals.json
           key: grind-cooldown-${{ github.run_id }}
+          if-no-files-found: ignore
       - name: Upload rejections
         uses: actions/upload-artifact@v4
         if: always()
@@ -44,5 +57,14 @@ jobs:
           name: grind-rejections
           path: grind_rejections.json
           retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
+      - name: Upload signals
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grind-signals
+          path: grind_signals.json
+          retention-days: 7
           overwrite: true
           if-no-files-found: ignore
