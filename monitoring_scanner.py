@@ -397,6 +397,9 @@ def main():
     session = get_session_label(ist.hour, ist.minute)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
 
+    if not SIGNALS_FILE.exists():
+        SIGNALS_FILE.write_text('{"signals": []}')
+
     if not btc_is_healthy():
         print("BTC dumping >3%. Skipping.")
         return
