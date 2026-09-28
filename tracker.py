@@ -24,6 +24,14 @@ SIGNAL_SOURCES = [
 ]
 
 
+def should_track(source, stage):
+    if source == "FUTURES":
+        return False
+    if source == "MONITOR" and stage != "BREAKOUT":
+        return False
+    return True
+
+
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -85,6 +93,16 @@ def get_price(symbol):
         return 0.0
 
 
+def clean_state(state):
+    signals = state.get("signals", [])
+    before = len(signals)
+    state["signals"] = [
+        s for s in signals
+        if should_track(s.get("source", ""), s.get("stage", ""))
+    ]
+    return before - len(state["signals"])
+
+
 def load_new_signals(state):
     seen = state.get("seen", {})
     signals = state.get("signals", [])
@@ -110,6 +128,11 @@ def load_new_signals(state):
             if key in seen:
                 continue
 
+            stage = s.get("stage", source)
+            if not should_track(source, stage):
+                seen[key] = True
+                continue
+
             entry_dt = parse_ts(ts)
             if not entry_dt:
                 continue
@@ -124,7 +147,7 @@ def load_new_signals(state):
                 "symbol": symbol,
                 "entry": entry,
                 "entry_ts": ts,
-                "stage": s.get("stage", source),
+                "stage": stage,
                 "peak": entry,
                 "peak_pct": 0.0,
                 "peak_ts": ts,
@@ -192,7 +215,7 @@ def update_signals(state):
                 s["status"] = "PUMPED"
             elif s["current_pct"] <= STOP_PCT:
                 s["status"] = "STOPPED"
-                s["exit_pct"] = s["current_pct"]
+                s["exit_pct"] = STOP_PCT
                 s["closed_ts"] = now.isoformat()
         elif s["status"] == "PUMPED":
             entry_dt = parse_ts(s["entry_ts"])
@@ -264,6 +287,9 @@ def main():
         state["signals"] = []
     if "seen" not in state:
         state["seen"] = {}
+
+    cleaned = clean_state(state)
+    print(f"Cleaned: {cleaned} invalid signals removed")
 
     added = load_new_signals(state)
     print(f"New signals: {added}")
