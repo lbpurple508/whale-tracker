@@ -1,5 +1,6 @@
 import os
 import json
+import html
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("cooldown.json")
 REJECT_FILE = Path("rejections.json")
 HISTORY_FILE = Path("alert_history.json")
+SIGNALS_FILE = Path("signals.json")
 COOLDOWN_MINUTES = 30
 HISTORY_HOURS = 4
 
@@ -57,10 +59,15 @@ def format_price(p):
     return f"${p:.8f}"
 
 def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram env vars missing")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"Telegram error: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -113,10 +120,14 @@ def record_alert(symbol):
     if symbol not in history:
         history[symbol] = {"events": []}
     history[symbol]["events"].append(now.isoformat())
-    history[symbol]["events"] = [
-        ts for ts in history[symbol]["events"]
-        if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600
-    ]
+    cleaned = []
+    for ts in history[symbol]["events"]:
+        try:
+            if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600:
+                cleaned.append(ts)
+        except Exception:
+            pass
+    history[symbol]["events"] = cleaned
     if len(history) > 300:
         sorted_items = sorted(
             history.items(),
@@ -125,6 +136,33 @@ def record_alert(symbol):
         )
         history = dict(sorted_items[:300])
     save_json(HISTORY_FILE, history)
+
+def log_signal(symbol, data, session):
+    try:
+        signals = load_json(SIGNALS_FILE)
+        if "signals" not in signals:
+            signals["signals"] = []
+        signals["signals"].append({
+            "ts": datetime.utcnow().isoformat(),
+            "session": session,
+            "symbol": symbol,
+            "price": data.get("price"),
+            "change_24h": data.get("change_24h"),
+            "change_1h": data.get("change_1h"),
+            "change_4h": data.get("change_4h"),
+            "rsi": data.get("rsi"),
+            "vol_ratio": data.get("vol_ratio"),
+            "accel_count": data.get("accel_count"),
+            "taker_pct": data.get("taker_pct"),
+            "bid_depth": data.get("bid_depth"),
+            "ask_depth": data.get("ask_depth"),
+            "bid_ask_ratio": data.get("bid_ask_ratio"),
+        })
+        if len(signals["signals"]) > 500:
+            signals["signals"] = signals["signals"][-500:]
+        save_json(SIGNALS_FILE, signals)
+    except Exception as e:
+        print(f"log_signal error: {e}")
 
 def log_rejection(symbol, reasons, price, change_24h):
     try:
@@ -146,13 +184,13 @@ def log_rejection(symbol, reasons, price, change_24h):
 
 def btc_is_healthy():
     try:
-        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
+        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=3"
         r = requests.get(url, timeout=10)
         data = r.json()
-        if not isinstance(data, list) or len(data) < 2:
+        if not isinstance(data, list) or len(data) < 3:
             return True
-        current_close = float(data[-1][4])
-        prev_close = float(data[-2][4])
+        current_close = float(data[-2][4])
+        prev_close = float(data[-3][4])
         if prev_close == 0:
             return True
         change = ((current_close - prev_close) / prev_close) * 100
@@ -179,8 +217,6 @@ def get_candidates():
             continue
         if symbol in MONITORING_BLACKLIST:
             rejected["monitoring"] += 1
-            continue
-        if symbol.endswith("BUSDT"):
             continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             continue
@@ -229,7 +265,7 @@ def compute_rsi(closes, period=14):
 
 def check_depth(symbol, price):
     try:
-        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
+        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
         r = requests.get(url, timeout=10)
         book = r.json()
         low, high = price * 0.98, price * 1.02
@@ -242,10 +278,10 @@ def check_depth(symbol, price):
 def check_signal(symbol, price, session):
     reasons = []
     try:
-        url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
+        url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=30"
         r = requests.get(url, timeout=10)
         klines = r.json()
-        if not isinstance(klines, list) or len(klines) < 21:
+        if not isinstance(klines, list) or len(klines) < 30:
             return None, ["not_enough_klines"]
 
         if session == "US":
@@ -256,10 +292,22 @@ def check_signal(symbol, price, session):
         taker_min = 0.50
         depth_min = 40_000
 
-        last_4_vols = [float(k[5]) for k in klines[-4:]]
+        # ALL analysis uses last COMPLETED candle (klines[-2])
+        completed = klines[-2]
+        current_open = float(completed[1])
+        current_close = float(completed[4])
+
+        prev_completed = klines[-3]
+        prev_open = float(prev_completed[1])
+        prev_close = float(prev_completed[4])
+
+        # Last 4 completed candles ending at klines[-2]
+        last_4_vols = [float(k[5]) for k in klines[-5:-1]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
-        recent_1h_vol = sum(float(k[5]) for k in klines[-4:])
-        prior_vols = [float(k[5]) for k in klines[-20:-4]]
+        recent_1h_vol = sum(last_4_vols)
+
+        # Prior 20 completed candles before those 4
+        prior_vols = [float(k[5]) for k in klines[-25:-5]]
         avg_1h_vol = sum(prior_vols) / len(prior_vols) * 4 if prior_vols else 0
         if avg_1h_vol == 0:
             return None, ["avg_vol_zero"]
@@ -268,45 +316,39 @@ def check_signal(symbol, price, session):
         if vol_ratio < 5:
             reasons.append(f"vol_{vol_ratio:.1f}x_need5x")
 
-        current_open = float(klines[-1][1])
-        current_close = float(klines[-1][4])
-        prev_open = float(klines[-2][1])
-        prev_close = float(klines[-2][4])
         if not (current_close > current_open or prev_close > prev_open):
             reasons.append("both_red")
 
-        if len(klines) >= 5:
-            price_1h_ago = float(klines[-5][4])
-            change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
-        else:
-            change_1h = 0
+        # 1h change: 4 completed candles back from completed = klines[-6]
+        price_1h_ago = float(klines[-6][4])
+        change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         if change_1h < -0.5 or change_1h > 8:
             reasons.append(f"1h_{change_1h:.1f}%")
 
-        if len(klines) >= 17:
-            price_4h_ago = float(klines[-17][4])
-            change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
-        else:
-            change_4h = 0
+        # 4h change: 16 completed candles back = klines[-18]
+        price_4h_ago = float(klines[-18][4])
+        change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         if change_4h < 0 or change_4h > 60:
             reasons.append(f"4h_{change_4h:.1f}%")
 
-        closes = [float(k[4]) for k in klines]
+        # RSI on completed candles only
+        closes = [float(k[4]) for k in klines[:-1]]
         rsi = compute_rsi(closes, 14)
         if rsi < 50:
             reasons.append(f"RSI_low_{rsi:.1f}")
         if rsi > rsi_max:
             reasons.append(f"RSI_high_{rsi:.1f}")
 
-        total_vol = float(klines[-1][5])
-        taker_buy = float(klines[-1][9])
+        # Taker buy from completed candle
+        total_vol = float(completed[5])
+        taker_buy = float(completed[9])
         if total_vol == 0:
             reasons.append("vol_zero")
         taker_pct = taker_buy / total_vol if total_vol else 0
         if taker_pct < taker_min:
             reasons.append(f"taker_{taker_pct*100:.1f}%")
 
-        bid_depth, ask_depth = check_depth(symbol, price)
+        bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
         if bid_depth < depth_min:
@@ -339,12 +381,12 @@ def scan(session):
     cooldown = load_cooldown()
     hits = []
     rejection_summary = {}
+    active_candidates = [c for c in candidates if c["symbol"] not in cooldown]
+    print(f"After cooldown filter: {len(active_candidates)}")
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(check_signal, c["symbol"], c["price"], session): c for c in candidates}
+        futures = {executor.submit(check_signal, c["symbol"], c["price"], session): c for c in active_candidates}
         for future in as_completed(futures):
             c = futures[future]
-            if c["symbol"] in cooldown:
-                continue
             result, reasons = future.result()
             if result:
                 c.update(result)
@@ -396,6 +438,7 @@ def main():
     for h in hits:
         count = get_alert_count(h["symbol"]) + 1
         record_alert(h["symbol"])
+        log_signal(h["symbol"], h, session)
         stop = h["price"] * 0.97
 
         if count == 1:
@@ -432,7 +475,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        send_telegram(f"🚨 SPIKE SCANNER CRASHED\n\nError: {str(e)[:300]}")
+        send_telegram(f"🚨 SPIKE SCANNER CRASHED\n\nError: {html.escape(str(e)[:300])}")
         raise
 
 if __name__ == "__main__":
