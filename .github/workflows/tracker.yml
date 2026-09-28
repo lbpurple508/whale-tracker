@@ -36,7 +36,6 @@ jobs:
           workflow: scanner.yml
           path: spike/
           if_no_artifact_found: ignore
-          search_artifacts: true
 
       - name: Download grind signals
         uses: dawidd6/action-download-artifact@v6
@@ -46,7 +45,6 @@ jobs:
           workflow: slow_grind_scanner.yml
           path: grind/
           if_no_artifact_found: ignore
-          search_artifacts: true
 
       - name: Download monitor signals
         uses: dawidd6/action-download-artifact@v6
@@ -56,7 +54,6 @@ jobs:
           workflow: monitoring_scanner.yml
           path: monitor/
           if_no_artifact_found: ignore
-          search_artifacts: true
 
       - name: Download futures signals
         uses: dawidd6/action-download-artifact@v6
@@ -66,7 +63,6 @@ jobs:
           workflow: futures_scanner.yml
           path: futures/
           if_no_artifact_found: ignore
-          search_artifacts: true
 
       - name: Restore tracker state
         uses: actions/cache/restore@v4
