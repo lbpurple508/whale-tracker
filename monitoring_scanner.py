@@ -1,5 +1,6 @@
 import os
 import json
+import html
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -37,10 +38,15 @@ def format_price(p):
     return f"${p:.8f}"
 
 def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram env vars missing")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"Telegram error: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -79,10 +85,8 @@ def is_on_cooldown(symbol, cooldown, stage):
     if symbol not in cooldown:
         return False
     existing_stage = cooldown[symbol].get("stage", "COILING")
-    # BREAKOUT bypasses COILING cooldown only
     if stage == "BREAKOUT" and existing_stage == "COILING":
         return False
-    # Otherwise respect cooldown
     return True
 
 def get_alert_count(symbol):
@@ -107,10 +111,14 @@ def record_alert(symbol, stage):
     if symbol not in history:
         history[symbol] = {"events": []}
     history[symbol]["events"].append(now.isoformat())
-    history[symbol]["events"] = [
-        ts for ts in history[symbol]["events"]
-        if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600
-    ]
+    cleaned = []
+    for ts in history[symbol]["events"]:
+        try:
+            if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600:
+                cleaned.append(ts)
+        except Exception:
+            pass
+    history[symbol]["events"] = cleaned
     save_json(HISTORY_FILE, history)
 
     cooldown = load_json(COOLDOWN_FILE)
@@ -118,7 +126,6 @@ def record_alert(symbol, stage):
     save_json(COOLDOWN_FILE, cooldown)
 
 def log_signal(symbol, stage, data, session):
-    """Save full signal data for 30-trade dataset."""
     try:
         signals = load_json(SIGNALS_FILE)
         if "signals" not in signals:
@@ -166,13 +173,13 @@ def log_rejection(symbol, reasons, price=0, change_24h=0):
 
 def btc_is_healthy():
     try:
-        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
+        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=3"
         r = requests.get(url, timeout=10)
         data = r.json()
-        if not isinstance(data, list) or len(data) < 2:
+        if not isinstance(data, list) or len(data) < 3:
             return True
-        current_close = float(data[-1][4])
-        prev_close = float(data[-2][4])
+        current_close = float(data[-2][4])
+        prev_close = float(data[-3][4])
         if prev_close == 0:
             return True
         change = ((current_close - prev_close) / prev_close) * 100
@@ -226,35 +233,29 @@ def detect_stage(symbol):
         if not isinstance(klines, list) or len(klines) < 30:
             return None, ["not_enough_klines"]
 
-        # USE LAST COMPLETED CANDLE (klines[-2]) for all checks
         completed = klines[-2]
         current_close = float(completed[4])
         current_open = float(completed[1])
         current_vol = float(completed[5])
 
-        # Prior 21 completed candles (not including current completed)
-        prior_vols = [float(k[5]) for k in klines[-22:-2]]
+        prior_vols = [float(k[5]) for k in klines[-23:-2]]
         avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
         if avg_vol == 0:
             return None, ["avg_vol_zero"]
         vol_ratio = current_vol / avg_vol
 
-        # 6h range (last 24 completed candles)
         highs_6h = [float(k[2]) for k in klines[-25:-1]]
         lows_6h = [float(k[3]) for k in klines[-25:-1]]
         if min(lows_6h) == 0:
             return None, ["zero_low"]
         range_pct = ((max(highs_6h) - min(lows_6h)) / min(lows_6h)) * 100
 
-        # 6h change — 24 candles back from klines[-2] = klines[-26]
         price_6h_ago = float(klines[-26][4])
         change_6h = ((current_close - price_6h_ago) / price_6h_ago) * 100
 
-        # 1h change — 4 candles back from klines[-2] = klines[-6]
         price_1h_ago = float(klines[-6][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
 
-        # RSI on completed candles only
         closes = [float(k[4]) for k in klines[:-1]]
         rsi_series = compute_rsi_series(closes, 14)
         if not rsi_series:
@@ -263,7 +264,6 @@ def detect_stage(symbol):
         rsi_2h_ago = rsi_series[-9] if len(rsi_series) >= 9 else rsi_now
         rsi_declining = rsi_now < rsi_2h_ago
 
-        # Buy pressure from last 8 completed candles
         recent_taker = sum(float(k[9]) for k in klines[-9:-1])
         recent_total = sum(float(k[5]) for k in klines[-9:-1])
         buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
@@ -271,7 +271,6 @@ def detect_stage(symbol):
         bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        # BREAKOUT — 9 filters
         breakout_conditions = [
             current_close > current_open,
             vol_ratio >= 3,
@@ -298,7 +297,6 @@ def detect_stage(symbol):
                 "bid_ask_ratio": bid_ask_ratio,
             }
 
-        # COILING CHECK — includes ratio filter
         coiling_reasons = []
         if rsi_now < 30 or rsi_now > 55:
             coiling_reasons.append(f"RSI_{rsi_now:.1f}")
@@ -454,7 +452,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        send_telegram(f"🚨 MONITORING SCANNER CRASHED\n\nError: {str(e)[:300]}")
+        send_telegram(f"🚨 MONITORING SCANNER CRASHED\n\nError: {html.escape(str(e)[:300])}")
         raise
 
 if __name__ == "__main__":
