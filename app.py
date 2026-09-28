@@ -1,4 +1,5 @@
 import os
+import html
 import requests
 from flask import Flask, request
 from datetime import datetime
@@ -9,10 +10,15 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram env vars missing")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"Telegram error: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -24,6 +30,8 @@ def home():
 def webhook():
     try:
         data = request.json
+        if not data:
+            return "No data", 400
         if isinstance(data, dict) and data.get("type") == "ADDRESS_ACTIVITY":
             event = data.get("event", {})
             activities = event.get("activity", [])
@@ -36,7 +44,7 @@ def webhook():
         return "OK", 200
     except Exception as e:
         print(f"Webhook error: {e}")
-        return f"Error: {str(e)}", 500
+        return f"Error: {html.escape(str(e))}", 500
 
 def process_alchemy_activity(act):
     from_addr = act.get("fromAddress", "Unknown")
@@ -45,53 +53,51 @@ def process_alchemy_activity(act):
     asset = act.get("asset", "Unknown")
     tx_hash = act.get("hash", "Unknown")
     category = act.get("category", "unknown")
-    raw = act.get("rawContract", {})
-    token_address = raw.get("address") if raw else None
+    raw = act.get("rawContract", {}) or {}
+    token_address = raw.get("address")
 
     lines = [
         "🐋 <b>WHALE ALERT</b>",
         "",
-        f"<b>From:</b> <code>{from_addr[:12]}...</code>",
-        f"<b>To:</b> <code>{to_addr[:12]}...</code>",
-        f"<b>Asset:</b> {asset}",
-        f"<b>Amount:</b> {value}",
+        f"<b>From:</b> <code>{html.escape(str(from_addr)[:12])}...</code>",
+        f"<b>To:</b> <code>{html.escape(str(to_addr)[:12])}...</code>",
+        f"<b>Asset:</b> {html.escape(str(asset))}",
+        f"<b>Amount:</b> {html.escape(str(value))}",
     ]
     if token_address:
-        lines.append(f"<b>Token:</b> <code>{token_address[:12]}...</code>")
-    lines.append(f"<b>Category:</b> {category}")
-    lines.append(f"<b>Tx:</b> <code>{tx_hash[:24]}...</code>")
+        lines.append(f"<b>Token:</b> <code>{html.escape(str(token_address)[:12])}...</code>")
+    lines.append(f"<b>Category:</b> {html.escape(str(category))}")
+    lines.append(f"<b>Tx:</b> <code>{html.escape(str(tx_hash)[:24])}...</code>")
 
-    message = "\n".join(lines)
-    send_telegram(message)
+    send_telegram("\n".join(lines))
 
 def process_transaction(tx):
     description = tx.get("description", "Unknown transaction")
     signature = tx.get("signature", "Unknown")
     fee_payer = tx.get("feePayer", "Unknown")
     timestamp = tx.get("timestamp", 0)
-    token_transfers = tx.get("tokenTransfers", [])
+    token_transfers = tx.get("tokenTransfers", []) or []
 
     lines = [
         "🐋 <b>WHALE ALERT</b>",
         "",
-        f"<b>Wallet:</b> <code>{fee_payer[:8]}...</code>",
-        f"<b>Action:</b> {description}",
+        f"<b>Wallet:</b> <code>{html.escape(str(fee_payer)[:8])}...</code>",
+        f"<b>Action:</b> {html.escape(str(description))}",
     ]
     for tt in token_transfers:
         mint = tt.get("mint", "Unknown")
         amount = tt.get("tokenAmount", 0)
         to_addr = tt.get("toUserAccount", "")
         direction = "BUY" if to_addr == fee_payer else "SELL"
-        lines.append(f"<b>Token:</b> {mint[:8]}...")
-        lines.append(f"<b>Amount:</b> {amount}")
+        lines.append(f"<b>Token:</b> {html.escape(str(mint)[:8])}...")
+        lines.append(f"<b>Amount:</b> {html.escape(str(amount))}")
         lines.append(f"<b>Direction:</b> {direction}")
 
-    lines.append(f"<b>Tx:</b> <code>{signature[:20]}...</code>")
+    lines.append(f"<b>Tx:</b> <code>{html.escape(str(signature)[:20])}...</code>")
     if timestamp:
         lines.append(f"<b>Time:</b> {datetime.fromtimestamp(timestamp)}")
 
-    message = "\n".join(lines)
-    send_telegram(message)
+    send_telegram("\n".join(lines))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
