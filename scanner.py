@@ -203,9 +203,14 @@ def get_candidates():
     url = f"{BASE_URL}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
     tickers = r.json()
+    if not isinstance(tickers, list):
+        print(f"Unexpected tickers response: {tickers}")
+        return []
     candidates = []
     rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0, "monitoring": 0}
     for t in tickers:
+        if not isinstance(t, dict):
+            continue
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
@@ -268,6 +273,8 @@ def check_depth(symbol, price):
         url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
         r = requests.get(url, timeout=10)
         book = r.json()
+        if not isinstance(book, dict):
+            return 0, 0
         low, high = price * 0.98, price * 1.02
         bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
         ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
@@ -292,7 +299,6 @@ def check_signal(symbol, price, session):
         taker_min = 0.50
         depth_min = 40_000
 
-        # ALL analysis uses last COMPLETED candle (klines[-2])
         completed = klines[-2]
         current_open = float(completed[1])
         current_close = float(completed[4])
@@ -301,12 +307,10 @@ def check_signal(symbol, price, session):
         prev_open = float(prev_completed[1])
         prev_close = float(prev_completed[4])
 
-        # Last 4 completed candles ending at klines[-2]
         last_4_vols = [float(k[5]) for k in klines[-5:-1]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
         recent_1h_vol = sum(last_4_vols)
 
-        # Prior 20 completed candles before those 4
         prior_vols = [float(k[5]) for k in klines[-25:-5]]
         avg_1h_vol = sum(prior_vols) / len(prior_vols) * 4 if prior_vols else 0
         if avg_1h_vol == 0:
@@ -319,19 +323,16 @@ def check_signal(symbol, price, session):
         if not (current_close > current_open or prev_close > prev_open):
             reasons.append("both_red")
 
-        # 1h change: 4 completed candles back from completed = klines[-6]
         price_1h_ago = float(klines[-6][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         if change_1h < -0.5 or change_1h > 8:
             reasons.append(f"1h_{change_1h:.1f}%")
 
-        # 4h change: 16 completed candles back = klines[-18]
         price_4h_ago = float(klines[-18][4])
         change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         if change_4h < 0 or change_4h > 60:
             reasons.append(f"4h_{change_4h:.1f}%")
 
-        # RSI on completed candles only
         closes = [float(k[4]) for k in klines[:-1]]
         rsi = compute_rsi(closes, 14)
         if rsi < 50:
@@ -339,7 +340,6 @@ def check_signal(symbol, price, session):
         if rsi > rsi_max:
             reasons.append(f"RSI_high_{rsi:.1f}")
 
-        # Taker buy from completed candle
         total_vol = float(completed[5])
         taker_buy = float(completed[9])
         if total_vol == 0:
