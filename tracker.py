@@ -139,11 +139,11 @@ def load_new_signals(state):
 
 def update_signals(state):
     signals = state.get("signals", [])
-    active = [s for s in signals if s.get("status") == "ACTIVE"]
-    if not active:
+    trackable = [s for s in signals if s.get("status") in ("ACTIVE", "PUMPED")]
+    if not trackable:
         return 0
 
-    symbols = list({s["symbol"] for s in active})
+    symbols = list({s["symbol"] for s in trackable})
     prices = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(get_price, sym): sym for sym in symbols}
@@ -152,7 +152,7 @@ def update_signals(state):
 
     now = datetime.utcnow()
     updated = 0
-    for s in active:
+    for s in trackable:
         p = prices.get(s["symbol"], 0)
         if p <= 0:
             continue
@@ -176,12 +176,13 @@ def update_signals(state):
             if t:
                 s["time_to_dip_min"] = int((now - t).total_seconds() / 60)
 
-        if s["current_pct"] <= STOP_PCT:
-            s["status"] = "STOPPED"
-            s["exit_pct"] = s["current_pct"]
-            s["closed_ts"] = now.isoformat()
-        elif s["peak_pct"] >= PUMP_TARGET:
-            s["status"] = "PUMPED"
+        if s["status"] == "ACTIVE":
+            if s["peak_pct"] >= PUMP_TARGET:
+                s["status"] = "PUMPED"
+            elif s["current_pct"] <= STOP_PCT:
+                s["status"] = "STOPPED"
+                s["exit_pct"] = s["current_pct"]
+                s["closed_ts"] = now.isoformat()
 
         s["last_update"] = now.isoformat()
         updated += 1
