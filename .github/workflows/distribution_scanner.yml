@@ -1,0 +1,50 @@
+name: Distribution Scanner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: distribution-scanner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Restore tracker state
+        uses: actions/cache/restore@v4
+        with:
+          path: tracker_state.json
+          key: tracker-state-${{ github.run_id }}
+          restore-keys: |
+            tracker-state-
+      - name: Restore distribution cooldown
+        uses: actions/cache/restore@v4
+        with:
+          path: dist_cooldown.json
+          key: dist-cooldown-${{ github.run_id }}
+          restore-keys: |
+            dist-cooldown-
+      - name: Run distribution scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python distribution_scanner.py
+      - name: Save distribution cooldown
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: dist_cooldown.json
+          key: dist-cooldown-${{ github.run_id }}
