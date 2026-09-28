@@ -12,6 +12,7 @@ BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("grind_cooldown.json")
 REJECT_FILE = Path("grind_rejections.json")
 HISTORY_FILE = Path("grind_history.json")
+SIGNALS_FILE = Path("grind_signals.json")
 COOLDOWN_MINUTES = 60
 HISTORY_HOURS = 4
 
@@ -113,11 +114,43 @@ def record_alert(symbol):
     if symbol not in history:
         history[symbol] = {"events": []}
     history[symbol]["events"].append(now.isoformat())
-    history[symbol]["events"] = [
-        ts for ts in history[symbol]["events"]
-        if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600
-    ]
+    cleaned = []
+    for ts in history[symbol]["events"]:
+        try:
+            if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600:
+                cleaned.append(ts)
+        except Exception:
+            pass
+    history[symbol]["events"] = cleaned
     save_json(HISTORY_FILE, history)
+
+def log_signal(symbol, data, session):
+    try:
+        signals = load_json(SIGNALS_FILE)
+        if "signals" not in signals:
+            signals["signals"] = []
+        signals["signals"].append({
+            "ts": datetime.utcnow().isoformat(),
+            "session": session,
+            "symbol": symbol,
+            "price": data.get("price"),
+            "change_24h": data.get("change_24h"),
+            "change_1h": data.get("change_1h"),
+            "change_4h": data.get("change_4h"),
+            "rsi": data.get("rsi"),
+            "vol_ratio_1h": data.get("vol_ratio_1h"),
+            "accel_count": data.get("accel_count"),
+            "greens": data.get("greens"),
+            "taker_pct": data.get("taker_pct"),
+            "bid_depth": data.get("bid_depth"),
+            "ask_depth": data.get("ask_depth"),
+            "bid_ask_ratio": data.get("bid_ask_ratio"),
+        })
+        if len(signals["signals"]) > 500:
+            signals["signals"] = signals["signals"][-500:]
+        save_json(SIGNALS_FILE, signals)
+    except Exception as e:
+        print(f"log_signal error: {e}")
 
 def log_rejection(symbol, reasons, price, change_24h):
     try:
@@ -171,8 +204,6 @@ def get_candidates():
         if symbol in MONITORING_BLACKLIST:
             rejected["monitoring"] += 1
             continue
-        if symbol.endswith("BUSDT"):
-            continue
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             continue
         try:
@@ -223,7 +254,7 @@ def compute_rsi(closes, period=14):
 
 def check_depth(symbol, price):
     try:
-        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
+        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
         r = requests.get(url, timeout=10)
         book = r.json()
         low, high = price * 0.98, price * 1.02
@@ -242,11 +273,17 @@ def check_acceleration(symbol, price):
         if not isinstance(klines, list) or len(klines) < 21:
             return None, ["not_enough_klines"]
 
-        last_4_vols = [float(k[5]) for k in klines[-4:]]
+        # Use last completed candle (klines[-2]) for all checks
+        completed = klines[-2]
+        current_close = float(completed[4])
+
+        # Last 4 completed candles for volume and acceleration
+        last_4_vols = [float(k[5]) for k in klines[-5:-1]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
 
-        recent_1h_vol = sum(float(k[5]) for k in klines[-4:])
-        prior_vols = [float(k[5]) for k in klines[-20:-4]]
+        recent_1h_vol = sum(last_4_vols)
+        # Prior 20 completed candles
+        prior_vols = [float(k[5]) for k in klines[-25:-5]]
         avg_1h_vol = sum(prior_vols) / len(prior_vols) * 4 if prior_vols else 0
         if avg_1h_vol == 0:
             return None, ["avg_vol_zero"]
@@ -256,37 +293,41 @@ def check_acceleration(symbol, price):
         if not has_acceleration:
             reasons.append(f"no_accel_{accel_count}_vol{vol_ratio_1h:.1f}x")
 
-        current_close = float(klines[-1][4])
-        price_1h_ago = float(klines[-5][4])
+        # 1h change: 4 candles back from completed (klines[-6])
+        price_1h_ago = float(klines[-6][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         if change_1h < -1 or change_1h > 8:
             reasons.append(f"1h_{change_1h:.1f}%")
 
-        price_4h_ago = float(klines[-17][4])
+        # 4h change: 16 candles back from completed (klines[-18])
+        price_4h_ago = float(klines[-18][4])
         change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         if change_4h < 0 or change_4h > 40:
             reasons.append(f"4h_{change_4h:.1f}%")
 
-        greens = sum(1 for k in klines[-4:] if float(k[4]) > float(k[1]))
+        # Greens: last 4 completed candles
+        greens = sum(1 for k in klines[-6:-2] if float(k[4]) > float(k[1]))
         if greens < 2:
             reasons.append(f"greens_{greens}")
 
-        closes = [float(k[4]) for k in klines]
+        # RSI on completed candles only
+        closes = [float(k[4]) for k in klines[:-1]]
         rsi = compute_rsi(closes, 14)
         if rsi < 50:
             reasons.append(f"RSI_low_{rsi:.1f}")
         if rsi > 72:
             reasons.append(f"RSI_high_{rsi:.1f}")
 
-        total_vol = float(klines[-1][5])
-        taker_buy = float(klines[-1][9])
+        # Taker buy from completed candle
+        total_vol = float(completed[5])
+        taker_buy = float(completed[9])
         if total_vol == 0:
             reasons.append("vol_zero")
         taker_pct = taker_buy / total_vol if total_vol else 0
         if taker_pct < 0.50:
             reasons.append(f"taker_{taker_pct*100:.1f}%")
 
-        bid_depth, ask_depth = check_depth(symbol, price)
+        bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
         if bid_depth < 40_000:
@@ -377,6 +418,7 @@ def main():
     for h in hits:
         count = get_alert_count(h["symbol"]) + 1
         record_alert(h["symbol"])
+        log_signal(h["symbol"], h, session)
         stop = h["price"] * 0.97
 
         if count == 1:
