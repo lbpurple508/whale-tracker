@@ -193,6 +193,9 @@ def load_cooldown():
 
 
 def main():
+    if not COOLDOWN_FILE.exists():
+        COOLDOWN_FILE.write_text("{}")
+
     tracker = load_json(TRACKER_FILE)
     signals = tracker.get("signals", [])
     if not isinstance(signals, list):
