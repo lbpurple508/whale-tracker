@@ -1,13 +1,21 @@
-name: Volume Scanner
+name: Spike Scanner
 
 on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: spike-scanner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,9 +29,11 @@ jobs:
           path: |
             cooldown.json
             rejections.json
-          key: cooldown-${{ github.run_id }}
+            alert_history.json
+            signals.json
+          key: spike-cooldown-${{ github.run_id }}
           restore-keys: |
-            cooldown-
+            spike-cooldown-
       - name: Run scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -36,7 +46,9 @@ jobs:
           path: |
             cooldown.json
             rejections.json
-          key: cooldown-${{ github.run_id }}
+            alert_history.json
+            signals.json
+          key: spike-cooldown-${{ github.run_id }}
       - name: Upload rejections
         uses: actions/upload-artifact@v4
         if: always()
@@ -44,5 +56,14 @@ jobs:
           name: spike-rejections
           path: rejections.json
           retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
+      - name: Upload signals
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spike-signals
+          path: signals.json
+          retention-days: 7
           overwrite: true
           if-no-files-found: ignore
