@@ -5,9 +5,17 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: monitoring-scanner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,5 +56,14 @@ jobs:
           name: monitoring-rejections
           path: monitor_rejections.json
           retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
+      - name: Upload signals
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: monitoring-signals
+          path: monitor_signals.json
+          retention-days: 7
           overwrite: true
           if-no-files-found: ignore
