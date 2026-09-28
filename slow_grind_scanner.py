@@ -183,8 +183,8 @@ def btc_is_healthy():
         data = r.json()
         if not isinstance(data, list) or len(data) < 3:
             return True
-        current_close = float(data[-2][4]) # last completed 1h candle
-        prev_close = float(data[-3][4])    # 1h before that
+        current_close = float(data[-2][4])
+        prev_close = float(data[-3][4])
         if prev_close == 0:
             return True
         change = ((current_close - prev_close) / prev_close) * 100
@@ -197,9 +197,14 @@ def get_candidates():
     url = f"{BASE_URL}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
     tickers = r.json()
+    if not isinstance(tickers, list):
+        print(f"Unexpected tickers response: {tickers}")
+        return []
     candidates = []
     rejected = {"vol_low": 0, "change_low": 0, "change_high": 0, "price_high": 0, "monitoring": 0}
     for t in tickers:
+        if not isinstance(t, dict):
+            continue
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
@@ -210,7 +215,6 @@ def get_candidates():
         if symbol in MONITORING_BLACKLIST:
             rejected["monitoring"] += 1
             continue
-        # Fix JUPUSDT bug: exclude leveraged tokens but allow JUPUSDT
         if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")) and symbol != "JUPUSDT":
             continue
         try:
@@ -264,6 +268,8 @@ def check_depth(symbol, price):
         url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
         r = requests.get(url, timeout=10)
         book = r.json()
+        if not isinstance(book, dict):
+            return 0, 0
         low, high = price * 0.98, price * 1.02
         bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
         ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
@@ -277,19 +283,16 @@ def check_acceleration(symbol, price):
         url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
         r = requests.get(url, timeout=10)
         klines = r.json()
-        if not isinstance(klines, list) or len(klines) < 21:
+        if not isinstance(klines, list) or len(klines) < 25:
             return None, ["not_enough_klines"]
 
-        # Use last completed candle (klines[-2]) for all checks
         completed = klines[-2]
         current_close = float(completed[4])
 
-        # Last 4 completed candles for volume and acceleration
         last_4_vols = [float(k[5]) for k in klines[-5:-1]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
 
         recent_1h_vol = sum(last_4_vols)
-        # Prior 20 completed candles
         prior_vols = [float(k[5]) for k in klines[-25:-5]]
         avg_1h_vol = sum(prior_vols) / len(prior_vols) * 4 if prior_vols else 0
         if avg_1h_vol == 0:
@@ -300,24 +303,20 @@ def check_acceleration(symbol, price):
         if not has_acceleration:
             reasons.append(f"no_accel_{accel_count}_vol{vol_ratio_1h:.1f}x")
 
-        # 1h change: 4 candles back from completed (klines[-6])
         price_1h_ago = float(klines[-6][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
         if change_1h < -1 or change_1h > 8:
             reasons.append(f"1h_{change_1h:.1f}%")
 
-        # 4h change: 16 candles back from completed (klines[-18])
         price_4h_ago = float(klines[-18][4])
         change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
         if change_4h < 0 or change_4h > 40:
             reasons.append(f"4h_{change_4h:.1f}%")
 
-        # Greens: last 4 completed candles (fixed to match last_4_vols)
         greens = sum(1 for k in klines[-5:-1] if float(k[4]) > float(k[1]))
         if greens < 2:
             reasons.append(f"greens_{greens}")
 
-        # RSI on completed candles only
         closes = [float(k[4]) for k in klines[:-1]]
         rsi = compute_rsi(closes, 14)
         if rsi < 50:
@@ -325,7 +324,6 @@ def check_acceleration(symbol, price):
         if rsi > 72:
             reasons.append(f"RSI_high_{rsi:.1f}")
 
-        # Taker buy from completed candle
         total_vol = float(completed[5])
         taker_buy = float(completed[9])
         if total_vol == 0:
