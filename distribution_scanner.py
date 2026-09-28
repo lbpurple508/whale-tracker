@@ -204,7 +204,6 @@ def main():
         print("No active positions to monitor")
         return
 
-    # dedupe by symbol, keep latest entry
     seen = {}
     for s in trackable:
         sym = s.get("symbol")
@@ -239,6 +238,7 @@ def main():
 
     if not to_alert:
         print(f"No distribution signals (checked {len(results)})")
+        save_json(COOLDOWN_FILE, cooldown)
         return
 
     for r in to_alert:
