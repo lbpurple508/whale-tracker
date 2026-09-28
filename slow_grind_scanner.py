@@ -1,5 +1,6 @@
 import os
 import json
+import html
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -58,10 +59,15 @@ def format_price(p):
     return f"${p:.8f}"
 
 def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram env vars missing")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"Telegram error: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -172,13 +178,13 @@ def log_rejection(symbol, reasons, price, change_24h):
 
 def btc_is_healthy():
     try:
-        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
+        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=3"
         r = requests.get(url, timeout=10)
         data = r.json()
-        if not isinstance(data, list) or len(data) < 2:
+        if not isinstance(data, list) or len(data) < 3:
             return True
-        current_close = float(data[-1][4])
-        prev_close = float(data[-2][4])
+        current_close = float(data[-2][4]) # last completed 1h candle
+        prev_close = float(data[-3][4])    # 1h before that
         if prev_close == 0:
             return True
         change = ((current_close - prev_close) / prev_close) * 100
@@ -204,7 +210,8 @@ def get_candidates():
         if symbol in MONITORING_BLACKLIST:
             rejected["monitoring"] += 1
             continue
-        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+        # Fix JUPUSDT bug: exclude leveraged tokens but allow JUPUSDT
+        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")) and symbol != "JUPUSDT":
             continue
         try:
             quote_vol = float(t["quoteVolume"])
@@ -305,8 +312,8 @@ def check_acceleration(symbol, price):
         if change_4h < 0 or change_4h > 40:
             reasons.append(f"4h_{change_4h:.1f}%")
 
-        # Greens: last 4 completed candles
-        greens = sum(1 for k in klines[-6:-2] if float(k[4]) > float(k[1]))
+        # Greens: last 4 completed candles (fixed to match last_4_vols)
+        greens = sum(1 for k in klines[-5:-1] if float(k[4]) > float(k[1]))
         if greens < 2:
             reasons.append(f"greens_{greens}")
 
@@ -457,7 +464,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        send_telegram(f"🚨 GRIND SCANNER CRASHED\n\nError: {str(e)[:300]}")
+        send_telegram(f"🚨 GRIND SCANNER CRASHED\n\nError: {html.escape(str(e)[:300])}")
         raise
 
 if __name__ == "__main__":
