@@ -1,5 +1,6 @@
 import os
 import json
+import html
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ SPOT_API = "https://data-api.binance.vision"
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 COOLDOWN_FILE = Path("futures_cooldown.json")
 REJECT_FILE = Path("futures_rejections.json")
+SIGNALS_FILE = Path("futures_signals.json")
 COOLDOWN_MINUTES = 60
 
 MAJORS = {
@@ -38,8 +40,6 @@ BLACKLIST = {
 
 _SPOT_SYMBOLS = None
 
-# ================= HELPERS =================
-
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -50,10 +50,15 @@ def format_price(p):
     return f"${p:.8f}"
 
 def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram env vars missing")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"Telegram error: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -84,6 +89,28 @@ def load_cooldown():
             pass
     return cleaned
 
+def log_signal(symbol, data, session):
+    try:
+        signals = load_json(SIGNALS_FILE)
+        if "signals" not in signals:
+            signals["signals"] = []
+        signals["signals"].append({
+            "ts": datetime.utcnow().isoformat(),
+            "session": session,
+            "symbol": symbol,
+            "price": data.get("price"),
+            "change_24h": data.get("change_24h"),
+            "spot_1h": data.get("spot_1h"),
+            "funding": data.get("funding"),
+            "oi_value": data.get("oi_value"),
+            "quote_vol": data.get("quote_vol"),
+        })
+        if len(signals["signals"]) > 500:
+            signals["signals"] = signals["signals"][-500:]
+        save_json(SIGNALS_FILE, signals)
+    except Exception as e:
+        print(f"log_signal error: {e}")
+
 def log_rejection(symbol, reasons, price, change_24h):
     try:
         data = load_json(REJECT_FILE)
@@ -104,13 +131,13 @@ def log_rejection(symbol, reasons, price, change_24h):
 
 def btc_is_healthy():
     try:
-        url = f"{SPOT_API}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"
+        url = f"{SPOT_API}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=3"
         r = requests.get(url, timeout=10)
         data = r.json()
-        if not isinstance(data, list) or len(data) < 2:
+        if not isinstance(data, list) or len(data) < 3:
             return True
-        current_close = float(data[-1][4])
-        prev_close = float(data[-2][4])
+        current_close = float(data[-2][4])
+        prev_close = float(data[-3][4])
         if prev_close == 0:
             return True
         change = ((current_close - prev_close) / prev_close) * 100
@@ -121,13 +148,13 @@ def btc_is_healthy():
 
 def get_spot_1h_change(symbol):
     try:
-        url = f"{SPOT_API}/api/v3/klines?symbol={symbol}&interval=1h&limit=2"
+        url = f"{SPOT_API}/api/v3/klines?symbol={symbol}&interval=1h&limit=3"
         r = requests.get(url, timeout=10)
         data = r.json()
-        if not isinstance(data, list) or len(data) < 2:
+        if not isinstance(data, list) or len(data) < 3:
             return 0
-        current_close = float(data[-1][4])
-        prev_close = float(data[-2][4])
+        current_close = float(data[-2][4])
+        prev_close = float(data[-3][4])
         if prev_close == 0:
             return 0
         return ((current_close - prev_close) / prev_close) * 100
@@ -154,13 +181,7 @@ def get_spot_symbols():
         _SPOT_SYMBOLS = set()
         return _SPOT_SYMBOLS
 
-# ================= COINGECKO DERIVATIVES =================
-
 def get_derivatives_data():
-    """
-    One API call to CoinGecko. Returns all Binance Futures perpetuals
-    with funding rate, open interest, price, volume.
-    """
     url = f"{COINGECKO_API}/derivatives?include_tickers=unexpired"
     try:
         r = requests.get(url, timeout=20, headers={"Accept": "application/json"})
@@ -171,7 +192,6 @@ def get_derivatives_data():
         if not isinstance(data, list):
             print(f"CoinGecko unexpected type: {type(data)}")
             return []
-        # Filter to Binance Futures only
         binance_data = [
             d for d in data
             if d.get("market") == "Binance (Futures)"
@@ -182,8 +202,6 @@ def get_derivatives_data():
     except Exception as e:
         print(f"CoinGecko error: {e}")
         return []
-
-# ================= CANDIDATES =================
 
 def get_candidates_from_spot():
     url = f"{SPOT_API}/api/v3/ticker/24hr"
@@ -204,7 +222,7 @@ def get_candidates_from_spot():
         if symbol in BLACKLIST:
             rejected["blacklist"] += 1
             continue
-        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSDT")):
+        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             continue
         try:
             quote_vol = float(t.get("quoteVolume", 0))
@@ -230,19 +248,10 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
-# ================= SIGNAL CHECK =================
-
 def check_pre_pump(candidate, derivatives_map):
-    """
-    Check candidate against CoinGecko derivatives data.
-    Filters: OI > $10M, funding < 0, valid price.
-    """
     symbol = candidate["symbol"]
-    # CoinGecko uses format "BTCUSDT" or "BTC"
-    # Try both symbol formats
     deriv = derivatives_map.get(symbol)
     if not deriv:
-        # Try without USDT suffix
         base = symbol.replace("USDT", "")
         deriv = derivatives_map.get(base)
         if not deriv:
@@ -254,15 +263,11 @@ def check_pre_pump(candidate, derivatives_map):
     except (ValueError, TypeError):
         return None, ["parse_error"]
 
-    # Funding must be negative (shorts trapped)
     if funding >= 0:
         return None, ["funding_pos"]
-
-    # OI must be meaningful
     if oi_usd < 5_000_000:
         return None, ["oi_too_small"]
 
-    # Spot 1h check
     spot_1h = get_spot_1h_change(symbol)
     if spot_1h > 10:
         return None, ["already_moved"]
@@ -296,8 +301,6 @@ def get_session_label(hour, minute):
         return "US"
     return "Dead-Zone"
 
-# ================= MAIN =================
-
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
@@ -313,13 +316,11 @@ def main():
         print("No CoinGecko data. Exiting.")
         return
 
-    # Build lookup: symbol -> derivative info
     deriv_map = {}
     for d in derivatives:
         sym = d.get("symbol", "").upper()
         if sym:
             deriv_map[sym] = d
-            # Also strip "USDT" suffix
             if sym.endswith("USDT"):
                 deriv_map[sym.replace("USDT", "")] = d
 
@@ -336,14 +337,14 @@ def main():
     cooldown = load_cooldown()
     print(f"Cooldown: {list(cooldown.keys())}")
 
+    active_candidates = [c for c in candidates if c["symbol"] not in cooldown]
+
     hits = []
     rejection = {}
     with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(check_pre_pump, c, deriv_map): c for c in candidates}
+        futures = {executor.submit(check_pre_pump, c, deriv_map): c for c in active_candidates}
         for future in as_completed(futures):
             c = futures[future]
-            if c["symbol"] in cooldown:
-                continue
             result, reasons = future.result()
             if result:
                 c.update(result)
@@ -360,6 +361,7 @@ def main():
     now = datetime.utcnow()
     for h in hits:
         cooldown[h["symbol"]] = now.isoformat()
+        log_signal(h["symbol"], h, session)
         stop = h["price"] * 0.97
         msg = (
             f"🔮 <b>PRE-PUMP DETECTED</b> [{session}]\n\n"
@@ -385,8 +387,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        err = str(e)[:300]
-        send_telegram(f"🚨 <b>FUTURES SCANNER CRASHED</b>\n\n<b>Error:</b> {err}")
+        send_telegram(f"🚨 <b>FUTURES SCANNER CRASHED</b>\n\n<b>Error:</b> {html.escape(str(e)[:300])}")
         raise
 
 if __name__ == "__main__":
