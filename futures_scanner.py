@@ -169,8 +169,14 @@ def get_spot_symbols():
         url = f"{SPOT_API}/api/v3/exchangeInfo"
         r = requests.get(url, timeout=20)
         data = r.json()
+        if not isinstance(data, dict):
+            print(f"Unexpected exchangeInfo response: {type(data)}")
+            _SPOT_SYMBOLS = set()
+            return _SPOT_SYMBOLS
         symbols = set()
         for s in data.get("symbols", []):
+            if not isinstance(s, dict):
+                continue
             if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
                 symbols.add(s["symbol"])
         _SPOT_SYMBOLS = symbols
@@ -194,7 +200,8 @@ def get_derivatives_data():
             return []
         binance_data = [
             d for d in data
-            if d.get("market") == "Binance (Futures)"
+            if isinstance(d, dict)
+            and d.get("market") == "Binance (Futures)"
             and d.get("contract_type") == "perpetual"
         ]
         print(f"CoinGecko: {len(binance_data)} Binance perps")
@@ -207,10 +214,15 @@ def get_candidates_from_spot():
     url = f"{SPOT_API}/api/v3/ticker/24hr"
     r = requests.get(url, timeout=20)
     tickers = r.json()
+    if not isinstance(tickers, list):
+        print(f"Unexpected tickers response: {tickers}")
+        return []
     spot_symbols = get_spot_symbols()
     candidates = []
     rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0}
     for t in tickers:
+        if not isinstance(t, dict):
+            continue
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
@@ -318,6 +330,8 @@ def main():
 
     deriv_map = {}
     for d in derivatives:
+        if not isinstance(d, dict):
+            continue
         sym = d.get("symbol", "").upper()
         if sym:
             deriv_map[sym] = d
