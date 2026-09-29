@@ -261,6 +261,30 @@ def update_signals(state):
     return updated
 
 
+def build_source_stats(signals):
+    sources = ["SPIKE", "GRIND", "MONITOR", "TREND"]
+    stats = {}
+    for src in sources:
+        items = [s for s in signals if s.get("source") == src]
+        total = len(items)
+        wins = len([s for s in items if s.get("status") in ("PUMPED", "CLOSED") and s.get("peak_pct", 0) >= PUMP_TARGET])
+        losses = len([s for s in items if s.get("status") == "STOPPED"])
+        active = len([s for s in items if s.get("status") == "ACTIVE"])
+        closed = wins + losses
+        win_rate = (wins / closed * 100) if closed > 0 else 0
+        loss_rate = (losses / closed * 100) if closed > 0 else 0
+        stats[src] = {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "active": active,
+            "closed": closed,
+            "win_rate": win_rate,
+            "loss_rate": loss_rate,
+        }
+    return stats
+
+
 def build_report(state):
     signals = state.get("signals", [])
     if not isinstance(signals, list):
@@ -279,6 +303,25 @@ def build_report(state):
         f"🔴 Stopped: <b>{len(stopped)}</b> | "
         f"⚫ Closed: <b>{len(closed)}</b>"
     )
+
+    stats = build_source_stats(signals)
+    lines.append("")
+    lines.append("📈 <b>BY SOURCE</b>")
+    for src in ["SPIKE", "GRIND", "MONITOR", "TREND"]:
+        st = stats[src]
+        if st["total"] == 0:
+            continue
+        if st["closed"] > 0:
+            wr = f"{st['win_rate']:.0f}%"
+            lr = f"{st['loss_rate']:.0f}%"
+        else:
+            wr = "—"
+            lr = "—"
+        lines.append(
+            f"• <b>{src}</b>: {st['total']} total | "
+            f"✅ {st['wins']} | ❌ {st['losses']} | 🟡 {st['active']}"
+        )
+        lines.append(f"   WR: {wr} | LR: {lr}")
 
     if pumped:
         lines.append("")
