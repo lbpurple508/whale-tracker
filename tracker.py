@@ -23,13 +23,15 @@ SIGNAL_SOURCES = [
     ("TREND", Path("trend/trend_signals.json")),
 ]
 
+VALID_SOURCES = ("MOMENTUM", "MONITOR", "TREND")
+
 
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def should_track(source, stage):
-    if source == "FUTURES":
+    if source not in VALID_SOURCES:
         return False
     if source == "MONITOR" and stage != "BREAKOUT":
         return False
