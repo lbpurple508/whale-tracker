@@ -10,11 +10,11 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://data-api.binance.vision"
-COOLDOWN_FILE = Path("grind_cooldown.json")
-REJECT_FILE = Path("grind_rejections.json")
-HISTORY_FILE = Path("grind_history.json")
-SIGNALS_FILE = Path("grind_signals.json")
-COOLDOWN_MINUTES = 60
+COOLDOWN_FILE = Path("cooldown.json")
+REJECT_FILE = Path("rejections.json")
+HISTORY_FILE = Path("alert_history.json")
+SIGNALS_FILE = Path("signals.json")
+COOLDOWN_MINUTES = 30
 HISTORY_HOURS = 4
 
 MAJORS = {
@@ -103,7 +103,12 @@ def get_alert_count(symbol):
     now = datetime.utcnow()
     if symbol not in history:
         return 0
-    events = history[symbol].get("events", [])
+    entry = history[symbol]
+    if not isinstance(entry, dict):
+        return 0
+    events = entry.get("events", [])
+    if not isinstance(events, list):
+        return 0
     count = 0
     for ts_str in events:
         try:
@@ -117,8 +122,10 @@ def get_alert_count(symbol):
 def record_alert(symbol):
     history = load_json(HISTORY_FILE)
     now = datetime.utcnow()
-    if symbol not in history:
+    if symbol not in history or not isinstance(history[symbol], dict):
         history[symbol] = {"events": []}
+    if "events" not in history[symbol] or not isinstance(history[symbol]["events"], list):
+        history[symbol]["events"] = []
     history[symbol]["events"].append(now.isoformat())
     cleaned = []
     for ts in history[symbol]["events"]:
@@ -128,6 +135,13 @@ def record_alert(symbol):
         except Exception:
             pass
     history[symbol]["events"] = cleaned
+    if len(history) > 300:
+        sorted_items = sorted(
+            history.items(),
+            key=lambda x: x[1]["events"][-1] if isinstance(x[1], dict) and x[1].get("events") else "",
+            reverse=True
+        )
+        history = dict(sorted_items[:300])
     save_json(HISTORY_FILE, history)
 
 def log_signal(symbol, data, session):
@@ -144,9 +158,8 @@ def log_signal(symbol, data, session):
             "change_1h": data.get("change_1h"),
             "change_4h": data.get("change_4h"),
             "rsi": data.get("rsi"),
-            "vol_ratio_1h": data.get("vol_ratio_1h"),
+            "vol_ratio": data.get("vol_ratio"),
             "accel_count": data.get("accel_count"),
-            "greens": data.get("greens"),
             "taker_pct": data.get("taker_pct"),
             "bid_depth": data.get("bid_depth"),
             "ask_depth": data.get("ask_depth"),
@@ -201,7 +214,7 @@ def get_candidates():
         print(f"Unexpected tickers response: {tickers}")
         return []
     candidates = []
-    rejected = {"vol_low": 0, "change_low": 0, "change_high": 0, "price_high": 0, "monitoring": 0}
+    rejected = {"vol_low": 0, "change_range": 0, "price_high": 0, "major": 0, "blacklist": 0, "monitoring": 0}
     for t in tickers:
         if not isinstance(t, dict):
             continue
@@ -209,28 +222,27 @@ def get_candidates():
         if not symbol.endswith("USDT"):
             continue
         if symbol in MAJORS:
+            rejected["major"] += 1
             continue
         if symbol in BLACKLIST:
+            rejected["blacklist"] += 1
             continue
         if symbol in MONITORING_BLACKLIST:
             rejected["monitoring"] += 1
             continue
-        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")) and symbol != "JUPUSDT":
+        if symbol.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             continue
         try:
             quote_vol = float(t["quoteVolume"])
             change = float(t["priceChangePercent"])
             price = float(t["lastPrice"])
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
             continue
-        if quote_vol < 3_000_000:
+        if quote_vol < 5_000_000:
             rejected["vol_low"] += 1
             continue
-        if change < 2:
-            rejected["change_low"] += 1
-            continue
-        if change > 200:
-            rejected["change_high"] += 1
+        if change < 2 or change > 200:
+            rejected["change_range"] += 1
             continue
         if price > 1.00:
             rejected["price_high"] += 1
@@ -258,6 +270,8 @@ def compute_rsi(closes, period=14):
             losses.append(abs(diff))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0 and avg_gain == 0:
+        return 50
     if avg_loss == 0:
         return 100
     rs = avg_gain / avg_loss
@@ -277,51 +291,62 @@ def check_depth(symbol, price):
     except Exception:
         return 0, 0
 
-def check_acceleration(symbol, price):
+def check_signal(symbol, price, session):
     reasons = []
     try:
-        url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=25"
+        url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=30"
         r = requests.get(url, timeout=10)
         klines = r.json()
-        if not isinstance(klines, list) or len(klines) < 25:
+        if not isinstance(klines, list) or len(klines) < 30:
             return None, ["not_enough_klines"]
 
+        if session == "US":
+            rsi_max = 70
+        else:
+            rsi_max = 72
+
+        taker_min = 0.50
+        depth_min = 40_000
+
         completed = klines[-2]
+        current_open = float(completed[1])
         current_close = float(completed[4])
+
+        prev_completed = klines[-3]
+        prev_open = float(prev_completed[1])
+        prev_close = float(prev_completed[4])
 
         last_4_vols = [float(k[5]) for k in klines[-5:-1]]
         accel_count = sum(1 for i in range(1, 4) if last_4_vols[i] > last_4_vols[i-1])
-
         recent_1h_vol = sum(last_4_vols)
+
         prior_vols = [float(k[5]) for k in klines[-25:-5]]
         avg_1h_vol = sum(prior_vols) / len(prior_vols) * 4 if prior_vols else 0
         if avg_1h_vol == 0:
             return None, ["avg_vol_zero"]
-        vol_ratio_1h = recent_1h_vol / avg_1h_vol
+        vol_ratio = recent_1h_vol / avg_1h_vol
 
-        has_acceleration = 1.5 <= vol_ratio_1h < 5 and accel_count >= 3
-        if not has_acceleration:
-            reasons.append(f"no_accel_{accel_count}_vol{vol_ratio_1h:.1f}x")
+        if vol_ratio < 5:
+            reasons.append(f"vol_{vol_ratio:.1f}x_need5x")
+
+        if not (current_close > current_open or prev_close > prev_open):
+            reasons.append("both_red")
 
         price_1h_ago = float(klines[-6][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
-        if change_1h < -1 or change_1h > 8:
+        if change_1h < -0.5 or change_1h > 8:
             reasons.append(f"1h_{change_1h:.1f}%")
 
         price_4h_ago = float(klines[-18][4])
         change_4h = ((current_close - price_4h_ago) / price_4h_ago) * 100
-        if change_4h < 0 or change_4h > 40:
+        if change_4h < 0 or change_4h > 60:
             reasons.append(f"4h_{change_4h:.1f}%")
-
-        greens = sum(1 for k in klines[-5:-1] if float(k[4]) > float(k[1]))
-        if greens < 2:
-            reasons.append(f"greens_{greens}")
 
         closes = [float(k[4]) for k in klines[:-1]]
         rsi = compute_rsi(closes, 14)
         if rsi < 50:
             reasons.append(f"RSI_low_{rsi:.1f}")
-        if rsi > 72:
+        if rsi > rsi_max:
             reasons.append(f"RSI_high_{rsi:.1f}")
 
         total_vol = float(completed[5])
@@ -329,15 +354,15 @@ def check_acceleration(symbol, price):
         if total_vol == 0:
             reasons.append("vol_zero")
         taker_pct = taker_buy / total_vol if total_vol else 0
-        if taker_pct < 0.50:
+        if taker_pct < taker_min:
             reasons.append(f"taker_{taker_pct*100:.1f}%")
 
         bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        if bid_depth < 40_000:
+        if bid_depth < depth_min:
             reasons.append(f"bid_low_{bid_depth:.0f}")
-        if ask_depth < 40_000:
+        if ask_depth < depth_min:
             reasons.append(f"ask_low_{ask_depth:.0f}")
         if bid_ask_ratio < 0.7:
             reasons.append(f"ratio_{bid_ask_ratio:.2f}")
@@ -346,32 +371,31 @@ def check_acceleration(symbol, price):
             return None, reasons
 
         return {
+            "vol_ratio": vol_ratio,
             "accel_count": accel_count,
-            "vol_ratio_1h": vol_ratio_1h,
-            "change_1h": change_1h,
-            "change_4h": change_4h,
-            "greens": greens,
-            "rsi": rsi,
             "taker_pct": taker_pct * 100,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
             "bid_ask_ratio": bid_ask_ratio,
+            "change_1h": change_1h,
+            "change_4h": change_4h,
+            "rsi": rsi,
         }, []
     except Exception as e:
         return None, [f"exception_{e}"]
 
-def scan():
+def scan(session):
     candidates = get_candidates()
     print(f"Candidates after Stage1: {len(candidates)}")
     cooldown = load_cooldown()
     hits = []
-    rejection = {}
+    rejection_summary = {}
+    active_candidates = [c for c in candidates if c["symbol"] not in cooldown]
+    print(f"After cooldown filter: {len(active_candidates)}")
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(check_acceleration, c["symbol"], c["price"]): c for c in candidates}
+        futures = {executor.submit(check_signal, c["symbol"], c["price"], session): c for c in active_candidates}
         for future in as_completed(futures):
             c = futures[future]
-            if c["symbol"] in cooldown:
-                continue
             result, reasons = future.result()
             if result:
                 c.update(result)
@@ -379,9 +403,9 @@ def scan():
             else:
                 if reasons:
                     top = reasons[0].split("_")[0]
-                    rejection[top] = rejection.get(top, 0) + 1
+                    rejection_summary[top] = rejection_summary.get(top, 0) + 1
                     log_rejection(c["symbol"], reasons, c["price"], c["change_24h"])
-    print(f"Stage2 rejection: {rejection}")
+    print(f"Stage2 rejection: {rejection_summary}")
     now = datetime.utcnow()
     for h in hits:
         cooldown[h["symbol"]] = now.isoformat()
@@ -412,7 +436,7 @@ def get_session_label(hour, minute):
 def main():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
-    print(f"Slow Grind Scanner starting at {ist} IST — Session: {session}")
+    print(f"Spike Scanner starting at {ist} IST — Session: {session}")
 
     if not SIGNALS_FILE.exists():
         SIGNALS_FILE.write_text('{"signals": []}')
@@ -421,7 +445,7 @@ def main():
         print("BTC dumping >2%. Skipping.")
         return
 
-    hits = scan()
+    hits = scan(session)
     print(f"Found {len(hits)} signals")
     for h in hits:
         count = get_alert_count(h["symbol"]) + 1
@@ -430,13 +454,13 @@ def main():
         stop = h["price"] * 0.97
 
         if count == 1:
-            header = f"📈 GRIND DETECTED [{session}]"
+            header = f"🚨 VOLUME BREAKOUT [{session}]"
             action = "✅ ENTER NOW — Buy at signal price. SL -3%."
         elif count == 2:
-            header = f"📈📈 GRIND DETECTED — 2ND [{session}]"
+            header = f"🚨🚨 VOLUME BREAKOUT — 2ND [{session}]"
             action = "✅ ADD MORE — Buy another $5."
         else:
-            header = f"🚨 GRIND DETECTED — {count}X [{session}]"
+            header = f"💥 VOLUME BREAKOUT — {count}X [{session}]"
             action = f"✅ ADD MORE — Confirmation #{count}. Buy another $5."
 
         msg = (
@@ -447,9 +471,7 @@ def main():
             f"<b>1h:</b> {h['change_1h']:.2f}%\n"
             f"<b>4h:</b> {h['change_4h']:.2f}%\n"
             f"<b>RSI:</b> {h['rsi']:.1f}\n"
-            f"<b>Volume:</b> {h['vol_ratio_1h']:.2f}x normal\n"
-            f"<b>Acceleration:</b> {h['accel_count']}/3 candles\n"
-            f"<b>Green Candles:</b> {h['greens']}/4\n"
+            f"<b>Volume:</b> {h['vol_ratio']:.2f}x normal\n"
             f"<b>Buyers:</b> {h['taker_pct']:.1f}%\n"
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
@@ -465,7 +487,7 @@ def safe_main():
     try:
         main()
     except Exception as e:
-        send_telegram(f"🚨 GRIND SCANNER CRASHED\n\nError: {html.escape(str(e)[:300])}")
+        send_telegram(f"🚨 SPIKE SCANNER CRASHED\n\nError: {html.escape(str(e)[:300])}")
         raise
 
 if __name__ == "__main__":
