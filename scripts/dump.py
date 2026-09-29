@@ -6,8 +6,7 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 labels = {
-    "rejections": "SPIKE",
-    "grind_rejections": "GRIND",
+    "momentum_rejections": "MOMENTUM",
     "futures_rejections": "FUTURES",
 }
 
@@ -17,6 +16,9 @@ for filename in sys.argv[1:]:
         data = json.load(open(filename))
     except Exception:
         print("no data")
+        continue
+    if not isinstance(data, dict):
+        print("bad format")
         continue
     items = sorted(data.items(), key=lambda x: x[1].get("count", 0), reverse=True)
     print(f"{len(data)} coins rejected\n")
