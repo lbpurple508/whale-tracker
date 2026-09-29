@@ -3,7 +3,7 @@ import json
 import html
 import requests
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -40,6 +40,11 @@ BLACKLIST = {
 
 _SPOT_SYMBOLS = None
 
+
+def now_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -48,6 +53,7 @@ def format_price(p):
     if p >= 0.0001:
         return f"${p:.6f}"
     return f"${p:.8f}"
+
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -58,44 +64,66 @@ def send_telegram(message):
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
-            print(f"Telegram error: {response.status_code} - {response.text}")
+            print(f"Telegram HTTP error: {response.status_code} - {response.text}")
+            return
+        body = response.json()
+        if not body.get("ok"):
+            print(f"Telegram API error: {body}")
     except Exception as e:
         print(f"Telegram error: {e}")
+
 
 def load_json(path):
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
     return {}
 
+
 def save_json(path, data):
     try:
-        path.write_text(json.dumps(data))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
     except Exception as e:
         print(f"save error: {e}")
 
+
+def parse_ts_safe(ts_str):
+    try:
+        t = datetime.fromisoformat(ts_str)
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        return t
+    except Exception:
+        return None
+
+
 def load_cooldown():
     data = load_json(COOLDOWN_FILE)
-    now = datetime.utcnow()
+    now = now_utc()
     cleaned = {}
     for sym, ts in data.items():
-        try:
-            t = datetime.fromisoformat(ts)
-            if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
-                cleaned[sym] = ts
-        except Exception:
-            pass
+        if not isinstance(ts, str):
+            continue
+        t = parse_ts_safe(ts)
+        if t is None:
+            continue
+        if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
+            cleaned[sym] = ts
     return cleaned
+
 
 def log_signal(symbol, data, session):
     try:
         signals = load_json(SIGNALS_FILE)
-        if "signals" not in signals:
+        if not isinstance(signals.get("signals"), list):
             signals["signals"] = []
         signals["signals"].append({
-            "ts": datetime.utcnow().isoformat(),
+            "ts": now_utc().isoformat(),
             "session": session,
             "symbol": symbol,
             "price": data.get("price"),
@@ -111,23 +139,25 @@ def log_signal(symbol, data, session):
     except Exception as e:
         print(f"log_signal error: {e}")
 
+
 def log_rejection(symbol, reasons, price, change_24h):
     try:
         data = load_json(REJECT_FILE)
-        key = symbol
-        if key not in data:
-            data[key] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
-        data[key]["count"] += 1
-        data[key]["last_seen"] = datetime.utcnow().isoformat()
-        data[key]["price"] = price
-        data[key]["change_24h"] = change_24h
-        data[key]["top_reason"] = reasons[0] if reasons else "unknown"
+        if symbol not in data or not isinstance(data.get(symbol), dict):
+            data[symbol] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
+        data[symbol]["count"] += 1
+        data[symbol]["last_seen"] = now_utc().isoformat()
+        data[symbol]["price"] = price
+        data[symbol]["change_24h"] = change_24h
+        data[symbol]["top_reason"] = reasons[0] if reasons else "unknown"
         if len(data) > 200:
-            sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
+            valid = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("last_seen")}
+            sorted_items = sorted(valid.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
             data = dict(sorted_items[:200])
         save_json(REJECT_FILE, data)
     except Exception as e:
         print(f"reject log error: {e}")
+
 
 def btc_is_healthy():
     try:
@@ -146,6 +176,7 @@ def btc_is_healthy():
     except Exception:
         return True
 
+
 def get_spot_1h_change(symbol):
     try:
         url = f"{SPOT_API}/api/v3/klines?symbol={symbol}&interval=1h&limit=3"
@@ -160,6 +191,7 @@ def get_spot_1h_change(symbol):
         return ((current_close - prev_close) / prev_close) * 100
     except Exception:
         return 0
+
 
 def get_spot_symbols():
     global _SPOT_SYMBOLS
@@ -187,6 +219,7 @@ def get_spot_symbols():
         _SPOT_SYMBOLS = set()
         return _SPOT_SYMBOLS
 
+
 def get_derivatives_data():
     url = f"{COINGECKO_API}/derivatives?include_tickers=unexpired"
     try:
@@ -210,10 +243,15 @@ def get_derivatives_data():
         print(f"CoinGecko error: {e}")
         return []
 
+
 def get_candidates_from_spot():
-    url = f"{SPOT_API}/api/v3/ticker/24hr"
-    r = requests.get(url, timeout=20)
-    tickers = r.json()
+    try:
+        url = f"{SPOT_API}/api/v3/ticker/24hr"
+        r = requests.get(url, timeout=20)
+        tickers = r.json()
+    except Exception as e:
+        print(f"ticker fetch failed: {e}")
+        return []
     if not isinstance(tickers, list):
         print(f"Unexpected tickers response: {tickers}")
         return []
@@ -260,6 +298,7 @@ def get_candidates_from_spot():
     print(f"Stage1 rejections: {rejected}")
     return candidates
 
+
 def check_pre_pump(candidate, derivatives_map):
     symbol = candidate["symbol"]
     deriv = derivatives_map.get(symbol)
@@ -292,6 +331,7 @@ def check_pre_pump(candidate, derivatives_map):
         "spot_1h": spot_1h,
     }, []
 
+
 def get_session_label(hour, minute):
     if hour == 5 and minute >= 30:
         return "Asia"
@@ -313,13 +353,21 @@ def get_session_label(hour, minute):
         return "US"
     return "Dead-Zone"
 
+
 def main():
-    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    ist = now_utc() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
     print(f"Futures Scanner (CoinGecko) starting at {ist} IST — Session: {session}")
 
     if not SIGNALS_FILE.exists():
         SIGNALS_FILE.write_text('{"signals": []}')
+    else:
+        try:
+            data = json.loads(SIGNALS_FILE.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("signals"), list):
+                SIGNALS_FILE.write_text('{"signals": []}')
+        except Exception:
+            SIGNALS_FILE.write_text('{"signals": []}')
 
     if not btc_is_healthy():
         print("BTC dumping >2%. Skipping.")
@@ -358,24 +406,25 @@ def main():
 
     hits = []
     rejection = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(check_pre_pump, c, deriv_map): c for c in active_candidates}
-        for future in as_completed(futures):
-            c = futures[future]
-            result, reasons = future.result()
-            if result:
-                c.update(result)
-                hits.append(c)
-            else:
-                if reasons:
-                    top = reasons[0].split("_")[0]
-                    rejection[top] = rejection.get(top, 0) + 1
-                    log_rejection(c["symbol"], reasons, c["price"], c["change_24h"])
+    if active_candidates:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = {executor.submit(check_pre_pump, c, deriv_map): c for c in active_candidates}
+            for future in as_completed(futures):
+                c = futures[future]
+                result, reasons = future.result()
+                if result:
+                    c.update(result)
+                    hits.append(c)
+                else:
+                    if reasons:
+                        top = reasons[0].split("_")[0]
+                        rejection[top] = rejection.get(top, 0) + 1
+                        log_rejection(c["symbol"], reasons, c["price"], c["change_24h"])
 
     print(f"Stage2 rejection: {rejection}")
     print(f"Found {len(hits)} pre-pump signals")
 
-    now = datetime.utcnow()
+    now = now_utc()
     for h in hits:
         cooldown[h["symbol"]] = now.isoformat()
         log_signal(h["symbol"], h, session)
@@ -400,12 +449,14 @@ def main():
 
     save_json(COOLDOWN_FILE, cooldown)
 
+
 def safe_main():
     try:
         main()
     except Exception as e:
         send_telegram(f"🚨 <b>FUTURES SCANNER CRASHED</b>\n\n<b>Error:</b> {html.escape(str(e)[:300])}")
         raise
+
 
 if __name__ == "__main__":
     safe_main()
