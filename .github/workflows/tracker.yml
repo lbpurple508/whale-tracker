@@ -64,6 +64,15 @@ jobs:
           path: futures/
           if_no_artifact_found: ignore
 
+      - name: Download trend signals
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          name: trend-signals
+          workflow: trend_scanner.yml
+          path: trend/
+          if_no_artifact_found: ignore
+
       - name: Restore tracker state
         uses: actions/cache/restore@v4
         with:
