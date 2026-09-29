@@ -19,16 +19,8 @@ HISTORY_HOURS = 4
 
 MAJORS = {
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "DOTUSDT",
-    "MATICUSDT", "LTCUSDT", "LINKUSDT", "TONUSDT", "SHIBUSDT",
-    "BCHUSDT", "UNIUSDT", "ATOMUSDT", "ETCUSDT", "FILUSDT",
-    "APTUSDT", "NEARUSDT", "ICPUSDT", "VETUSDT", "OPUSDT",
-    "ARBUSDT", "INJUSDT", "SUIUSDT", "SEIUSDT", "TIAUSDT",
-    "XLMUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
-    "STXUSDT", "IMXUSDT", "RUNEUSDT", "AAVEUSDT", "MKRUSDT",
-    "GRTUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT", "CRVUSDT",
-    "ALGOUSDT", "EGLDUSDT", "FTMUSDT", "THETAUSDT", "FLOWUSDT",
-    "HBARUSDT",
+    "ADAUSDT", "DOGEUSDT", "TRXUSDT", "LTCUSDT", "LINKUSDT",
+    "TONUSDT", "SHIBUSDT", "BCHUSDT",
 }
 
 BLACKLIST = {
@@ -279,7 +271,7 @@ def get_candidates():
         if quote_vol < 5_000_000:
             rejected["vol_low"] += 1
             continue
-        if change < 2 or change > 200:
+        if change < 2 or change > 15:
             rejected["change_range"] += 1
             continue
         if price > 1.00:
