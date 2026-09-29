@@ -28,22 +28,13 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Download spike signals
+      - name: Download momentum signals
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
-          name: spike-signals
-          workflow: scanner.yml
-          path: spike/
-          if_no_artifact_found: ignore
-
-      - name: Download grind signals
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: grind-signals
-          workflow: slow_grind_scanner.yml
-          path: grind/
+          name: momentum-signals
+          workflow: momentum_scanner.yml
+          path: momentum/
           if_no_artifact_found: ignore
 
       - name: Download monitor signals
