@@ -15,7 +15,7 @@ COOLDOWN_FILE = Path("dist_cooldown.json")
 COOLDOWN_MINUTES = 15
 
 ALERT_THRESHOLD = 4
-WARN_THRESHOLD = 2
+WARN_THRESHOLD = 3
 
 
 def now_utc():
