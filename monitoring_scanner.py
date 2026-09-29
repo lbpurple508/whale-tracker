@@ -3,7 +3,7 @@ import json
 import html
 import requests
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -28,6 +28,11 @@ MONITORING_TOKENS = [
     "QKCUSDT", "GNSUSDT",
 ]
 
+
+def now_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def format_price(p):
     if p >= 1:
         return f"${p:.4f}"
@@ -36,6 +41,7 @@ def format_price(p):
     if p >= 0.0001:
         return f"${p:.6f}"
     return f"${p:.8f}"
+
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -46,77 +52,114 @@ def send_telegram(message):
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
-            print(f"Telegram error: {response.status_code} - {response.text}")
+            print(f"Telegram HTTP error: {response.status_code} - {response.text}")
+            return
+        body = response.json()
+        if not body.get("ok"):
+            print(f"Telegram API error: {body}")
     except Exception as e:
         print(f"Telegram error: {e}")
+
 
 def load_json(path):
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
     return {}
 
+
 def save_json(path, data):
     try:
-        path.write_text(json.dumps(data))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
     except Exception as e:
         print(f"save error: {e}")
 
+
+def parse_ts_safe(ts_str):
+    try:
+        t = datetime.fromisoformat(ts_str)
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        return t
+    except Exception:
+        return None
+
+
 def load_cooldown():
     data = load_json(COOLDOWN_FILE)
-    now = datetime.utcnow()
+    now = now_utc()
     cleaned = {}
     for sym, info in data.items():
-        try:
-            ts = info.get("ts", "")
-            stage = info.get("stage", "COILING")
-            t = datetime.fromisoformat(ts)
-            minutes = COOLDOWN_BREAKOUT_MINUTES if stage == "BREAKOUT" else COOLDOWN_MINUTES
-            if (now - t).total_seconds() < minutes * 60:
-                cleaned[sym] = info
-        except Exception:
-            pass
+        if not isinstance(info, dict):
+            continue
+        ts = info.get("ts", "")
+        if not isinstance(ts, str):
+            continue
+        t = parse_ts_safe(ts)
+        if t is None:
+            continue
+        stage = info.get("stage", "COILING")
+        minutes = COOLDOWN_BREAKOUT_MINUTES if stage == "BREAKOUT" else COOLDOWN_MINUTES
+        if (now - t).total_seconds() < minutes * 60:
+            cleaned[sym] = info
     return cleaned
+
 
 def is_on_cooldown(symbol, cooldown, stage):
     if symbol not in cooldown:
         return False
-    existing_stage = cooldown[symbol].get("stage", "COILING")
+    entry = cooldown[symbol]
+    if not isinstance(entry, dict):
+        return False
+    existing_stage = entry.get("stage", "COILING")
     if stage == "BREAKOUT" and existing_stage == "COILING":
         return False
     return True
 
+
 def get_alert_count(symbol):
     history = load_json(HISTORY_FILE)
-    now = datetime.utcnow()
-    if symbol not in history:
+    now = now_utc()
+    entry = history.get(symbol)
+    if not isinstance(entry, dict):
         return 0
-    events = history[symbol].get("events", [])
+    events = entry.get("events", [])
+    if not isinstance(events, list):
+        return 0
     count = 0
     for ts_str in events:
-        try:
-            t = datetime.fromisoformat(ts_str)
-            if (now - t).total_seconds() < HISTORY_HOURS * 3600:
-                count += 1
-        except Exception:
-            pass
+        if not isinstance(ts_str, str):
+            continue
+        t = parse_ts_safe(ts_str)
+        if t is None:
+            continue
+        if (now - t).total_seconds() < HISTORY_HOURS * 3600:
+            count += 1
     return count
+
 
 def record_alert(symbol, stage):
     history = load_json(HISTORY_FILE)
-    now = datetime.utcnow()
-    if symbol not in history:
+    now = now_utc()
+    if symbol not in history or not isinstance(history[symbol], dict):
         history[symbol] = {"events": []}
+    if not isinstance(history[symbol].get("events"), list):
+        history[symbol]["events"] = []
     history[symbol]["events"].append(now.isoformat())
     cleaned = []
     for ts in history[symbol]["events"]:
-        try:
-            if (now - datetime.fromisoformat(ts)).total_seconds() < HISTORY_HOURS * 3600:
-                cleaned.append(ts)
-        except Exception:
-            pass
+        if not isinstance(ts, str):
+            continue
+        t = parse_ts_safe(ts)
+        if t is None:
+            continue
+        if (now - t).total_seconds() < HISTORY_HOURS * 3600:
+            cleaned.append(ts)
     history[symbol]["events"] = cleaned
     save_json(HISTORY_FILE, history)
 
@@ -124,13 +167,14 @@ def record_alert(symbol, stage):
     cooldown[symbol] = {"ts": now.isoformat(), "stage": stage}
     save_json(COOLDOWN_FILE, cooldown)
 
+
 def log_signal(symbol, stage, data, session):
     try:
         signals = load_json(SIGNALS_FILE)
-        if "signals" not in signals:
+        if not isinstance(signals.get("signals"), list):
             signals["signals"] = []
         signals["signals"].append({
-            "ts": datetime.utcnow().isoformat(),
+            "ts": now_utc().isoformat(),
             "session": session,
             "symbol": symbol,
             "stage": stage,
@@ -152,23 +196,25 @@ def log_signal(symbol, stage, data, session):
     except Exception as e:
         print(f"log_signal error: {e}")
 
+
 def log_rejection(symbol, reasons, price=0, change_24h=0):
     try:
         data = load_json(REJECT_FILE)
-        key = symbol
-        if key not in data:
-            data[key] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
-        data[key]["count"] += 1
-        data[key]["last_seen"] = datetime.utcnow().isoformat()
-        data[key]["price"] = price
-        data[key]["change_24h"] = change_24h
-        data[key]["top_reason"] = reasons[0] if reasons else "unknown"
+        if symbol not in data or not isinstance(data.get(symbol), dict):
+            data[symbol] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
+        data[symbol]["count"] += 1
+        data[symbol]["last_seen"] = now_utc().isoformat()
+        data[symbol]["price"] = price
+        data[symbol]["change_24h"] = change_24h
+        data[symbol]["top_reason"] = reasons[0] if reasons else "unknown"
         if len(data) > 200:
-            sorted_items = sorted(data.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
+            valid = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("last_seen")}
+            sorted_items = sorted(valid.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
             data = dict(sorted_items[:200])
         save_json(REJECT_FILE, data)
     except Exception as e:
         print(f"reject log error: {e}")
+
 
 def btc_is_healthy():
     try:
@@ -187,6 +233,7 @@ def btc_is_healthy():
     except Exception:
         return True
 
+
 def compute_rsi_series(closes, period=14):
     if len(closes) < period + 1:
         return []
@@ -204,12 +251,15 @@ def compute_rsi_series(closes, period=14):
                 losses.append(abs(diff))
         avg_gain = sum(gains) / period
         avg_loss = sum(losses) / period
-        if avg_loss == 0:
+        if avg_loss == 0 and avg_gain == 0:
+            rsis.append(50)
+        elif avg_loss == 0:
             rsis.append(100)
         else:
             rs = avg_gain / avg_loss
             rsis.append(100 - (100 / (1 + rs)))
     return rsis
+
 
 def check_depth(symbol, price):
     try:
@@ -224,6 +274,7 @@ def check_depth(symbol, price):
         return bid_depth, ask_depth
     except Exception:
         return 0, 0
+
 
 def detect_stage(symbol):
     reasons = []
@@ -343,6 +394,7 @@ def detect_stage(symbol):
     except Exception as e:
         return None, [f"exception_{e}"]
 
+
 def scan(session):
     print(f"Scanning {len(MONITORING_TOKENS)} monitoring tokens...")
     cooldown = load_cooldown()
@@ -371,6 +423,7 @@ def scan(session):
     print(f"Rejection: {rejection}")
     return hits
 
+
 def get_session_label(hour, minute):
     if hour == 5 and minute >= 30:
         return "Asia"
@@ -392,13 +445,21 @@ def get_session_label(hour, minute):
         return "US"
     return "Dead-Zone"
 
+
 def main():
-    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    ist = now_utc() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
 
     if not SIGNALS_FILE.exists():
         SIGNALS_FILE.write_text('{"signals": []}')
+    else:
+        try:
+            data = json.loads(SIGNALS_FILE.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("signals"), list):
+                SIGNALS_FILE.write_text('{"signals": []}')
+        except Exception:
+            SIGNALS_FILE.write_text('{"signals": []}')
 
     if not btc_is_healthy():
         print("BTC dumping >3%. Skipping.")
@@ -413,7 +474,7 @@ def main():
         stage = h.get("stage", "COILING")
 
         if stage == "BREAKOUT":
-            header = f"🚀 MONITORING BREAKOUT — ENTER NOW [{session}]"
+            header = f"🚀 MONITORING BREAKOUT [{session}]"
         elif count == 1:
             header = f"⭐ MONITORING COILING (WATCH) [{session}]"
         elif count == 2:
@@ -446,11 +507,12 @@ def main():
         )
 
         if stage == "BREAKOUT":
-            msg += "✅ ENTER NOW — Buy at current price."
+            msg += "✅ ENTER NOW — Buy at current price. SL -3%."
         else:
             msg += "⏸️ WAIT — Do NOT enter yet. Wait for BREAKOUT alert."
 
         send_telegram(msg)
+
 
 def safe_main():
     try:
@@ -458,6 +520,7 @@ def safe_main():
     except Exception as e:
         send_telegram(f"🚨 MONITORING SCANNER CRASHED\n\nError: {html.escape(str(e)[:300])}")
         raise
+
 
 if __name__ == "__main__":
     safe_main()
