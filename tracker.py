@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -21,7 +21,12 @@ SIGNAL_SOURCES = [
     ("GRIND", Path("grind/grind_signals.json")),
     ("MONITOR", Path("monitor/monitor_signals.json")),
     ("FUTURES", Path("futures/futures_signals.json")),
+    ("TREND", Path("trend/trend_signals.json")),
 ]
+
+
+def now_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def should_track(source, stage):
@@ -54,7 +59,11 @@ def send_telegram(message):
             timeout=10,
         )
         if r.status_code != 200:
-            print(f"Telegram error: {r.status_code} - {r.text}")
+            print(f"Telegram HTTP error: {r.status_code} - {r.text}")
+            return
+        body = r.json()
+        if not body.get("ok"):
+            print(f"Telegram API error: {body}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -62,7 +71,8 @@ def send_telegram(message):
 def load_json(path):
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
     return {}
@@ -70,14 +80,19 @@ def load_json(path):
 
 def save_json(path, data):
     try:
-        path.write_text(json.dumps(data, indent=2))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
     except Exception as e:
         print(f"save error: {e}")
 
 
 def parse_ts(s):
     try:
-        return datetime.fromisoformat(s)
+        t = datetime.fromisoformat(s)
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        return t
     except Exception:
         return None
 
@@ -95,23 +110,34 @@ def get_price(symbol):
 
 def clean_state(state):
     signals = state.get("signals", [])
+    if not isinstance(signals, list):
+        return 0
     before = len(signals)
     state["signals"] = [
         s for s in signals
-        if should_track(s.get("source", ""), s.get("stage", ""))
+        if isinstance(s, dict) and should_track(s.get("source", ""), s.get("stage", ""))
     ]
     return before - len(state["signals"])
 
 
 def load_new_signals(state):
     seen = state.get("seen", {})
+    if not isinstance(seen, dict):
+        seen = {}
     signals = state.get("signals", [])
+    if not isinstance(signals, list):
+        signals = []
     added = 0
-    now = datetime.utcnow()
+    now = now_utc()
 
     for source, path in SIGNAL_SOURCES:
         data = load_json(path)
-        for s in data.get("signals", []):
+        entries = data.get("signals", [])
+        if not isinstance(entries, list):
+            continue
+        for s in entries:
+            if not isinstance(s, dict):
+                continue
             ts = s.get("ts")
             symbol = s.get("symbol")
             price = s.get("price")
@@ -173,18 +199,21 @@ def load_new_signals(state):
 
 def update_signals(state):
     signals = state.get("signals", [])
-    trackable = [s for s in signals if s.get("status") in ("ACTIVE", "PUMPED")]
+    if not isinstance(signals, list):
+        return 0
+    trackable = [s for s in signals if isinstance(s, dict) and s.get("status") in ("ACTIVE", "PUMPED")]
     if not trackable:
         return 0
 
-    symbols = list({s["symbol"] for s in trackable})
+    symbols = list({s["symbol"] for s in trackable if s.get("symbol")})
     prices = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(get_price, sym): sym for sym in symbols}
-        for f in as_completed(futures):
-            prices[futures[f]] = f.result()
+    if symbols:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(get_price, sym): sym for sym in symbols}
+            for f in as_completed(futures):
+                prices[futures[f]] = f.result()
 
-    now = datetime.utcnow()
+    now = now_utc()
     updated = 0
     for s in trackable:
         p = prices.get(s["symbol"], 0)
@@ -234,6 +263,8 @@ def update_signals(state):
 
 def build_report(state):
     signals = state.get("signals", [])
+    if not isinstance(signals, list):
+        signals = []
     total = len(signals)
     active = [s for s in signals if s.get("status") == "ACTIVE"]
     pumped = [s for s in signals if s.get("status") == "PUMPED"]
@@ -283,9 +314,9 @@ def build_report(state):
 
 def main():
     state = load_json(TRACKER_FILE)
-    if "signals" not in state:
+    if "signals" not in state or not isinstance(state["signals"], list):
         state["signals"] = []
-    if "seen" not in state:
+    if "seen" not in state or not isinstance(state["seen"], dict):
         state["seen"] = {}
 
     cleaned = clean_state(state)
