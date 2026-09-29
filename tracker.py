@@ -17,8 +17,7 @@ MAX_SIGNAL_AGE_HOURS = 48
 MAX_PUMPED_AGE_HOURS = 72
 
 SIGNAL_SOURCES = [
-    ("SPIKE", Path("spike/signals.json")),
-    ("GRIND", Path("grind/grind_signals.json")),
+    ("MOMENTUM", Path("momentum/momentum_signals.json")),
     ("MONITOR", Path("monitor/monitor_signals.json")),
     ("FUTURES", Path("futures/futures_signals.json")),
     ("TREND", Path("trend/trend_signals.json")),
@@ -262,7 +261,7 @@ def update_signals(state):
 
 
 def build_source_stats(signals):
-    sources = ["SPIKE", "GRIND", "MONITOR", "TREND"]
+    sources = ["MOMENTUM", "MONITOR", "TREND"]
     stats = {}
     for src in sources:
         items = [s for s in signals if s.get("source") == src]
@@ -307,7 +306,7 @@ def build_report(state):
     stats = build_source_stats(signals)
     lines.append("")
     lines.append("📈 <b>BY SOURCE</b>")
-    for src in ["SPIKE", "GRIND", "MONITOR", "TREND"]:
+    for src in ["MOMENTUM", "MONITOR", "TREND"]:
         st = stats[src]
         if st["total"] == 0:
             continue
