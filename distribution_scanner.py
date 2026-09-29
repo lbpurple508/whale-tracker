@@ -3,7 +3,7 @@ import json
 import html
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -16,6 +16,10 @@ COOLDOWN_MINUTES = 15
 
 ALERT_THRESHOLD = 4
 WARN_THRESHOLD = 2
+
+
+def now_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def format_price(p):
@@ -37,7 +41,11 @@ def send_telegram(message):
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
-            print(f"Telegram error: {response.status_code} - {response.text}")
+            print(f"Telegram HTTP error: {response.status_code} - {response.text}")
+            return
+        body = response.json()
+        if not body.get("ok"):
+            print(f"Telegram API error: {body}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -45,7 +53,8 @@ def send_telegram(message):
 def load_json(path):
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
     return {}
@@ -53,9 +62,21 @@ def load_json(path):
 
 def save_json(path, data):
     try:
-        path.write_text(json.dumps(data))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
     except Exception as e:
         print(f"save error: {e}")
+
+
+def parse_ts_safe(ts_str):
+    try:
+        t = datetime.fromisoformat(ts_str)
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        return t
+    except Exception:
+        return None
 
 
 def get_klines(symbol):
@@ -100,6 +121,8 @@ def compute_rsi(closes, period=14):
             losses.append(abs(diff))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0 and avg_gain == 0:
+        return 50
     if avg_loss == 0:
         return 100
     rs = avg_gain / avg_loss
@@ -107,94 +130,106 @@ def compute_rsi(closes, period=14):
 
 
 def check_distribution(symbol, entry_price):
-    klines = get_klines(symbol)
-    if not klines:
+    try:
+        klines = get_klines(symbol)
+        if not klines:
+            return None
+
+        completed = klines[-2]
+        o = float(completed[1])
+        h = float(completed[2])
+        l = float(completed[3])
+        c = float(completed[4])
+        vol = float(completed[5])
+        taker_buy = float(completed[9])
+
+        if vol <= 0:
+            return None
+
+        prior_vols = [float(k[5]) for k in klines[-23:-2]]
+        avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
+        vol_ratio = vol / avg_vol if avg_vol > 0 else 0
+
+        closes = [float(k[4]) for k in klines[:-1]]
+        rsi = compute_rsi(closes, 14)
+
+        taker_pct = taker_buy / vol
+
+        candle_range = h - l
+        upper_wick = h - max(o, c)
+        upper_wick_pct = upper_wick / candle_range if candle_range > 0 else 0
+
+        price_1h_ago = float(klines[-6][4])
+        change_1h = ((c - price_1h_ago) / price_1h_ago) * 100
+
+        bid_depth, ask_depth = get_depth(symbol, c)
+        bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
+
+        score = 0
+        reasons = []
+
+        if bid_ask_ratio < 0.7:
+            score += 2
+            reasons.append(f"bid/ask {bid_ask_ratio:.2f}")
+        if taker_pct < 0.45:
+            score += 2
+            reasons.append(f"taker {taker_pct*100:.1f}%")
+        if rsi > 78:
+            score += 1
+            reasons.append(f"RSI {rsi:.1f}")
+        if upper_wick_pct > 0.5:
+            score += 1
+            reasons.append(f"wick {upper_wick_pct*100:.0f}%")
+        if vol_ratio > 2 and abs(change_1h) < 1:
+            score += 2
+            reasons.append(f"vol {vol_ratio:.1f}x flat")
+
+        current_pct = ((c - entry_price) / entry_price) * 100
+
+        return {
+            "symbol": symbol,
+            "price": c,
+            "entry": entry_price,
+            "current_pct": current_pct,
+            "score": score,
+            "reasons": reasons,
+            "rsi": rsi,
+            "bid_ask": bid_ask_ratio,
+            "taker_pct": taker_pct * 100,
+            "vol_ratio": vol_ratio,
+            "upper_wick_pct": upper_wick_pct * 100,
+            "change_1h": change_1h,
+        }
+    except Exception as e:
+        print(f"check_distribution error for {symbol}: {e}")
         return None
-
-    completed = klines[-2]
-    o = float(completed[1])
-    h = float(completed[2])
-    l = float(completed[3])
-    c = float(completed[4])
-    vol = float(completed[5])
-    taker_buy = float(completed[9])
-
-    if vol <= 0:
-        return None
-
-    prior_vols = [float(k[5]) for k in klines[-23:-2]]
-    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
-    vol_ratio = vol / avg_vol if avg_vol > 0 else 0
-
-    closes = [float(k[4]) for k in klines[:-1]]
-    rsi = compute_rsi(closes, 14)
-
-    taker_pct = taker_buy / vol
-
-    candle_range = h - l
-    upper_wick = h - max(o, c)
-    upper_wick_pct = upper_wick / candle_range if candle_range > 0 else 0
-
-    price_1h_ago = float(klines[-6][4])
-    change_1h = ((c - price_1h_ago) / price_1h_ago) * 100
-
-    bid_depth, ask_depth = get_depth(symbol, c)
-    bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
-
-    score = 0
-    reasons = []
-
-    if bid_ask_ratio < 0.7:
-        score += 2
-        reasons.append(f"bid/ask {bid_ask_ratio:.2f}")
-    if taker_pct < 0.45:
-        score += 2
-        reasons.append(f"taker {taker_pct*100:.1f}%")
-    if rsi > 78:
-        score += 1
-        reasons.append(f"RSI {rsi:.1f}")
-    if upper_wick_pct > 0.5:
-        score += 1
-        reasons.append(f"wick {upper_wick_pct*100:.0f}%")
-    if vol_ratio > 2 and abs(change_1h) < 1:
-        score += 2
-        reasons.append(f"vol {vol_ratio:.1f}x flat")
-
-    current_pct = ((c - entry_price) / entry_price) * 100
-
-    return {
-        "symbol": symbol,
-        "price": c,
-        "entry": entry_price,
-        "current_pct": current_pct,
-        "score": score,
-        "reasons": reasons,
-        "rsi": rsi,
-        "bid_ask": bid_ask_ratio,
-        "taker_pct": taker_pct * 100,
-        "vol_ratio": vol_ratio,
-        "upper_wick_pct": upper_wick_pct * 100,
-        "change_1h": change_1h,
-    }
 
 
 def load_cooldown():
     data = load_json(COOLDOWN_FILE)
-    now = datetime.utcnow()
+    now = now_utc()
     cleaned = {}
     for sym, ts in data.items():
-        try:
-            t = datetime.fromisoformat(ts)
-            if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
-                cleaned[sym] = ts
-        except Exception:
-            pass
+        if not isinstance(ts, str):
+            continue
+        t = parse_ts_safe(ts)
+        if t is None:
+            continue
+        if (now - t).total_seconds() < COOLDOWN_MINUTES * 60:
+            cleaned[sym] = ts
     return cleaned
 
 
 def main():
     if not COOLDOWN_FILE.exists():
         COOLDOWN_FILE.write_text("{}")
+    else:
+        try:
+            data = json.loads(COOLDOWN_FILE.read_text())
+            if not isinstance(data, dict):
+                COOLDOWN_FILE.write_text("{}")
+        except Exception:
+            COOLDOWN_FILE.write_text("{}")
 
     tracker = load_json(TRACKER_FILE)
     signals = tracker.get("signals", [])
@@ -202,7 +237,7 @@ def main():
         print("Bad tracker state")
         return
 
-    trackable = [s for s in signals if s.get("status") in ("ACTIVE", "PUMPED")]
+    trackable = [s for s in signals if isinstance(s, dict) and s.get("status") in ("ACTIVE", "PUMPED")]
     if not trackable:
         print("No active positions to monitor")
         return
@@ -216,21 +251,26 @@ def main():
         ts = s.get("entry_ts", "")
         if not entry:
             continue
+        try:
+            entry_f = float(entry)
+        except (ValueError, TypeError):
+            continue
         if sym not in seen or ts > seen[sym]["entry_ts"]:
-            seen[sym] = {"symbol": sym, "entry": float(entry), "entry_ts": ts}
+            seen[sym] = {"symbol": sym, "entry": entry_f, "entry_ts": ts}
 
     print(f"Checking {len(seen)} active positions...")
 
     results = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(check_distribution, v["symbol"], v["entry"]): v["symbol"] for v in seen.values()}
-        for f in as_completed(futures):
-            r = f.result()
-            if r:
-                results.append(r)
+    if seen:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(check_distribution, v["symbol"], v["entry"]): v["symbol"] for v in seen.values()}
+            for f in as_completed(futures):
+                r = f.result()
+                if r:
+                    results.append(r)
 
     cooldown = load_cooldown()
-    now = datetime.utcnow()
+    now = now_utc()
     to_alert = []
     for r in results:
         if r["score"] < WARN_THRESHOLD:
