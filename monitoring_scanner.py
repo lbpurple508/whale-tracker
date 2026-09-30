@@ -28,20 +28,17 @@ MONITORING_TOKENS = [
     "QKCUSDT", "GNSUSDT",
 ]
 
-# Tier 1 — own blockchain. Whales can coordinate on-chain.
 OWN_CHAIN = {
     "MOVRUSDT", "GLMRUSDT", "ARKUSDT", "SCRUSDT", "EPICUSDT",
     "STXUSDT", "LSKUSDT", "SYNUSDT", "SOPHUSDT", "HEIUSDT",
     "QKCUSDT", "TOWNSUSDT", "AVAUSDT",
 }
 
-# Ecosystem pairs — when one pumps, watch the other
 ECOSYSTEM_PAIRS = {
     "GLMRUSDT": "MOVRUSDT",
     "MOVRUSDT": "GLMRUSDT",
 }
 
-# Prime window (IST hours) — whales fire here
 PRIME_START_H = 10
 PRIME_END_H = 13
 
@@ -239,7 +236,6 @@ def compute_rsi(closes, period=14):
 
 
 def count_dead_base_hours(k15):
-    """Count consecutive 15m candles with range < 1% before the trigger."""
     dead = 0
     for k in reversed(k15[:-2]):
         try:
@@ -278,42 +274,34 @@ def detect_stage(symbol, ist_hour):
         if c_close <= 0 or c_low <= 0:
             return None, ["bad_price"]
 
-        # 15m change (the real trigger)
         prev_close = float(prev_completed[4])
         if prev_close <= 0:
             return None, ["bad_prev"]
         change_15m = ((c_close - prev_close) / prev_close) * 100
 
-        # 1h change
         price_1h_ago = float(k15[-6][4])
         change_1h = ((c_close - price_1h_ago) / price_1h_ago) * 100
 
-        # 6h change
         price_6h_ago = float(k15[-26][4])
         change_6h = ((c_close - price_6h_ago) / price_6h_ago) * 100
 
-        # Quiet volume base (last 24 completed 15m candles)
         quiet_vols = [float(k[5]) for k in k15[-26:-2]]
         quiet_avg = sum(quiet_vols) / len(quiet_vols) if quiet_vols else 0
         if quiet_avg <= 0:
             return None, ["quiet_avg_zero"]
         explosion_ratio = c_vol / quiet_avg
 
-        # Candle quality
         rng = c_high - c_low
         if rng <= 0:
             return None, ["zero_range"]
         upper_wick = (c_high - max(c_open, c_close)) / rng
         clv = (c_close - c_low) / rng
 
-        # Dead base duration
         dead_hours = count_dead_base_hours(k15)
 
-        # RSI (shown, not blocking)
         closes_15m = [float(k[4]) for k in k15[:-1]]
         rsi_15m = compute_rsi(closes_15m, 14)
 
-        # Taker buy pressure (last 4 completed 15m)
         recent_taker = sum(float(k[9]) for k in k15[-5:-1])
         recent_total = sum(float(k[5]) for k in k15[-5:-1])
         buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
@@ -321,7 +309,6 @@ def detect_stage(symbol, ist_hour):
         bid_depth, ask_depth = check_depth(symbol, c_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        # Tier-based thresholds
         tier = 1 if symbol in OWN_CHAIN else 2
         if tier == 1:
             min_15m = 2.5
@@ -330,17 +317,17 @@ def detect_stage(symbol, ist_hour):
             min_15m = 3.0
             min_vol = 2.0
 
-        # Prime window bonus
         prime = PRIME_START_H <= ist_hour < PRIME_END_H
         if prime:
             min_15m -= 0.5
             min_vol -= 0.3
 
-        # Filter chain
         if c_close <= c_open:
             reasons.append("red_candle")
         if change_15m < min_15m:
             reasons.append(f"15m_{change_15m:.1f}%")
+        if change_15m > 12.0:
+            reasons.append(f"15m_high_{change_15m:.1f}%")
         if explosion_ratio < min_vol:
             reasons.append(f"vol_{explosion_ratio:.1f}x")
         if upper_wick > 0.35:
@@ -482,7 +469,6 @@ def main():
         )
         send_telegram(msg)
 
-    # Ecosystem pair check
     for fired in fired_symbols:
         pair = ECOSYSTEM_PAIRS.get(fired)
         if pair and pair not in fired_symbols:
