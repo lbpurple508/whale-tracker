@@ -326,9 +326,9 @@ def detect_stage(symbol):
         breakout_conditions = [
             current_close > current_open,
             vol_ratio >= 1.5,
-            1.5 <= change_1h <= 8,
-            45 <= rsi_now <= 72,
-            rsi_2h_ago < 65,
+            1.5 <= change_1h <= 6,
+            50 <= rsi_now <= 75,
+            rsi_2h_ago < 70,
             buy_pressure >= 0.50,
             bid_ask_ratio >= 0.7,
             bid_depth >= 15_000,
