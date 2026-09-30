@@ -18,7 +18,6 @@ MAX_PUMPED_AGE_HOURS = 72
 
 SIGNAL_SOURCES = [
     ("MONITOR", Path("monitor/monitor_signals.json")),
-    ("FUTURES", Path("futures/futures_signals.json")),
 ]
 
 VALID_SOURCES = ("MONITOR",)
