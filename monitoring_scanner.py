@@ -14,9 +14,8 @@ COOLDOWN_FILE = Path("monitor_cooldown.json")
 REJECT_FILE = Path("monitor_rejections.json")
 HISTORY_FILE = Path("monitor_history.json")
 SIGNALS_FILE = Path("monitor_signals.json")
-COOLDOWN_MINUTES = 45
-COOLDOWN_BREAKOUT_MINUTES = 180
-COOLDOWN_ACCUMULATION_MINUTES = 240
+COOLDOWN_MINUTES = 240
+COOLDOWN_BREAKOUT_MINUTES = 240
 HISTORY_HOURS = 6
 
 MONITORING_TOKENS = [
@@ -104,51 +103,11 @@ def load_cooldown():
         t = parse_ts_safe(ts)
         if t is None:
             continue
-        stage = info.get("stage", "COILING")
-        if stage == "BREAKOUT":
-            minutes = COOLDOWN_BREAKOUT_MINUTES
-        elif stage == "ACCUMULATION":
-            minutes = COOLDOWN_ACCUMULATION_MINUTES
-        else:
-            minutes = COOLDOWN_MINUTES
+        stage = info.get("stage", "SIGNAL")
+        minutes = COOLDOWN_BREAKOUT_MINUTES if stage == "BREAKOUT" else COOLDOWN_MINUTES
         if (now - t).total_seconds() < minutes * 60:
             cleaned[sym] = info
     return cleaned
-
-
-def is_on_cooldown(symbol, cooldown, stage):
-    if symbol not in cooldown:
-        return False
-    entry = cooldown[symbol]
-    if not isinstance(entry, dict):
-        return False
-    existing_stage = entry.get("stage", "COILING")
-    if stage == "BREAKOUT" and existing_stage == "COILING":
-        return False
-    if stage == "BREAKOUT" and existing_stage == "ACCUMULATION":
-        return False
-    return True
-
-
-def get_alert_count(symbol):
-    history = load_json(HISTORY_FILE)
-    now = now_utc()
-    entry = history.get(symbol)
-    if not isinstance(entry, dict):
-        return 0
-    events = entry.get("events", [])
-    if not isinstance(events, list):
-        return 0
-    count = 0
-    for ts_str in events:
-        if not isinstance(ts_str, str):
-            continue
-        t = parse_ts_safe(ts_str)
-        if t is None:
-            continue
-        if (now - t).total_seconds() < HISTORY_HOURS * 3600:
-            count += 1
-    return count
 
 
 def record_alert(symbol, stage):
@@ -187,16 +146,14 @@ def log_signal(symbol, stage, data, session):
             "symbol": symbol,
             "stage": stage,
             "price": data.get("price"),
-            "rsi_now": data.get("rsi"),
-            "rsi_2h_ago": data.get("rsi_2h_ago"),
-            "volume_ratio": data.get("vol_ratio"),
+            "volume_ratio": data.get("explosion_ratio"),
+            "quiet_ratio": data.get("quiet_ratio"),
             "buy_pressure": data.get("buy_pressure"),
             "bid_depth": data.get("bid_depth"),
             "ask_depth": data.get("ask_depth"),
             "bid_ask_ratio": data.get("bid_ask_ratio"),
             "change_1h": data.get("change_1h"),
             "change_6h": data.get("change_6h"),
-            "range_pct": data.get("range_pct"),
         })
         if len(signals["signals"]) > 500:
             signals["signals"] = signals["signals"][-500:]
@@ -224,73 +181,6 @@ def log_rejection(symbol, reasons, price=0, change_24h=0):
         print(f"reject log error: {e}")
 
 
-def btc_is_healthy():
-    try:
-        url = f"{BASE_URL}/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=3"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if not isinstance(data, list) or len(data) < 3:
-            return True
-        current_close = float(data[-2][4])
-        prev_close = float(data[-3][4])
-        if prev_close == 0:
-            return True
-        change = ((current_close - prev_close) / prev_close) * 100
-        print(f"BTC 1h change: {change:.2f}%")
-        return change > -3
-    except Exception:
-        return True
-
-
-def compute_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        if diff > 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(diff))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0 and avg_gain == 0:
-        return 50
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def compute_rsi_series(closes, period=14):
-    if len(closes) < period + 1:
-        return []
-    rsis = []
-    for i in range(period, len(closes)):
-        window = closes[i-period:i+1]
-        gains, losses = [], []
-        for j in range(1, len(window)):
-            diff = window[j] - window[j-1]
-            if diff > 0:
-                gains.append(diff)
-                losses.append(0)
-            else:
-                gains.append(0)
-                losses.append(abs(diff))
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
-        if avg_loss == 0 and avg_gain == 0:
-            rsis.append(50)
-        elif avg_loss == 0:
-            rsis.append(100)
-        else:
-            rs = avg_gain / avg_loss
-            rsis.append(100 - (100 / (1 + rs)))
-    return rsis
-
-
 def check_depth(symbol, price):
     try:
         url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
@@ -306,109 +196,50 @@ def check_depth(symbol, price):
         return 0, 0
 
 
-def check_accumulation(symbol, k1h, current_close, buy_pressure):
-    if len(k1h) < 25:
-        return None, ["not_enough_1h"]
-
-    lows_8h = [float(k[3]) for k in k1h[-9:-1]]
-    if len(lows_8h) < 8:
-        return None, ["not_enough_lows"]
-    higher_lows = sum(1 for i in range(1, len(lows_8h)) if lows_8h[i] > lows_8h[i-1])
-    if higher_lows < 5:
-        return None, [f"higher_lows_{higher_lows}"]
-
-    highs_first = [float(k[2]) for k in k1h[-17:-9]]
-    lows_first = [float(k[3]) for k in k1h[-17:-9]]
-    if min(lows_first) == 0:
-        return None, ["zero_low_1h"]
-    range_first = (max(highs_first) - min(lows_first)) / min(lows_first) * 100
-
-    highs_last = [float(k[2]) for k in k1h[-9:-1]]
-    lows_last = [float(k[3]) for k in k1h[-9:-1]]
-    range_last = (max(highs_last) - min(lows_last)) / min(lows_last) * 100
-
-    if range_last >= range_first:
-        return None, [f"no_compression_{range_first:.1f}_{range_last:.1f}"]
-    if range_last > 5:
-        return None, [f"range_{range_last:.1f}%"]
-
-    vol_last_4h = [float(k[5]) for k in k1h[-5:-1]]
-    vol_prior_12h = [float(k[5]) for k in k1h[-17:-5]]
-    if not vol_last_4h or not vol_prior_12h:
-        return None, ["vol_missing"]
-    avg_last = sum(vol_last_4h) / len(vol_last_4h)
-    avg_prior = sum(vol_prior_12h) / len(vol_prior_12h)
-    if avg_prior == 0:
-        return None, ["avg_prior_zero"]
-    vol_ratio_1h = avg_last / avg_prior
-    if vol_ratio_1h < 1.2 or vol_ratio_1h > 3.0:
-        return None, [f"vol_1h_{vol_ratio_1h:.1f}x"]
-
-    closes_1h = [float(k[4]) for k in k1h[:-1]]
-    rsi_1h = compute_rsi(closes_1h, 14)
-    if rsi_1h < 40 or rsi_1h > 60:
-        return None, [f"rsi_1h_{rsi_1h:.1f}"]
-
-    price_6h_ago_1h = float(k1h[-7][4])
-    change_6h_1h = ((current_close - price_6h_ago_1h) / price_6h_ago_1h) * 100
-    if change_6h_1h < -3 or change_6h_1h > 5:
-        return None, [f"6h_chg_{change_6h_1h:.1f}%"]
-
-    if buy_pressure < 0.55:
-        return None, [f"buy_low_{buy_pressure*100:.1f}%"]
-
-    return {
-        "higher_lows": higher_lows,
-        "range_first": range_first,
-        "range_last": range_last,
-        "vol_ratio_1h": vol_ratio_1h,
-        "rsi_1h": rsi_1h,
-        "change_6h_1h": change_6h_1h,
-    }, []
-
-
 def detect_stage(symbol):
     reasons = []
     try:
-        url = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=48"
-        r = requests.get(url, timeout=15)
-        klines = r.json()
-        if not isinstance(klines, list) or len(klines) < 30:
-            return None, ["not_enough_klines"]
+        url_15m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
+        r_15m = requests.get(url_15m, timeout=15)
+        k15 = r_15m.json()
+        if not isinstance(k15, list) or len(k15) < 50:
+            return None, ["not_enough_15m"]
 
-        completed = klines[-2]
-        current_close = float(completed[4])
-        current_open = float(completed[1])
-        current_vol = float(completed[5])
+        url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=15"
+        r_5m = requests.get(url_5m, timeout=10)
+        k5 = r_5m.json()
+        if not isinstance(k5, list) or len(k5) < 10:
+            return None, ["not_enough_5m"]
 
-        prior_vols = [float(k[5]) for k in klines[-23:-2]]
-        avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
-        if avg_vol == 0:
-            return None, ["avg_vol_zero"]
-        vol_ratio = current_vol / avg_vol
+        quiet_vols_15m = [float(k[5]) for k in k15[-26:-2]]
+        quiet_avg_15m = sum(quiet_vols_15m) / len(quiet_vols_15m) if quiet_vols_15m else 0
+        if quiet_avg_15m == 0:
+            return None, ["quiet_avg_zero"]
 
-        highs_6h = [float(k[2]) for k in klines[-25:-1]]
-        lows_6h = [float(k[3]) for k in klines[-25:-1]]
-        if min(lows_6h) == 0:
-            return None, ["zero_low"]
-        range_pct = ((max(highs_6h) - min(lows_6h)) / min(lows_6h)) * 100
+        quiet_avg_5m = quiet_avg_15m / 3
 
-        price_6h_ago = float(klines[-26][4])
-        change_6h = ((current_close - price_6h_ago) / price_6h_ago) * 100
+        prior_24h = [float(k[5]) for k in k15[-98:-2]] if len(k15) >= 98 else quiet_vols_15m
+        prior_24h_avg = sum(prior_24h) / len(prior_24h) if prior_24h else 0
+        quiet_ratio = quiet_avg_15m / prior_24h_avg if prior_24h_avg > 0 else 1
 
-        price_1h_ago = float(klines[-6][4])
+        current_5m = k5[-2]
+        current_open = float(current_5m[1])
+        current_close = float(current_5m[4])
+        current_vol_5m = float(current_5m[5])
+
+        explosion_ratio = current_vol_5m / quiet_avg_5m if quiet_avg_5m > 0 else 0
+
+        last_3_5m = sum(float(k[5]) for k in k5[-5:-2])
+        vol_15m_ratio = last_3_5m / quiet_avg_15m if quiet_avg_15m > 0 else 0
+
+        price_1h_ago = float(k15[-6][4])
         change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
 
-        closes = [float(k[4]) for k in klines[:-1]]
-        rsi_series = compute_rsi_series(closes, 14)
-        if not rsi_series:
-            return None, ["rsi_fail"]
-        rsi_now = rsi_series[-1]
-        rsi_2h_ago = rsi_series[-9] if len(rsi_series) >= 9 else rsi_now
-        rsi_declining = rsi_now < rsi_2h_ago
+        price_6h_ago = float(k15[-26][4])
+        change_6h = ((current_close - price_6h_ago) / price_6h_ago) * 100
 
-        recent_taker = sum(float(k[9]) for k in klines[-9:-1])
-        recent_total = sum(float(k[5]) for k in klines[-9:-1])
+        recent_taker = sum(float(k[9]) for k in k5[-5:-1])
+        recent_total = sum(float(k[5]) for k in k5[-5:-1])
         buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
 
         bid_depth, ask_depth = check_depth(symbol, current_close)
@@ -416,100 +247,32 @@ def detect_stage(symbol):
 
         breakout_conditions = [
             current_close > current_open,
-            vol_ratio >= 3,
-            2 <= change_1h <= 5,
-            55 <= rsi_now <= 72,
-            rsi_2h_ago < 65,
-            2 <= change_6h <= 12,
+            quiet_ratio < 0.75,
+            explosion_ratio >= 5,
+            vol_15m_ratio >= 3,
+            change_1h >= 1.0,
+            change_1h <= 25,
             buy_pressure >= 0.55,
-            bid_ask_ratio >= 1.0,
-            bid_depth >= 25_000,
-            ask_depth >= 25_000,
+            bid_ask_ratio >= 0.9,
+            bid_depth >= 15_000,
+            ask_depth >= 15_000,
         ]
         if all(breakout_conditions):
             return "BREAKOUT", {
                 "price": current_close,
-                "vol_ratio": vol_ratio,
-                "rsi": rsi_now,
-                "rsi_2h_ago": rsi_2h_ago,
+                "quiet_ratio": quiet_ratio,
+                "explosion_ratio": explosion_ratio,
+                "vol_5m_ratio": vol_15m_ratio,
                 "change_1h": change_1h,
                 "change_6h": change_6h,
-                "range_pct": range_pct,
                 "buy_pressure": buy_pressure * 100,
                 "bid_depth": bid_depth,
                 "ask_depth": ask_depth,
                 "bid_ask_ratio": bid_ask_ratio,
             }
 
-        try:
-            url_1h = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=1h&limit=30"
-            r_1h = requests.get(url_1h, timeout=10)
-            k1h = r_1h.json()
-            if isinstance(k1h, list) and len(k1h) >= 25:
-                acc_result, acc_reasons = check_accumulation(symbol, k1h, current_close, buy_pressure)
-                if acc_result:
-                    return "ACCUMULATION", {
-                        "price": current_close,
-                        "vol_ratio": acc_result["vol_ratio_1h"],
-                        "rsi": acc_result["rsi_1h"],
-                        "rsi_2h_ago": acc_result["rsi_1h"],
-                        "change_1h": change_1h,
-                        "change_6h": change_6h,
-                        "range_pct": range_pct,
-                        "buy_pressure": buy_pressure * 100,
-                        "bid_depth": bid_depth,
-                        "ask_depth": ask_depth,
-                        "bid_ask_ratio": bid_ask_ratio,
-                        "higher_lows": acc_result["higher_lows"],
-                    }
-                else:
-                    reasons.extend(acc_reasons)
-        except Exception as e:
-            reasons.append(f"accum_err_{e}")
-
-        coiling_reasons = []
-        if rsi_now < 30 or rsi_now > 55:
-            coiling_reasons.append(f"RSI_{rsi_now:.1f}")
-        if not rsi_declining:
-            coiling_reasons.append("rsi_rising")
-        if range_pct > 10:
-            coiling_reasons.append(f"range_{range_pct:.1f}%")
-        if change_6h < -5 or change_6h > 5:
-            coiling_reasons.append(f"6h_{change_6h:.1f}%")
-        if vol_ratio < 1.0:
-            coiling_reasons.append(f"vol_{vol_ratio:.1f}x_low")
-        if vol_ratio > 2.5:
-            coiling_reasons.append(f"vol_{vol_ratio:.1f}x_high")
-        if buy_pressure < 0.50:
-            coiling_reasons.append(f"buy_{buy_pressure*100:.1f}%")
-        greens = sum(1 for k in klines[-7:-1] if float(k[4]) > float(k[1]))
-        if greens < 3:
-            coiling_reasons.append(f"greens_{greens}")
-        if bid_depth < 5_000:
-            coiling_reasons.append(f"bid_{bid_depth:.0f}")
-        if ask_depth < 5_000:
-            coiling_reasons.append(f"ask_{ask_depth:.0f}")
-        if bid_ask_ratio < 0.7:
-            coiling_reasons.append(f"ratio_{bid_ask_ratio:.2f}")
-
-        if coiling_reasons:
-            reasons.extend(coiling_reasons)
-            return None, reasons
-
-        return "COILING", {
-            "price": current_close,
-            "vol_ratio": vol_ratio,
-            "rsi": rsi_now,
-            "rsi_2h_ago": rsi_2h_ago,
-            "change_1h": change_1h,
-            "change_6h": change_6h,
-            "range_pct": range_pct,
-            "buy_pressure": buy_pressure * 100,
-            "greens": greens,
-            "bid_depth": bid_depth,
-            "ask_depth": ask_depth,
-            "bid_ask_ratio": bid_ask_ratio,
-        }
+        reasons.append(f"expl_{explosion_ratio:.1f}x")
+        return None, reasons
     except Exception as e:
         return None, [f"exception_{e}"]
 
@@ -529,7 +292,7 @@ def scan(session):
             else:
                 stage, data = None, ["exception"]
             if stage:
-                if is_on_cooldown(symbol, cooldown, stage):
+                if symbol in cooldown:
                     continue
                 data["symbol"] = symbol
                 data["stage"] = stage
@@ -543,32 +306,31 @@ def scan(session):
     return hits
 
 
+def is_active_session(ist_hour, ist_minute):
+    total_min = ist_hour * 60 + ist_minute
+    start_min = 8 * 60 + 30
+    end_min = 15 * 60 + 30
+    return start_min <= total_min <= end_min
+
+
 def get_session_label(hour, minute):
-    if hour == 5 and minute >= 30:
-        return "Asia"
-    if 6 <= hour <= 10:
-        return "Asia"
-    if hour == 11 and minute < 30:
+    if 8 <= hour <= 11:
         return "Asia"
     if hour == 12 and minute >= 30:
         return "Europe"
-    if 13 <= hour <= 14:
+    if 13 <= hour <= 15:
         return "Europe"
-    if hour == 15 and minute < 30:
-        return "Europe"
-    if hour == 18 and minute >= 30:
-        return "US"
-    if 19 <= hour <= 20:
-        return "US"
-    if hour == 21 and minute < 30:
-        return "US"
-    return "Dead-Zone"
+    return "Off"
 
 
 def main():
     ist = now_utc() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour, ist.minute)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
+
+    if not is_active_session(ist.hour, ist.minute):
+        print("Outside 8:30-15:30 IST. Skipping.")
+        return
 
     if not SIGNALS_FILE.exists():
         SIGNALS_FILE.write_text('{"signals": []}')
@@ -580,69 +342,31 @@ def main():
         except Exception:
             SIGNALS_FILE.write_text('{"signals": []}')
 
-    if not btc_is_healthy():
-        print("BTC dumping >3%. Skipping.")
-        return
-
     hits = scan(session)
     print(f"Found {len(hits)} signals")
 
     for h in hits:
-        count = get_alert_count(h["symbol"]) + 1
-        stop = h["price"] * 0.97
-        stage = h.get("stage", "COILING")
+        header = f"🚀 MONITORING BREAKOUT [{session}]"
 
-        if stage == "BREAKOUT":
-            header = f"🚀 MONITORING BREAKOUT [{session}]"
-        elif stage == "ACCUMULATION":
-            header = f"🐋 WHALE ACCUMULATION [{session}]"
-        elif count == 1:
-            header = f"⭐ MONITORING COILING (WATCH) [{session}]"
-        elif count == 2:
-            header = f"⭐⭐ MONITORING COILING — 2ND [{session}]"
-        else:
-            header = f"🎯 MONITORING COILING — {count}X [{session}]"
-
-        record_alert(h["symbol"], stage)
-        log_signal(h["symbol"], stage, h, session)
+        record_alert(h["symbol"], "BREAKOUT")
+        log_signal(h["symbol"], "BREAKOUT", h, session)
 
         msg = (
             f"{header}\n\n"
-            f"<b>Stage:</b> {stage}\n"
-            f"<b>Alerts (6h):</b> {count}\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
-            f"<b>6h Range:</b> {h['range_pct']:.2f}%\n"
-            f"<b>6h Change:</b> {h['change_6h']:+.2f}%\n"
+            f"<b>Quiet Base:</b> {h['quiet_ratio']:.2f}x 24h avg\n"
+            f"<b>5m Explosion:</b> {h['explosion_ratio']:.2f}x\n"
+            f"<b>15m Volume:</b> {h['vol_5m_ratio']:.2f}x\n"
             f"<b>1h Change:</b> {h['change_1h']:+.2f}%\n"
-            f"<b>RSI now:</b> {h['rsi']:.1f}\n"
-            f"<b>RSI 2h ago:</b> {h['rsi_2h_ago']:.1f}\n"
-            f"<b>Volume:</b> {h['vol_ratio']:.2f}x normal\n"
+            f"<b>6h Change:</b> {h['change_6h']:+.2f}%\n"
             f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
-        )
-
-        if stage == "ACCUMULATION" and "higher_lows" in h:
-            msg += f"<b>Higher Lows:</b> {h['higher_lows']}/7\n"
-
-        msg += (
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
-            f"<b>Trail:</b> +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
+            f"⏳ WATCHING — Dip watcher is tracking for entry. Wait for ENTER signal."
         )
-
-        if stage == "BREAKOUT":
-            msg += "✅ ENTER NOW — Buy at current price. SL -3%."
-        elif stage == "ACCUMULATION":
-            msg += (
-                "🐋 EARLY ENTRY — Whales loading. "
-                "Buy half position now. BREAKOUT will confirm later."
-            )
-        else:
-            msg += "⏸️ WAIT — Do NOT enter yet. Wait for BREAKOUT alert."
-
         send_telegram(msg)
 
 
