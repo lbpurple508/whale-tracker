@@ -17,7 +17,7 @@ MAX_SIGNAL_AGE_HOURS = 48
 MAX_PUMPED_AGE_HOURS = 72
 
 SIGNAL_SOURCES = [
-    ("MONITOR", Path("dip/dip_confirmed.json")),
+    ("MONITOR", Path("monitor/monitor_signals.json")),
 ]
 
 VALID_SOURCES = ("MONITOR",)
@@ -127,6 +127,10 @@ def clean_state(state):
             s["peak_pct"] = 0.0
         if "current_pct" not in s:
             s["current_pct"] = 0.0
+        if "tier" not in s:
+            s["tier"] = 2
+        if "dead_hours" not in s:
+            s["dead_hours"] = 0
         cleaned.append(s)
     state["signals"] = cleaned
     return before - len(cleaned)
@@ -166,7 +170,7 @@ def load_new_signals(state):
             if key in seen:
                 continue
 
-            stage = s.get("stage", source)
+            stage = s.get("stage", "BREAKOUT")
             if not should_track(source, stage):
                 seen[key] = True
                 continue
@@ -186,8 +190,10 @@ def load_new_signals(state):
                 "entry": entry,
                 "entry_ts": ts,
                 "stage": stage,
-                "signal_price": s.get("signal_price", entry),
-                "entry_dip_pct": s.get("dip_pct", 0.0),
+                "tier": s.get("tier", 2),
+                "dead_hours": s.get("dead_hours", 0),
+                "signal_price": entry,
+                "entry_dip_pct": 0.0,
                 "peak": entry,
                 "peak_pct": 0.0,
                 "peak_ts": ts,
