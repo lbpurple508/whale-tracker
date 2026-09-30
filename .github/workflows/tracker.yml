@@ -28,15 +28,6 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Download momentum signals
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: momentum-signals
-          workflow: momentum_scanner.yml
-          path: momentum/
-          if_no_artifact_found: ignore
-
       - name: Download monitor signals
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
@@ -53,15 +44,6 @@ jobs:
           name: futures-signals
           workflow: futures_scanner.yml
           path: futures/
-          if_no_artifact_found: ignore
-
-      - name: Download trend signals
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: trend-signals
-          workflow: trend_scanner.yml
-          path: trend/
           if_no_artifact_found: ignore
 
       - name: Restore tracker state
