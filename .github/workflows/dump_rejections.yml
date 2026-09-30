@@ -18,28 +18,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download momentum rejections
+      - name: Download monitor rejections
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
-          name: momentum-rejections
-          workflow: momentum_scanner.yml
-          path: momentum/
-          if_no_artifact_found: ignore
-          search_artifacts: true
-
-      - name: Download futures rejections
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: futures-rejections
-          workflow: futures_scanner.yml
-          path: futures/
+          name: monitoring-rejections
+          workflow: monitoring_scanner.yml
+          path: monitor/
           if_no_artifact_found: ignore
           search_artifacts: true
 
       - name: Build report
-        run: python3 scripts/dump.py momentum/momentum_rejections.json futures/futures_rejections.json > report.txt
+        run: python3 scripts/dump.py monitor/monitor_rejections.json > report.txt
 
       - name: Show report
         run: cat report.txt
