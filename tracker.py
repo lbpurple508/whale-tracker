@@ -30,7 +30,7 @@ def now_utc():
 def should_track(source, stage):
     if source not in VALID_SOURCES:
         return False
-    if source == "MONITOR" and stage != "BREAKOUT":
+    if source == "MONITOR" and stage not in ("BREAKOUT", "ACCUMULATION"):
         return False
     return True
 
@@ -281,28 +281,24 @@ def update_signals(state):
     return updated
 
 
-def build_source_stats(signals):
-    sources = ["MONITOR"]
-    stats = {}
-    for src in sources:
-        items = [s for s in signals if s.get("source") == src]
-        total = len(items)
-        wins = len([s for s in items if s.get("status") in ("PUMPED", "CLOSED") and s.get("peak_pct", 0) >= PUMP_TARGET])
-        losses = len([s for s in items if s.get("status") == "STOPPED"])
-        active = len([s for s in items if s.get("status") == "ACTIVE"])
-        closed = wins + losses
-        win_rate = (wins / closed * 100) if closed > 0 else 0
-        loss_rate = (losses / closed * 100) if closed > 0 else 0
-        stats[src] = {
-            "total": total,
-            "wins": wins,
-            "losses": losses,
-            "active": active,
-            "closed": closed,
-            "win_rate": win_rate,
-            "loss_rate": loss_rate,
-        }
-    return stats
+def build_stage_stats(signals, stage):
+    items = [s for s in signals if s.get("stage") == stage]
+    total = len(items)
+    wins = len([s for s in items if s.get("status") in ("PUMPED", "CLOSED") and s.get("peak_pct", 0) >= PUMP_TARGET])
+    losses = len([s for s in items if s.get("status") == "STOPPED"])
+    active = len([s for s in items if s.get("status") == "ACTIVE"])
+    closed = wins + losses
+    win_rate = (wins / closed * 100) if closed > 0 else 0
+    loss_rate = (losses / closed * 100) if closed > 0 else 0
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "active": active,
+        "closed": closed,
+        "win_rate": win_rate,
+        "loss_rate": loss_rate,
+    }
 
 
 def build_report(state):
@@ -324,11 +320,10 @@ def build_report(state):
         f"⚫ Closed: <b>{len(closed)}</b>"
     )
 
-    stats = build_source_stats(signals)
     lines.append("")
-    lines.append("📈 <b>BY SOURCE</b>")
-    for src in ["MONITOR"]:
-        st = stats[src]
+    lines.append("📈 <b>BY STAGE</b>")
+    for stage in ["ACCUMULATION", "BREAKOUT"]:
+        st = build_stage_stats(signals, stage)
         if st["total"] == 0:
             continue
         if st["closed"] > 0:
@@ -337,8 +332,9 @@ def build_report(state):
         else:
             wr = "—"
             lr = "—"
+        icon = "🐋" if stage == "ACCUMULATION" else "🚀"
         lines.append(
-            f"• <b>{src}</b>: {st['total']} total | "
+            f"• {icon} <b>{stage}</b>: {st['total']} total | "
             f"✅ {st['wins']} | ❌ {st['losses']} | 🟡 {st['active']}"
         )
         lines.append(f"   WR: {wr} | LR: {lr}")
@@ -348,7 +344,7 @@ def build_report(state):
         lines.append("🟢 <b>PUMPED (+30%+)</b>")
         for s in pumped[-5:]:
             lines.append(
-                f"• <b>{s['symbol']}</b> [{s['source']}] "
+                f"• <b>{s['symbol']}</b> [{s['stage']}] "
                 f"{format_price(s['entry'])} → +{s['peak_pct']:.2f}% "
                 f"in {s['time_to_peak_min']}m"
             )
@@ -358,7 +354,7 @@ def build_report(state):
         lines.append("🟡 <b>ACTIVE</b>")
         for s in active[-5:]:
             lines.append(
-                f"• <b>{s['symbol']}</b> [{s['source']}] "
+                f"• <b>{s['symbol']}</b> [{s['stage']}] "
                 f"{format_price(s['entry'])} → {s['current_pct']:+.2f}% "
                 f"(peak {s['peak_pct']:+.2f}%, dip {s['dip_pct']:+.2f}%)"
             )
@@ -368,7 +364,7 @@ def build_report(state):
         lines.append("🔴 <b>STOPPED (-3%)</b>")
         for s in stopped[-5:]:
             lines.append(
-                f"• <b>{s['symbol']}</b> [{s['source']}] "
+                f"• <b>{s['symbol']}</b> [{s['stage']}] "
                 f"{format_price(s['entry'])} → {s.get('exit_pct', 0):+.2f}%"
             )
 
