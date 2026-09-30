@@ -109,11 +109,27 @@ def clean_state(state):
     if not isinstance(signals, list):
         return 0
     before = len(signals)
-    state["signals"] = [
-        s for s in signals
-        if isinstance(s, dict) and should_track(s.get("source", ""), s.get("stage", ""))
-    ]
-    return before - len(state["signals"])
+    cleaned = []
+    for s in signals:
+        if not isinstance(s, dict):
+            continue
+        if not should_track(s.get("source", ""), s.get("stage", "")):
+            continue
+        if "dip_pct_tracked" not in s:
+            s["dip_pct_tracked"] = 0.0
+        if "entry_dip_pct" not in s and "dip_pct" in s:
+            s["entry_dip_pct"] = s.pop("dip_pct")
+        if "entry_dip_pct" not in s:
+            s["entry_dip_pct"] = 0.0
+        if "signal_price" not in s:
+            s["signal_price"] = s.get("entry", 0)
+        if "peak_pct" not in s:
+            s["peak_pct"] = 0.0
+        if "current_pct" not in s:
+            s["current_pct"] = 0.0
+        cleaned.append(s)
+    state["signals"] = cleaned
+    return before - len(cleaned)
 
 
 def load_new_signals(state):
@@ -171,7 +187,7 @@ def load_new_signals(state):
                 "entry_ts": ts,
                 "stage": stage,
                 "signal_price": s.get("signal_price", entry),
-                "dip_pct": s.get("dip_pct", 0.0),
+                "entry_dip_pct": s.get("dip_pct", 0.0),
                 "peak": entry,
                 "peak_pct": 0.0,
                 "peak_ts": ts,
@@ -217,6 +233,11 @@ def update_signals(state):
         p = prices.get(s["symbol"], 0)
         if p <= 0:
             continue
+
+        if "dip_pct_tracked" not in s:
+            s["dip_pct_tracked"] = 0.0
+        if "peak_pct" not in s:
+            s["peak_pct"] = 0.0
 
         s["current"] = p
         s["current_pct"] = ((p - s["entry"]) / s["entry"]) * 100
@@ -290,29 +311,35 @@ def build_report(state):
         lines.append("")
         lines.append("🟢 <b>PUMPED (+30%+)</b>")
         for s in pumped[-5:]:
+            peak = s.get("peak_pct", 0)
+            ttp = s.get("time_to_peak_min", 0)
             lines.append(
-                f"• <b>{s['symbol']}</b> "
-                f"{format_price(s['entry'])} → +{s['peak_pct']:.2f}% "
-                f"in {s['time_to_peak_min']}m"
+                f"• <b>{s.get('symbol', '?')}</b> "
+                f"{format_price(s.get('entry', 0))} → +{peak:.2f}% "
+                f"in {ttp}m"
             )
 
     if active:
         lines.append("")
         lines.append("🟡 <b>ACTIVE</b>")
         for s in active[-5:]:
+            peak = s.get("peak_pct", 0)
+            dip_tr = s.get("dip_pct_tracked", 0)
+            cur = s.get("current_pct", 0)
             lines.append(
-                f"• <b>{s['symbol']}</b> "
-                f"{format_price(s['entry'])} → {s['current_pct']:+.2f}% "
-                f"(peak {s['peak_pct']:+.2f}%, dip {s['dip_pct_tracked']:+.2f}%)"
+                f"• <b>{s.get('symbol', '?')}</b> "
+                f"{format_price(s.get('entry', 0))} → {cur:+.2f}% "
+                f"(peak {peak:+.2f}%, dip {dip_tr:+.2f}%)"
             )
 
     if stopped:
         lines.append("")
         lines.append("🔴 <b>STOPPED (-3%)</b>")
         for s in stopped[-5:]:
+            exit_pct = s.get("exit_pct", 0)
             lines.append(
-                f"• <b>{s['symbol']}</b> "
-                f"{format_price(s['entry'])} → {s.get('exit_pct', 0):+.2f}%"
+                f"• <b>{s.get('symbol', '?')}</b> "
+                f"{format_price(s.get('entry', 0))} → {exit_pct:+.2f}%"
             )
 
     return "\n".join(lines)
