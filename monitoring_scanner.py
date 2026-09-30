@@ -28,6 +28,23 @@ MONITORING_TOKENS = [
     "QKCUSDT", "GNSUSDT",
 ]
 
+# Tier 1 — own blockchain. Whales can coordinate on-chain.
+OWN_CHAIN = {
+    "MOVRUSDT", "GLMRUSDT", "ARKUSDT", "SCRUSDT", "EPICUSDT",
+    "STXUSDT", "LSKUSDT", "SYNUSDT", "SOPHUSDT", "HEIUSDT",
+    "QKCUSDT", "TOWNSUSDT", "AVAUSDT",
+}
+
+# Ecosystem pairs — when one pumps, watch the other
+ECOSYSTEM_PAIRS = {
+    "GLMRUSDT": "MOVRUSDT",
+    "MOVRUSDT": "GLMRUSDT",
+}
+
+# Prime window (IST hours) — whales fire here
+PRIME_START_H = 10
+PRIME_END_H = 13
+
 
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -103,7 +120,7 @@ def load_cooldown():
         t = parse_ts_safe(ts)
         if t is None:
             continue
-        stage = info.get("stage", "SIGNAL")
+        stage = info.get("stage", "BREAKOUT")
         minutes = COOLDOWN_BREAKOUT_MINUTES if stage == "BREAKOUT" else COOLDOWN_MINUTES
         if (now - t).total_seconds() < minutes * 60:
             cleaned[sym] = info
@@ -145,9 +162,12 @@ def log_signal(symbol, stage, data, session):
             "session": session,
             "symbol": symbol,
             "stage": stage,
+            "tier": data.get("tier"),
             "price": data.get("price"),
+            "dead_hours": data.get("dead_hours"),
+            "change_15m": data.get("change_15m"),
             "volume_ratio": data.get("explosion_ratio"),
-            "quiet_ratio": data.get("quiet_ratio"),
+            "rsi": data.get("rsi"),
             "buy_pressure": data.get("buy_pressure"),
             "bid_depth": data.get("bid_depth"),
             "ask_depth": data.get("ask_depth"),
@@ -171,7 +191,6 @@ def log_rejection(symbol, reasons, price=0, change_24h=0):
         data[symbol]["last_seen"] = now_utc().isoformat()
         data[symbol]["price"] = price
         data[symbol]["change_24h"] = change_24h
-        # Keep ALL failing reasons joined
         data[symbol]["top_reason"] = ",".join(reasons) if reasons else "unknown"
         if len(data) > 200:
             valid = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("last_seen")}
@@ -197,7 +216,48 @@ def check_depth(symbol, price):
         return 0, 0
 
 
-def detect_stage(symbol):
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0 and avg_gain == 0:
+        return 50
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def count_dead_base_hours(k15):
+    """Count consecutive 15m candles with range < 1% before the trigger."""
+    dead = 0
+    for k in reversed(k15[:-2]):
+        try:
+            h = float(k[2])
+            l = float(k[3])
+            if l <= 0:
+                break
+            rng = (h - l) / l * 100
+            if rng < 1.0:
+                dead += 1
+            else:
+                break
+        except Exception:
+            break
+    return dead / 4.0
+
+
+def detect_stage(symbol, ist_hour):
     reasons = []
     try:
         url_15m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
@@ -206,61 +266,89 @@ def detect_stage(symbol):
         if not isinstance(k15, list) or len(k15) < 50:
             return None, ["not_enough_15m"]
 
-        url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=15"
-        r_5m = requests.get(url_5m, timeout=10)
-        k5 = r_5m.json()
-        if not isinstance(k5, list) or len(k5) < 10:
-            return None, ["not_enough_5m"]
+        completed = k15[-2]
+        prev_completed = k15[-3]
 
-        quiet_vols_15m = [float(k[5]) for k in k15[-26:-2]]
-        quiet_avg_15m = sum(quiet_vols_15m) / len(quiet_vols_15m) if quiet_vols_15m else 0
-        if quiet_avg_15m == 0:
-            return None, ["quiet_avg_zero"]
+        c_open = float(completed[1])
+        c_high = float(completed[2])
+        c_low = float(completed[3])
+        c_close = float(completed[4])
+        c_vol = float(completed[5])
 
-        quiet_avg_5m = quiet_avg_15m / 3
+        if c_close <= 0 or c_low <= 0:
+            return None, ["bad_price"]
 
-        prior_24h = [float(k[5]) for k in k15[-98:-2]] if len(k15) >= 98 else quiet_vols_15m
-        prior_24h_avg = sum(prior_24h) / len(prior_24h) if prior_24h else 0
-        quiet_ratio = quiet_avg_15m / prior_24h_avg if prior_24h_avg > 0 else 1
+        # 15m change (the real trigger)
+        prev_close = float(prev_completed[4])
+        if prev_close <= 0:
+            return None, ["bad_prev"]
+        change_15m = ((c_close - prev_close) / prev_close) * 100
 
-        current_5m = k5[-2]
-        current_open = float(current_5m[1])
-        current_close = float(current_5m[4])
-        current_vol_5m = float(current_5m[5])
-
-        explosion_ratio = current_vol_5m / quiet_avg_5m if quiet_avg_5m > 0 else 0
-
-        last_3_5m = sum(float(k[5]) for k in k5[-5:-2])
-        vol_15m_ratio = last_3_5m / quiet_avg_15m if quiet_avg_15m > 0 else 0
-
+        # 1h change
         price_1h_ago = float(k15[-6][4])
-        change_1h = ((current_close - price_1h_ago) / price_1h_ago) * 100
+        change_1h = ((c_close - price_1h_ago) / price_1h_ago) * 100
 
+        # 6h change
         price_6h_ago = float(k15[-26][4])
-        change_6h = ((current_close - price_6h_ago) / price_6h_ago) * 100
+        change_6h = ((c_close - price_6h_ago) / price_6h_ago) * 100
 
-        recent_taker = sum(float(k[9]) for k in k5[-5:-1])
-        recent_total = sum(float(k[5]) for k in k5[-5:-1])
+        # Quiet volume base (last 24 completed 15m candles)
+        quiet_vols = [float(k[5]) for k in k15[-26:-2]]
+        quiet_avg = sum(quiet_vols) / len(quiet_vols) if quiet_vols else 0
+        if quiet_avg <= 0:
+            return None, ["quiet_avg_zero"]
+        explosion_ratio = c_vol / quiet_avg
+
+        # Candle quality
+        rng = c_high - c_low
+        if rng <= 0:
+            return None, ["zero_range"]
+        upper_wick = (c_high - max(c_open, c_close)) / rng
+        clv = (c_close - c_low) / rng
+
+        # Dead base duration
+        dead_hours = count_dead_base_hours(k15)
+
+        # RSI (shown, not blocking)
+        closes_15m = [float(k[4]) for k in k15[:-1]]
+        rsi_15m = compute_rsi(closes_15m, 14)
+
+        # Taker buy pressure (last 4 completed 15m)
+        recent_taker = sum(float(k[9]) for k in k15[-5:-1])
+        recent_total = sum(float(k[5]) for k in k15[-5:-1])
         buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
 
-        bid_depth, ask_depth = check_depth(symbol, current_close)
+        bid_depth, ask_depth = check_depth(symbol, c_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        # Log every failing filter so we know why each coin was rejected
-        if current_close <= current_open:
-            reasons.append("candle_red")
-        if quiet_ratio >= 0.75:
-            reasons.append(f"quiet_{quiet_ratio:.2f}")
-        if explosion_ratio < 5:
-            reasons.append(f"expl_{explosion_ratio:.1f}x")
-        if vol_15m_ratio < 3:
-            reasons.append(f"vol15m_{vol_15m_ratio:.1f}x")
-        if change_1h < 1.0:
-            reasons.append(f"1h_low_{change_1h:.1f}")
-        if change_1h > 25:
-            reasons.append(f"1h_high_{change_1h:.1f}")
+        # Tier-based thresholds
+        tier = 1 if symbol in OWN_CHAIN else 2
+        if tier == 1:
+            min_15m = 2.5
+            min_vol = 1.5
+        else:
+            min_15m = 3.0
+            min_vol = 2.0
+
+        # Prime window bonus
+        prime = PRIME_START_H <= ist_hour < PRIME_END_H
+        if prime:
+            min_15m -= 0.5
+            min_vol -= 0.3
+
+        # Filter chain
+        if c_close <= c_open:
+            reasons.append("red_candle")
+        if change_15m < min_15m:
+            reasons.append(f"15m_{change_15m:.1f}%")
+        if explosion_ratio < min_vol:
+            reasons.append(f"vol_{explosion_ratio:.1f}x")
+        if upper_wick > 0.35:
+            reasons.append(f"wick_{upper_wick*100:.0f}%")
+        if clv < 0.70:
+            reasons.append(f"clv_{clv:.2f}")
         if buy_pressure < 0.55:
-            reasons.append(f"buy_{buy_pressure*100:.1f}")
+            reasons.append(f"buy_{buy_pressure*100:.0f}%")
         if bid_ask_ratio < 0.9:
             reasons.append(f"ratio_{bid_ask_ratio:.2f}")
         if bid_depth < 15_000:
@@ -272,28 +360,33 @@ def detect_stage(symbol):
             return None, reasons
 
         return "BREAKOUT", {
-            "price": current_close,
-            "quiet_ratio": quiet_ratio,
-            "explosion_ratio": explosion_ratio,
-            "vol_5m_ratio": vol_15m_ratio,
+            "price": c_close,
+            "tier": tier,
+            "dead_hours": dead_hours,
+            "change_15m": change_15m,
             "change_1h": change_1h,
             "change_6h": change_6h,
+            "quiet_ratio": 1.0,
+            "explosion_ratio": explosion_ratio,
+            "vol_5m_ratio": explosion_ratio,
+            "rsi": rsi_15m,
             "buy_pressure": buy_pressure * 100,
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
             "bid_ask_ratio": bid_ask_ratio,
+            "prime": prime,
         }
     except Exception as e:
         return None, [f"exception_{e}"]
 
 
-def scan(session):
+def scan(session, ist_hour):
     print(f"Scanning {len(MONITORING_TOKENS)} monitoring tokens...")
     cooldown = load_cooldown()
     hits = []
     rejection = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(detect_stage, s): s for s in MONITORING_TOKENS}
+        futures = {executor.submit(detect_stage, s, ist_hour): s for s in MONITORING_TOKENS}
         for future in as_completed(futures):
             symbol = futures[future]
             stage_data = future.result()
@@ -323,19 +416,17 @@ def is_active_session(ist_hour, ist_minute):
     return start_min <= total_min <= end_min
 
 
-def get_session_label(hour, minute):
+def get_session_label(hour):
     if 8 <= hour <= 11:
         return "Asia"
-    if hour == 12 and minute >= 30:
-        return "Europe"
-    if 13 <= hour <= 15:
+    if 12 <= hour <= 15:
         return "Europe"
     return "Off"
 
 
 def main():
     ist = now_utc() + timedelta(hours=5, minutes=30)
-    session = get_session_label(ist.hour, ist.minute)
+    session = get_session_label(ist.hour)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
 
     if not is_active_session(ist.hour, ist.minute):
@@ -352,32 +443,56 @@ def main():
         except Exception:
             SIGNALS_FILE.write_text('{"signals": []}')
 
-    hits = scan(session)
+    hits = scan(session, ist.hour)
     print(f"Found {len(hits)} signals")
 
+    fired_symbols = set()
     for h in hits:
-        header = f"🚀 MONITORING BREAKOUT [{session}]"
+        tier = h.get("tier", 2)
+        tier_label = "Tier 1 — Own Chain" if tier == 1 else "Tier 2 — Token"
+        prime_flag = " ⚡PRIME" if h.get("prime") else ""
+        header = f"🚀 BREAKOUT [{tier_label}]{prime_flag} [{session}]"
 
         record_alert(h["symbol"], "BREAKOUT")
         log_signal(h["symbol"], "BREAKOUT", h, session)
+        fired_symbols.add(h["symbol"])
+
+        stop = h["price"] * 0.97
+        target_5 = h["price"] * 1.05
+        target_10 = h["price"] * 1.10
+        target_25 = h["price"] * 1.25
 
         msg = (
             f"{header}\n\n"
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
-            f"<b>Quiet Base:</b> {h['quiet_ratio']:.2f}x 24h avg\n"
-            f"<b>5m Explosion:</b> {h['explosion_ratio']:.2f}x\n"
-            f"<b>15m Volume:</b> {h['vol_5m_ratio']:.2f}x\n"
-            f"<b>1h Change:</b> {h['change_1h']:+.2f}%\n"
-            f"<b>6h Change:</b> {h['change_6h']:+.2f}%\n"
+            f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
+            f"<b>15m Change:</b> {h['change_15m']:+.2f}%\n"
+            f"<b>Volume:</b> {h['explosion_ratio']:.2f}x quiet\n"
+            f"<b>RSI(15m):</b> {h['rsi']:.1f}\n"
             f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
+            f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
-            f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"⏳ WATCHING — Dip watcher is tracking for entry. Wait for ENTER signal."
+            f"<b>Entry:</b> {format_price(h['price'])}\n"
+            f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
+            f"<b>Targets:</b> +5% {format_price(target_5)} | +10% {format_price(target_10)} | +25% {format_price(target_25)}\n\n"
+            f"✅ ENTER NOW — Buy at market. SL {format_price(stop)}."
         )
         send_telegram(msg)
+
+    # Ecosystem pair check
+    for fired in fired_symbols:
+        pair = ECOSYSTEM_PAIRS.get(fired)
+        if pair and pair not in fired_symbols:
+            pair_msg = (
+                f"🔗 <b>ECOSYSTEM ROTATION</b>\n\n"
+                f"<b>{fired}</b> just fired.\n"
+                f"<b>{pair}</b> is paired (same ecosystem).\n"
+                f"Watch {pair} next — whales often rotate between them."
+            )
+            send_telegram(pair_msg)
 
 
 def safe_main():
