@@ -15,7 +15,7 @@ REJECT_FILE = Path("monitor_rejections.json")
 HISTORY_FILE = Path("monitor_history.json")
 SIGNALS_FILE = Path("monitor_signals.json")
 COOLDOWN_MINUTES = 45
-COOLDOWN_BREAKOUT_MINUTES = 5
+COOLDOWN_BREAKOUT_MINUTES = 60
 HISTORY_HOURS = 6
 
 MONITORING_TOKENS = [
