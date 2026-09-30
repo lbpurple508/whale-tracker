@@ -37,15 +37,6 @@ jobs:
           path: monitor/
           if_no_artifact_found: ignore
 
-      - name: Download futures signals
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: futures-signals
-          workflow: futures_scanner.yml
-          path: futures/
-          if_no_artifact_found: ignore
-
       - name: Restore tracker state
         uses: actions/cache/restore@v4
         with:
