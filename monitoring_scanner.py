@@ -15,7 +15,7 @@ REJECT_FILE = Path("monitor_rejections.json")
 HISTORY_FILE = Path("monitor_history.json")
 SIGNALS_FILE = Path("monitor_signals.json")
 COOLDOWN_MINUTES = 45
-COOLDOWN_BREAKOUT_MINUTES = 60
+COOLDOWN_BREAKOUT_MINUTES = 180
 HISTORY_HOURS = 6
 
 MONITORING_TOKENS = [
@@ -326,8 +326,10 @@ def detect_stage(symbol):
         breakout_conditions = [
             current_close > current_open,
             vol_ratio >= 1.5,
-            1.5 <= change_1h <= 8,
+            1.5 <= change_1h <= 5,
+            40 <= rsi_now <= 78,
             rsi_2h_ago < 75,
+            change_6h <= 15,
             buy_pressure >= 0.50,
             bid_ask_ratio >= 0.7,
             bid_depth >= 15_000,
