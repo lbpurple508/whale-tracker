@@ -17,7 +17,7 @@ MAX_SIGNAL_AGE_HOURS = 48
 MAX_PUMPED_AGE_HOURS = 72
 
 SIGNAL_SOURCES = [
-    ("MONITOR", Path("monitor/monitor_signals.json")),
+    ("MONITOR", Path("dip/dip_confirmed.json")),
 ]
 
 VALID_SOURCES = ("MONITOR",)
@@ -29,8 +29,6 @@ def now_utc():
 
 def should_track(source, stage):
     if source not in VALID_SOURCES:
-        return False
-    if source == "MONITOR" and stage not in ("BREAKOUT", "ACCUMULATION"):
         return False
     return True
 
@@ -111,19 +109,10 @@ def clean_state(state):
     if not isinstance(signals, list):
         return 0
     before = len(signals)
-    filtered = [
+    state["signals"] = [
         s for s in signals
         if isinstance(s, dict) and should_track(s.get("source", ""), s.get("stage", ""))
     ]
-    seen = {}
-    deduped = []
-    for s in filtered:
-        key = f"{s.get('source')}|{s.get('symbol')}|{s.get('stage')}"
-        if key in seen:
-            continue
-        seen[key] = True
-        deduped.append(s)
-    state["signals"] = deduped
     return before - len(state["signals"])
 
 
@@ -134,9 +123,6 @@ def load_new_signals(state):
     signals = state.get("signals", [])
     if not isinstance(signals, list):
         signals = []
-    recent = state.get("recent", {})
-    if not isinstance(recent, dict):
-        recent = {}
     added = 0
     now = now_utc()
 
@@ -169,14 +155,6 @@ def load_new_signals(state):
                 seen[key] = True
                 continue
 
-            recent_key = f"{source}|{symbol}|{stage}"
-            last_ts = recent.get(recent_key)
-            if last_ts:
-                last_dt = parse_ts(last_ts)
-                if last_dt and (now - last_dt).total_seconds() < 3600:
-                    seen[key] = True
-                    continue
-
             entry_dt = parse_ts(ts)
             if not entry_dt:
                 continue
@@ -192,11 +170,13 @@ def load_new_signals(state):
                 "entry": entry,
                 "entry_ts": ts,
                 "stage": stage,
+                "signal_price": s.get("signal_price", entry),
+                "dip_pct": s.get("dip_pct", 0.0),
                 "peak": entry,
                 "peak_pct": 0.0,
                 "peak_ts": ts,
                 "dip": entry,
-                "dip_pct": 0.0,
+                "dip_pct_tracked": 0.0,
                 "dip_ts": ts,
                 "current": entry,
                 "current_pct": 0.0,
@@ -208,12 +188,10 @@ def load_new_signals(state):
                 "exit_pct": None,
             })
             seen[key] = True
-            recent[recent_key] = ts
             added += 1
 
     state["signals"] = signals
     state["seen"] = seen
-    state["recent"] = recent
     return added
 
 
@@ -253,7 +231,7 @@ def update_signals(state):
 
         if p < s["dip"]:
             s["dip"] = p
-            s["dip_pct"] = ((p - s["entry"]) / s["entry"]) * 100
+            s["dip_pct_tracked"] = ((p - s["entry"]) / s["entry"]) * 100
             s["dip_ts"] = now.isoformat()
             t = parse_ts(s["entry_ts"])
             if t:
@@ -281,26 +259,6 @@ def update_signals(state):
     return updated
 
 
-def build_stage_stats(signals, stage):
-    items = [s for s in signals if s.get("stage") == stage]
-    total = len(items)
-    wins = len([s for s in items if s.get("status") in ("PUMPED", "CLOSED") and s.get("peak_pct", 0) >= PUMP_TARGET])
-    losses = len([s for s in items if s.get("status") == "STOPPED"])
-    active = len([s for s in items if s.get("status") == "ACTIVE"])
-    closed = wins + losses
-    win_rate = (wins / closed * 100) if closed > 0 else 0
-    loss_rate = (losses / closed * 100) if closed > 0 else 0
-    return {
-        "total": total,
-        "wins": wins,
-        "losses": losses,
-        "active": active,
-        "closed": closed,
-        "win_rate": win_rate,
-        "loss_rate": loss_rate,
-    }
-
-
 def build_report(state):
     signals = state.get("signals", [])
     if not isinstance(signals, list):
@@ -311,6 +269,12 @@ def build_report(state):
     stopped = [s for s in signals if s.get("status") == "STOPPED"]
     closed = [s for s in signals if s.get("status") == "CLOSED"]
 
+    wins = len(pumped) + len([s for s in closed if s.get("peak_pct", 0) >= PUMP_TARGET])
+    losses = len(stopped)
+    closed_total = wins + losses
+    wr = (wins / closed_total * 100) if closed_total > 0 else 0
+    lr = (losses / closed_total * 100) if closed_total > 0 else 0
+
     lines = ["📊 <b>SIGNAL TRACKER</b>", ""]
     lines.append(
         f"Total: <b>{total}</b> | "
@@ -319,32 +283,15 @@ def build_report(state):
         f"🔴 Stopped: <b>{len(stopped)}</b> | "
         f"⚫ Closed: <b>{len(closed)}</b>"
     )
-
-    lines.append("")
-    lines.append("📈 <b>BY STAGE</b>")
-    for stage in ["ACCUMULATION", "BREAKOUT"]:
-        st = build_stage_stats(signals, stage)
-        if st["total"] == 0:
-            continue
-        if st["closed"] > 0:
-            wr = f"{st['win_rate']:.0f}%"
-            lr = f"{st['loss_rate']:.0f}%"
-        else:
-            wr = "—"
-            lr = "—"
-        icon = "🐋" if stage == "ACCUMULATION" else "🚀"
-        lines.append(
-            f"• {icon} <b>{stage}</b>: {st['total']} total | "
-            f"✅ {st['wins']} | ❌ {st['losses']} | 🟡 {st['active']}"
-        )
-        lines.append(f"   WR: {wr} | LR: {lr}")
+    if closed_total > 0:
+        lines.append(f"WR: <b>{wr:.0f}%</b> | LR: <b>{lr:.0f}%</b> ({closed_total} closed)")
 
     if pumped:
         lines.append("")
         lines.append("🟢 <b>PUMPED (+30%+)</b>")
         for s in pumped[-5:]:
             lines.append(
-                f"• <b>{s['symbol']}</b> [{s['stage']}] "
+                f"• <b>{s['symbol']}</b> "
                 f"{format_price(s['entry'])} → +{s['peak_pct']:.2f}% "
                 f"in {s['time_to_peak_min']}m"
             )
@@ -354,9 +301,9 @@ def build_report(state):
         lines.append("🟡 <b>ACTIVE</b>")
         for s in active[-5:]:
             lines.append(
-                f"• <b>{s['symbol']}</b> [{s['stage']}] "
+                f"• <b>{s['symbol']}</b> "
                 f"{format_price(s['entry'])} → {s['current_pct']:+.2f}% "
-                f"(peak {s['peak_pct']:+.2f}%, dip {s['dip_pct']:+.2f}%)"
+                f"(peak {s['peak_pct']:+.2f}%, dip {s['dip_pct_tracked']:+.2f}%)"
             )
 
     if stopped:
@@ -364,7 +311,7 @@ def build_report(state):
         lines.append("🔴 <b>STOPPED (-3%)</b>")
         for s in stopped[-5:]:
             lines.append(
-                f"• <b>{s['symbol']}</b> [{s['stage']}] "
+                f"• <b>{s['symbol']}</b> "
                 f"{format_price(s['entry'])} → {s.get('exit_pct', 0):+.2f}%"
             )
 
@@ -377,8 +324,6 @@ def main():
         state["signals"] = []
     if "seen" not in state or not isinstance(state["seen"], dict):
         state["seen"] = {}
-    if "recent" not in state or not isinstance(state["recent"], dict):
-        state["recent"] = {}
 
     cleaned = clean_state(state)
     print(f"Cleaned: {cleaned} invalid signals removed")
