@@ -171,7 +171,8 @@ def log_rejection(symbol, reasons, price=0, change_24h=0):
         data[symbol]["last_seen"] = now_utc().isoformat()
         data[symbol]["price"] = price
         data[symbol]["change_24h"] = change_24h
-        data[symbol]["top_reason"] = reasons[0] if reasons else "unknown"
+        # Keep ALL failing reasons joined
+        data[symbol]["top_reason"] = ",".join(reasons) if reasons else "unknown"
         if len(data) > 200:
             valid = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("last_seen")}
             sorted_items = sorted(valid.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
@@ -245,34 +246,43 @@ def detect_stage(symbol):
         bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        breakout_conditions = [
-            current_close > current_open,
-            quiet_ratio < 0.75,
-            explosion_ratio >= 5,
-            vol_15m_ratio >= 3,
-            change_1h >= 1.0,
-            change_1h <= 25,
-            buy_pressure >= 0.55,
-            bid_ask_ratio >= 0.9,
-            bid_depth >= 15_000,
-            ask_depth >= 15_000,
-        ]
-        if all(breakout_conditions):
-            return "BREAKOUT", {
-                "price": current_close,
-                "quiet_ratio": quiet_ratio,
-                "explosion_ratio": explosion_ratio,
-                "vol_5m_ratio": vol_15m_ratio,
-                "change_1h": change_1h,
-                "change_6h": change_6h,
-                "buy_pressure": buy_pressure * 100,
-                "bid_depth": bid_depth,
-                "ask_depth": ask_depth,
-                "bid_ask_ratio": bid_ask_ratio,
-            }
+        # Log every failing filter so we know why each coin was rejected
+        if current_close <= current_open:
+            reasons.append("candle_red")
+        if quiet_ratio >= 0.75:
+            reasons.append(f"quiet_{quiet_ratio:.2f}")
+        if explosion_ratio < 5:
+            reasons.append(f"expl_{explosion_ratio:.1f}x")
+        if vol_15m_ratio < 3:
+            reasons.append(f"vol15m_{vol_15m_ratio:.1f}x")
+        if change_1h < 1.0:
+            reasons.append(f"1h_low_{change_1h:.1f}")
+        if change_1h > 25:
+            reasons.append(f"1h_high_{change_1h:.1f}")
+        if buy_pressure < 0.55:
+            reasons.append(f"buy_{buy_pressure*100:.1f}")
+        if bid_ask_ratio < 0.9:
+            reasons.append(f"ratio_{bid_ask_ratio:.2f}")
+        if bid_depth < 15_000:
+            reasons.append(f"bid_{bid_depth:.0f}")
+        if ask_depth < 15_000:
+            reasons.append(f"ask_{ask_depth:.0f}")
 
-        reasons.append(f"expl_{explosion_ratio:.1f}x")
-        return None, reasons
+        if reasons:
+            return None, reasons
+
+        return "BREAKOUT", {
+            "price": current_close,
+            "quiet_ratio": quiet_ratio,
+            "explosion_ratio": explosion_ratio,
+            "vol_5m_ratio": vol_15m_ratio,
+            "change_1h": change_1h,
+            "change_6h": change_6h,
+            "buy_pressure": buy_pressure * 100,
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+            "bid_ask_ratio": bid_ask_ratio,
+        }
     except Exception as e:
         return None, [f"exception_{e}"]
 
