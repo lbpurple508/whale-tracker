@@ -13,17 +13,10 @@ BINANCE_API = "https://data-api.binance.vision"
 DIP_STATE_FILE = Path("dip_state.json")
 DIP_CONFIRMED_FILE = Path("dip_confirmed.json")
 
-# Timing
-WATCH_END_MIN = 30          # close decision after 30 minutes
-
-# Dip thresholds (relative to signal price)
-MISSED_PUMP_PCT = 1.0       # +1% above signal → MISSED (pumped without dip)
-ENTER_DIP_PCT = -1.5        # -1.5% is dip entry sweet spot
-FAIL_PCT = -3.0             # -3% below signal → FAILED (setup broke)
-
-# Entry window: dip must be between ENTER_DIP_PCT and FAIL_PCT
-DIP_ENTRY_MIN = -3.0        # deeper bound of entry
-DIP_ENTRY_MAX = -1.5        # shallower bound
+WATCH_END_MIN = 90
+MISSED_PUMP_PCT = 3.0
+DIP_ENTRY_MIN = -3.5
+DIP_ENTRY_MAX = -1.0
 
 
 def now_utc():
@@ -102,7 +95,6 @@ def get_price(symbol):
 
 
 def load_pending_signals(state):
-    """Load new signals from monitor_signals.json into pending list."""
     sig_file = Path("monitor/monitor_signals.json")
     data = load_json(sig_file)
     entries = data.get("signals", [])
@@ -158,6 +150,10 @@ def load_pending_signals(state):
             "highest_price": sp,
             "highest_ts": ts,
             "status": "WAITING",
+            "entered": False,
+            "missed_notified": False,
+            "failed_notified": False,
+            "stale_notified": False,
         })
         seen[key] = True
         added += 1
@@ -167,8 +163,7 @@ def load_pending_signals(state):
     return added
 
 
-def decide(p, current_price, current_ts, now):
-    """Return (decision, reason) or (None, None) if still waiting."""
+def decide(p, current_price, now):
     sig = p["signal_price"]
     low = min(p["lowest_price"], current_price)
     high = max(p["highest_price"], current_price)
@@ -176,17 +171,14 @@ def decide(p, current_price, current_ts, now):
     dip_pct = (low - sig) / sig * 100
     up_pct = (high - sig) / sig * 100
 
-    # Check dip first (dip is our goal)
     if dip_pct <= DIP_ENTRY_MIN and dip_pct >= DIP_ENTRY_MAX:
         return "ENTER", dip_pct
     if dip_pct < DIP_ENTRY_MIN:
         return "FAILED", dip_pct
 
-    # No dip yet. Check if pumped.
     if up_pct >= MISSED_PUMP_PCT:
         return "MISSED", up_pct
 
-    # Timeout
     signal_dt = parse_ts(p["signal_ts"])
     if signal_dt:
         age_min = (now - signal_dt).total_seconds() / 60
@@ -232,7 +224,6 @@ def main():
             still_waiting.append(p)
             continue
 
-        # Update high/low
         if cp < p["lowest_price"]:
             p["lowest_price"] = cp
             p["lowest_ts"] = now.isoformat()
@@ -240,7 +231,7 @@ def main():
             p["highest_price"] = cp
             p["highest_ts"] = now.isoformat()
 
-        decision, pct = decide(p, cp, now, now)
+        decision, pct = decide(p, cp, now)
 
         if decision is None:
             still_waiting.append(p)
@@ -249,6 +240,10 @@ def main():
         sig = p["signal_price"]
 
         if decision == "ENTER":
+            if p.get("entered"):
+                continue
+            p["entered"] = True
+
             entry_price = p["lowest_price"]
             stop_price = entry_price * 0.97
             dip_at_entry = (entry_price - sig) / sig * 100
@@ -287,6 +282,10 @@ def main():
             print(f"ENTER: {p['symbol']} at {entry_price} (dip {dip_at_entry:.2f}%)")
 
         elif decision == "MISSED":
+            if p.get("missed_notified"):
+                continue
+            p["missed_notified"] = True
+
             msg = (
                 f"⚠️ <b>MISSED — {p['symbol']}</b>\n\n"
                 f"Signal: {format_price(sig)}\n"
@@ -298,6 +297,10 @@ def main():
             print(f"MISSED: {p['symbol']}")
 
         elif decision == "FAILED":
+            if p.get("failed_notified"):
+                continue
+            p["failed_notified"] = True
+
             msg = (
                 f"❌ <b>FAILED — {p['symbol']}</b>\n\n"
                 f"Signal: {format_price(sig)}\n"
@@ -308,11 +311,15 @@ def main():
             print(f"FAILED: {p['symbol']}")
 
         elif decision == "STALE":
+            if p.get("stale_notified"):
+                continue
+            p["stale_notified"] = True
+
             msg = (
                 f"⏸️ <b>STALE — {p['symbol']}</b>\n\n"
                 f"Signal: {format_price(sig)}\n"
                 f"Current: {format_price(cp)} ({pct:+.2f}%)\n"
-                f"30 min passed. No dip. Skipping."
+                f"90 min passed. No dip. Skipping."
             )
             send_telegram(msg)
             print(f"STALE: {p['symbol']}")
@@ -320,7 +327,6 @@ def main():
     state["pending"] = still_waiting
     save_json(DIP_STATE_FILE, state)
 
-    # Cap confirmed list
     if len(confirmed["signals"]) > 500:
         confirmed["signals"] = confirmed["signals"][-500:]
     save_json(DIP_CONFIRMED_FILE, confirmed)
