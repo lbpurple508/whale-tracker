@@ -162,7 +162,7 @@ def log_signal(symbol, stage, data, session):
             "tier": data.get("tier"),
             "price": data.get("price"),
             "dead_hours": data.get("dead_hours"),
-            "change_15m": data.get("change_15m"),
+            "change_5m": data.get("change_5m"),
             "volume_ratio": data.get("explosion_ratio"),
             "rsi": data.get("rsi"),
             "buy_pressure": data.get("buy_pressure"),
@@ -262,72 +262,86 @@ def detect_stage(symbol, ist_hour):
         if not isinstance(k15, list) or len(k15) < 50:
             return None, ["not_enough_15m"]
 
-        completed = k15[-2]
-        prev_completed = k15[-3]
+        url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=30"
+        r_5m = requests.get(url_5m, timeout=10)
+        k5 = r_5m.json()
+        if not isinstance(k5, list) or len(k5) < 15:
+            return None, ["not_enough_5m"]
 
-        c_open = float(completed[1])
-        c_high = float(completed[2])
-        c_low = float(completed[3])
-        c_close = float(completed[4])
-        c_vol = float(completed[5])
+        # 5m trigger candle
+        completed_5m = k5[-2]
+        prev_completed_5m = k5[-3]
+
+        c_open = float(completed_5m[1])
+        c_high = float(completed_5m[2])
+        c_low = float(completed_5m[3])
+        c_close = float(completed_5m[4])
+        c_vol = float(completed_5m[5])
 
         if c_close <= 0 or c_low <= 0:
             return None, ["bad_price"]
 
-        prev_close = float(prev_completed[4])
+        prev_close = float(prev_completed_5m[4])
         if prev_close <= 0:
             return None, ["bad_prev"]
-        change_15m = ((c_close - prev_close) / prev_close) * 100
+        change_5m = ((c_close - prev_close) / prev_close) * 100
 
+        # 1h and 6h changes using 15m for context
         price_1h_ago = float(k15[-6][4])
         change_1h = ((c_close - price_1h_ago) / price_1h_ago) * 100
 
         price_6h_ago = float(k15[-26][4])
         change_6h = ((c_close - price_6h_ago) / price_6h_ago) * 100
 
-        quiet_vols = [float(k[5]) for k in k15[-26:-2]]
-        quiet_avg = sum(quiet_vols) / len(quiet_vols) if quiet_vols else 0
-        if quiet_avg <= 0:
+        # Volume base: 5m quiet average over last 20 completed candles
+        quiet_vols_5m = [float(k[5]) for k in k5[-22:-2]]
+        quiet_avg_5m = sum(quiet_vols_5m) / len(quiet_vols_5m) if quiet_vols_5m else 0
+        if quiet_avg_5m <= 0:
             return None, ["quiet_avg_zero"]
-        explosion_ratio = c_vol / quiet_avg
+        explosion_ratio = c_vol / quiet_avg_5m
 
+        # Candle quality
         rng = c_high - c_low
         if rng <= 0:
             return None, ["zero_range"]
         upper_wick = (c_high - max(c_open, c_close)) / rng
         clv = (c_close - c_low) / rng
 
+        # Dead base: count hours flat on 15m
         dead_hours = count_dead_base_hours(k15)
 
+        # RSI 15m (informational)
         closes_15m = [float(k[4]) for k in k15[:-1]]
         rsi_15m = compute_rsi(closes_15m, 14)
 
-        recent_taker = sum(float(k[9]) for k in k15[-5:-1])
-        recent_total = sum(float(k[5]) for k in k15[-5:-1])
+        # Buy pressure from last 4 completed 5m candles
+        recent_taker = sum(float(k[9]) for k in k5[-5:-1])
+        recent_total = sum(float(k[5]) for k in k5[-5:-1])
         buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
 
         bid_depth, ask_depth = check_depth(symbol, c_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
+        # Tier thresholds
         tier = 1 if symbol in OWN_CHAIN else 2
         if tier == 1:
-            min_15m = 2.5
-            min_vol = 1.5
-        else:
-            min_15m = 3.0
+            min_5m = 1.2
             min_vol = 2.0
+        else:
+            min_5m = 1.5
+            min_vol = 2.5
 
         prime = PRIME_START_H <= ist_hour < PRIME_END_H
         if prime:
-            min_15m -= 0.5
-            min_vol -= 0.3
+            min_5m -= 0.3
+            min_vol -= 0.5
 
         if c_close <= c_open:
             reasons.append("red_candle")
-        if change_15m < min_15m:
-            reasons.append(f"15m_{change_15m:.1f}%")
-        if change_15m > 12.0:
-            reasons.append(f"15m_high_{change_15m:.1f}%")
+        if change_5m < min_5m:
+            reasons.append(f"5m_{change_5m:.1f}%")
+        if change_5m > 6.0:
+            reasons.append(f"5m_high_{change_5m:.1f}%")
         if explosion_ratio < min_vol:
             reasons.append(f"vol_{explosion_ratio:.1f}x")
         if upper_wick > 0.35:
@@ -350,7 +364,7 @@ def detect_stage(symbol, ist_hour):
             "price": c_close,
             "tier": tier,
             "dead_hours": dead_hours,
-            "change_15m": change_15m,
+            "change_5m": change_5m,
             "change_1h": change_1h,
             "change_6h": change_6h,
             "quiet_ratio": 1.0,
@@ -454,7 +468,7 @@ def main():
             f"<b>Coin:</b> {h['symbol']}\n"
             f"<b>Price:</b> {format_price(h['price'])}\n"
             f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
-            f"<b>15m Change:</b> {h['change_15m']:+.2f}%\n"
+            f"<b>5m Change:</b> {h['change_5m']:+.2f}%\n"
             f"<b>Volume:</b> {h['explosion_ratio']:.2f}x quiet\n"
             f"<b>RSI(15m):</b> {h['rsi']:.1f}\n"
             f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
