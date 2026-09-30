@@ -16,6 +16,7 @@ HISTORY_FILE = Path("monitor_history.json")
 SIGNALS_FILE = Path("monitor_signals.json")
 COOLDOWN_MINUTES = 45
 COOLDOWN_BREAKOUT_MINUTES = 180
+COOLDOWN_ACCUMULATION_MINUTES = 240
 HISTORY_HOURS = 6
 
 MONITORING_TOKENS = [
@@ -104,7 +105,12 @@ def load_cooldown():
         if t is None:
             continue
         stage = info.get("stage", "COILING")
-        minutes = COOLDOWN_BREAKOUT_MINUTES if stage == "BREAKOUT" else COOLDOWN_MINUTES
+        if stage == "BREAKOUT":
+            minutes = COOLDOWN_BREAKOUT_MINUTES
+        elif stage == "ACCUMULATION":
+            minutes = COOLDOWN_ACCUMULATION_MINUTES
+        else:
+            minutes = COOLDOWN_MINUTES
         if (now - t).total_seconds() < minutes * 60:
             cleaned[sym] = info
     return cleaned
@@ -117,7 +123,11 @@ def is_on_cooldown(symbol, cooldown, stage):
     if not isinstance(entry, dict):
         return False
     existing_stage = entry.get("stage", "COILING")
+    # Breakout bypasses coiling
     if stage == "BREAKOUT" and existing_stage == "COILING":
+        return False
+    # Breakout bypasses accumulation (upgrade signal)
+    if stage == "BREAKOUT" and existing_stage == "ACCUMULATION":
         return False
     return True
 
@@ -234,6 +244,28 @@ def btc_is_healthy():
         return True
 
 
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0 and avg_gain == 0:
+        return 50
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
 def compute_rsi_series(closes, period=14):
     if len(closes) < period + 1:
         return []
@@ -274,6 +306,70 @@ def check_depth(symbol, price):
         return bid_depth, ask_depth
     except Exception:
         return 0, 0
+
+
+def check_accumulation(symbol, k1h, current_close):
+    """Check whale accumulation pattern on 1h timeframe."""
+    if len(k1h) < 25:
+        return None, ["not_enough_1h"]
+
+    # Higher lows: last 8 completed 1h candles
+    lows_8h = [float(k[3]) for k in k1h[-9:-1]]
+    if len(lows_8h) < 8:
+        return None, ["not_enough_lows"]
+    higher_lows = sum(1 for i in range(1, len(lows_8h)) if lows_8h[i] > lows_8h[i-1])
+    if higher_lows < 4:
+        return None, [f"higher_lows_{higher_lows}"]
+
+    # Range compression: last 8h range < first 8h range
+    highs_first = [float(k[2]) for k in k1h[-17:-9]]
+    lows_first = [float(k[3]) for k in k1h[-17:-9]]
+    if min(lows_first) == 0:
+        return None, ["zero_low_1h"]
+    range_first = (max(highs_first) - min(lows_first)) / min(lows_first) * 100
+
+    highs_last = [float(k[2]) for k in k1h[-9:-1]]
+    lows_last = [float(k[3]) for k in k1h[-9:-1]]
+    range_last = (max(highs_last) - min(lows_last)) / min(lows_last) * 100
+
+    if range_last >= range_first:
+        return None, [f"no_compression_{range_first:.1f}_{range_last:.1f}"]
+    if range_last > 5:
+        return None, [f"range_{range_last:.1f}%"]
+
+    # Volume building: last 4h avg vs prior 12h avg
+    vol_last_4h = [float(k[5]) for k in k1h[-5:-1]]
+    vol_prior_12h = [float(k[5]) for k in k1h[-17:-5]]
+    if not vol_last_4h or not vol_prior_12h:
+        return None, ["vol_missing"]
+    avg_last = sum(vol_last_4h) / len(vol_last_4h)
+    avg_prior = sum(vol_prior_12h) / len(vol_prior_12h)
+    if avg_prior == 0:
+        return None, ["avg_prior_zero"]
+    vol_ratio_1h = avg_last / avg_prior
+    if vol_ratio_1h < 1.2 or vol_ratio_1h > 3.0:
+        return None, [f"vol_1h_{vol_ratio_1h:.1f}x"]
+
+    # RSI flat 35-60 (loading zone)
+    closes_1h = [float(k[4]) for k in k1h[:-1]]
+    rsi_1h = compute_rsi(closes_1h, 14)
+    if rsi_1h < 35 or rsi_1h > 60:
+        return None, [f"rsi_1h_{rsi_1h:.1f}"]
+
+    # 6h change small (-3 to +5)
+    price_6h_ago_1h = float(k1h[-7][4])
+    change_6h_1h = ((current_close - price_6h_ago_1h) / price_6h_ago_1h) * 100
+    if change_6h_1h < -3 or change_6h_1h > 5:
+        return None, [f"6h_chg_{change_6h_1h:.1f}%"]
+
+    return {
+        "higher_lows": higher_lows,
+        "range_first": range_first,
+        "range_last": range_last,
+        "vol_ratio_1h": vol_ratio_1h,
+        "rsi_1h": rsi_1h,
+        "change_6h_1h": change_6h_1h,
+    }, []
 
 
 def detect_stage(symbol):
@@ -323,6 +419,7 @@ def detect_stage(symbol):
         bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
+        # === BREAKOUT (priority 1) ===
         breakout_conditions = [
             current_close > current_open,
             vol_ratio >= 1.5,
@@ -350,6 +447,34 @@ def detect_stage(symbol):
                 "bid_ask_ratio": bid_ask_ratio,
             }
 
+        # === ACCUMULATION (priority 2) — 1h whale loading pattern ===
+        try:
+            url_1h = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=1h&limit=30"
+            r_1h = requests.get(url_1h, timeout=10)
+            k1h = r_1h.json()
+            if isinstance(k1h, list) and len(k1h) >= 25:
+                acc_result, acc_reasons = check_accumulation(symbol, k1h, current_close)
+                if acc_result:
+                    return "ACCUMULATION", {
+                        "price": current_close,
+                        "vol_ratio": acc_result["vol_ratio_1h"],
+                        "rsi": acc_result["rsi_1h"],
+                        "rsi_2h_ago": acc_result["rsi_1h"],
+                        "change_1h": change_1h,
+                        "change_6h": change_6h,
+                        "range_pct": range_pct,
+                        "buy_pressure": buy_pressure * 100,
+                        "bid_depth": bid_depth,
+                        "ask_depth": ask_depth,
+                        "bid_ask_ratio": bid_ask_ratio,
+                        "higher_lows": acc_result["higher_lows"],
+                    }
+                else:
+                    reasons.extend(acc_reasons)
+        except Exception as e:
+            reasons.append(f"accum_err_{e}")
+
+        # === COILING (priority 3) — shakeout watch ===
         coiling_reasons = []
         if rsi_now < 30 or rsi_now > 55:
             coiling_reasons.append(f"RSI_{rsi_now:.1f}")
@@ -376,7 +501,8 @@ def detect_stage(symbol):
             coiling_reasons.append(f"ratio_{bid_ask_ratio:.2f}")
 
         if coiling_reasons:
-            return None, coiling_reasons
+            reasons.extend(coiling_reasons)
+            return None, reasons
 
         return "COILING", {
             "price": current_close,
@@ -476,6 +602,8 @@ def main():
 
         if stage == "BREAKOUT":
             header = f"🚀 MONITORING BREAKOUT [{session}]"
+        elif stage == "ACCUMULATION":
+            header = f"🐋 WHALE ACCUMULATION [{session}]"
         elif count == 1:
             header = f"⭐ MONITORING COILING (WATCH) [{session}]"
         elif count == 2:
@@ -502,6 +630,12 @@ def main():
             f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
             f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
             f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
+        )
+
+        if stage == "ACCUMULATION" and "higher_lows" in h:
+            msg += f"<b>Higher Lows:</b> {h['higher_lows']}/7\n"
+
+        msg += (
             f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
             f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
             f"<b>Trail:</b> +3%→BE, +5%→+2%, +10%→+6%, +25%→+18%\n\n"
@@ -509,6 +643,11 @@ def main():
 
         if stage == "BREAKOUT":
             msg += "✅ ENTER NOW — Buy at current price. SL -3%."
+        elif stage == "ACCUMULATION":
+            msg += (
+                "🐋 EARLY ENTRY — Whales loading. "
+                "Buy half position now. BREAKOUT will confirm later."
+            )
         else:
             msg += "⏸️ WAIT — Do NOT enter yet. Wait for BREAKOUT alert."
 
