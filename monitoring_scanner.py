@@ -123,10 +123,8 @@ def is_on_cooldown(symbol, cooldown, stage):
     if not isinstance(entry, dict):
         return False
     existing_stage = entry.get("stage", "COILING")
-    # Breakout bypasses coiling
     if stage == "BREAKOUT" and existing_stage == "COILING":
         return False
-    # Breakout bypasses accumulation (upgrade signal)
     if stage == "BREAKOUT" and existing_stage == "ACCUMULATION":
         return False
     return True
@@ -308,20 +306,17 @@ def check_depth(symbol, price):
         return 0, 0
 
 
-def check_accumulation(symbol, k1h, current_close):
-    """Check whale accumulation pattern on 1h timeframe."""
+def check_accumulation(symbol, k1h, current_close, buy_pressure):
     if len(k1h) < 25:
         return None, ["not_enough_1h"]
 
-    # Higher lows: last 8 completed 1h candles
     lows_8h = [float(k[3]) for k in k1h[-9:-1]]
     if len(lows_8h) < 8:
         return None, ["not_enough_lows"]
     higher_lows = sum(1 for i in range(1, len(lows_8h)) if lows_8h[i] > lows_8h[i-1])
-    if higher_lows < 4:
+    if higher_lows < 5:
         return None, [f"higher_lows_{higher_lows}"]
 
-    # Range compression: last 8h range < first 8h range
     highs_first = [float(k[2]) for k in k1h[-17:-9]]
     lows_first = [float(k[3]) for k in k1h[-17:-9]]
     if min(lows_first) == 0:
@@ -337,7 +332,6 @@ def check_accumulation(symbol, k1h, current_close):
     if range_last > 5:
         return None, [f"range_{range_last:.1f}%"]
 
-    # Volume building: last 4h avg vs prior 12h avg
     vol_last_4h = [float(k[5]) for k in k1h[-5:-1]]
     vol_prior_12h = [float(k[5]) for k in k1h[-17:-5]]
     if not vol_last_4h or not vol_prior_12h:
@@ -350,17 +344,18 @@ def check_accumulation(symbol, k1h, current_close):
     if vol_ratio_1h < 1.2 or vol_ratio_1h > 3.0:
         return None, [f"vol_1h_{vol_ratio_1h:.1f}x"]
 
-    # RSI flat 35-60 (loading zone)
     closes_1h = [float(k[4]) for k in k1h[:-1]]
     rsi_1h = compute_rsi(closes_1h, 14)
-    if rsi_1h < 35 or rsi_1h > 60:
+    if rsi_1h < 40 or rsi_1h > 60:
         return None, [f"rsi_1h_{rsi_1h:.1f}"]
 
-    # 6h change small (-3 to +5)
     price_6h_ago_1h = float(k1h[-7][4])
     change_6h_1h = ((current_close - price_6h_ago_1h) / price_6h_ago_1h) * 100
     if change_6h_1h < -3 or change_6h_1h > 5:
         return None, [f"6h_chg_{change_6h_1h:.1f}%"]
+
+    if buy_pressure < 0.55:
+        return None, [f"buy_low_{buy_pressure*100:.1f}%"]
 
     return {
         "higher_lows": higher_lows,
@@ -419,18 +414,17 @@ def detect_stage(symbol):
         bid_depth, ask_depth = check_depth(symbol, current_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        # === BREAKOUT (priority 1) ===
         breakout_conditions = [
             current_close > current_open,
-            vol_ratio >= 1.5,
-            1.5 <= change_1h <= 5,
-            40 <= rsi_now <= 78,
-            rsi_2h_ago < 75,
-            change_6h <= 15,
-            buy_pressure >= 0.50,
-            bid_ask_ratio >= 0.7,
-            bid_depth >= 15_000,
-            ask_depth >= 15_000,
+            vol_ratio >= 3,
+            2 <= change_1h <= 5,
+            55 <= rsi_now <= 72,
+            rsi_2h_ago < 65,
+            2 <= change_6h <= 12,
+            buy_pressure >= 0.55,
+            bid_ask_ratio >= 1.0,
+            bid_depth >= 25_000,
+            ask_depth >= 25_000,
         ]
         if all(breakout_conditions):
             return "BREAKOUT", {
@@ -447,13 +441,12 @@ def detect_stage(symbol):
                 "bid_ask_ratio": bid_ask_ratio,
             }
 
-        # === ACCUMULATION (priority 2) — 1h whale loading pattern ===
         try:
             url_1h = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=1h&limit=30"
             r_1h = requests.get(url_1h, timeout=10)
             k1h = r_1h.json()
             if isinstance(k1h, list) and len(k1h) >= 25:
-                acc_result, acc_reasons = check_accumulation(symbol, k1h, current_close)
+                acc_result, acc_reasons = check_accumulation(symbol, k1h, current_close, buy_pressure)
                 if acc_result:
                     return "ACCUMULATION", {
                         "price": current_close,
@@ -474,7 +467,6 @@ def detect_stage(symbol):
         except Exception as e:
             reasons.append(f"accum_err_{e}")
 
-        # === COILING (priority 3) — shakeout watch ===
         coiling_reasons = []
         if rsi_now < 30 or rsi_now > 55:
             coiling_reasons.append(f"RSI_{rsi_now:.1f}")
