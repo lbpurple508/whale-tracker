@@ -111,10 +111,19 @@ def clean_state(state):
     if not isinstance(signals, list):
         return 0
     before = len(signals)
-    state["signals"] = [
+    filtered = [
         s for s in signals
         if isinstance(s, dict) and should_track(s.get("source", ""), s.get("stage", ""))
     ]
+    seen = {}
+    deduped = []
+    for s in filtered:
+        key = f"{s.get('source')}|{s.get('symbol')}|{s.get('stage')}"
+        if key in seen:
+            continue
+        seen[key] = True
+        deduped.append(s)
+    state["signals"] = deduped
     return before - len(state["signals"])
 
 
