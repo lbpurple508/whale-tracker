@@ -28,13 +28,13 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Download monitor signals
+      - name: Download dip confirmed
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
-          name: monitoring-signals
-          workflow: monitoring_scanner.yml
-          path: monitor/
+          name: dip-confirmed
+          workflow: dip_watcher.yml
+          path: dip/
           if_no_artifact_found: ignore
 
       - name: Restore tracker state
