@@ -1,6 +1,7 @@
 import os
 import json
 import html
+import time
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -9,11 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+BASE_DIR = Path(__file__).resolve().parent
+
 BASE_URL = "https://data-api.binance.vision"
-COOLDOWN_FILE = Path("monitor_cooldown.json")
-REJECT_FILE = Path("monitor_rejections.json")
-HISTORY_FILE = Path("monitor_history.json")
-SIGNALS_FILE = Path("monitor/monitor_signals.json")
+COOLDOWN_FILE = BASE_DIR / "monitor_cooldown.json"
+REJECT_FILE = BASE_DIR / "monitor_rejections.json"
+HISTORY_FILE = BASE_DIR / "monitor_history.json"
+SIGNALS_FILE = BASE_DIR / "monitor" / "monitor_signals.json"
 
 COOLDOWN_MINUTES = 240
 COOLDOWN_BREAKOUT_MINUTES = 240
@@ -44,6 +47,17 @@ ECOSYSTEM_PAIRS = {
 PRIME_START_H = 10
 PRIME_END_H = 13
 
+MAX_BASE_RANGE_PCT = 4.0
+MIN_DIST_TO_BASE_HIGH = 0.5
+
+# Base window: 16 completed 15m candles = 4 hours
+BASE_BARS = 16
+# Volume baseline: previous 20 completed 5m candles
+VOLUME_BASELINE_BARS = 20
+# 1h = 12 x 5m; 6h = 72 x 5m
+ONE_HOUR_BARS = 12
+SIX_HOUR_BARS = 72
+
 
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -59,22 +73,45 @@ def format_price(p):
     return f"${p:.8f}"
 
 
+def http_get_json(url, timeout=10, retries=1):
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                return None
+            return None
+        except Exception:
+            if attempt < retries:
+                time.sleep(2)
+                continue
+            return None
+    return None
+
+
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram env vars missing")
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
             print(f"Telegram HTTP error: {response.status_code} - {response.text}")
-            return
+            return False
         body = response.json()
         if not body.get("ok"):
             print(f"Telegram API error: {body}")
+            return False
+        return True
     except Exception as e:
         print(f"Telegram error: {e}")
+        return False
 
 
 def load_json(path):
@@ -89,6 +126,7 @@ def load_json(path):
 
 def save_json(path, data):
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data))
         tmp.replace(path)
@@ -135,20 +173,15 @@ def cooldown_blocks(cooldown, symbol, stage):
     info = cooldown.get(symbol)
     if not isinstance(info, dict):
         return False
-
     ts = parse_ts_safe(info.get("ts", ""))
     if ts is None:
         return False
-
     age_min = (now_utc() - ts).total_seconds() / 60
     prev_stage = info.get("stage", "")
-
     if prev_stage == "BREAKOUT":
         return age_min < COOLDOWN_BREAKOUT_MINUTES
-
     if prev_stage == "WATCHLIST":
         return stage == "WATCHLIST" and age_min < COOLDOWN_WATCHLIST_MINUTES
-
     return False
 
 
@@ -199,7 +232,6 @@ def log_signal(symbol, stage, data, session):
             "bid_ask_ratio": data.get("bid_ask_ratio"),
             "change_1h": data.get("change_1h"),
             "change_6h": data.get("change_6h"),
-            # WATCHLIST-specific research fields
             "base_range_pct": data.get("base_range_pct"),
             "base_high": data.get("base_high"),
             "base_low": data.get("base_low"),
@@ -233,15 +265,12 @@ def log_rejection(symbol, reasons, price=0, change_24h=0):
 
 
 def check_depth(symbol, price):
-    """Return (bid, ask) or (None, None) on API failure."""
+    """Depth limited to 100 levels (weight 5 instead of 25)."""
+    url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
+    book = http_get_json(url, timeout=10, retries=1)
+    if not isinstance(book, dict):
+        return None, None
     try:
-        url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return None, None
-        book = r.json()
-        if not isinstance(book, dict):
-            return None, None
         low, high = price * 0.98, price * 1.02
         bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
         ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
@@ -272,10 +301,50 @@ def compute_rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def count_dead_base_hours(k15):
+def get_trigger_base(k15, k5):
+    """
+    FIX 1: Timestamp-aligned base.
+    Returns (base_high, base_low, base_slice) where base_slice is the
+    last BASE_BARS completed 15m candles whose close was BEFORE the
+    latest completed 5m trigger candle opened.
+    """
+    if len(k5) < 3 or len(k15) < BASE_BARS + 2:
+        return None, None, None
+
+    trigger_open_ms = int(k5[-2][0])
+
+    eligible = []
+    for k in k15:
+        try:
+            close_ms = int(k[6])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if close_ms <= trigger_open_ms:
+            eligible.append(k)
+
+    if len(eligible) < BASE_BARS:
+        return None, None, None
+
+    base_slice = eligible[-BASE_BARS:]
+
+    try:
+        base_high = max(float(k[2]) for k in base_slice)
+        base_low = min(float(k[3]) for k in base_slice)
+    except (TypeError, ValueError, IndexError):
+        return None, None, None
+
+    if base_low <= 0:
+        return None, None, None
+
+    return base_high, base_low, base_slice
+
+
+def count_dead_base_hours(base_slice):
+    """Counts consecutive quiet (range<1%) 15m candles within base_slice."""
+    if not base_slice:
+        return 0.0
     dead = 0
-    completed = k15[:-1]
-    for k in reversed(completed):
+    for k in reversed(base_slice):
         try:
             h = float(k[2])
             l = float(k[3])
@@ -291,67 +360,92 @@ def count_dead_base_hours(k15):
     return dead / 4.0
 
 
-def get_base_levels(k15):
+def get_volume_ratio(k5):
     """
-    Return (base_high, base_low) using 15m candles EXCLUDING the last completed
-    15m candle (because the trigger 5m candle may be inside it).
-    Returns (None, None) if not enough data.
+    FIX 3: Single volume-baseline helper used by both stages.
+    Latest completed 5m vs previous VOLUME_BASELINE_BARS completed 5m.
     """
-    if len(k15) < 20:
-        return None, None
-    # k15[-1] = forming; k15[-2] = latest completed (may contain trigger);
-    # we use k15[-18:-2] as the base window
-    base_slice = k15[-18:-2]
-    if len(base_slice) < 8:
-        return None, None
+    trigger_idx = len(k5) - 2
+    if trigger_idx < VOLUME_BASELINE_BARS:
+        return None
+
     try:
-        base_high = max(float(k[2]) for k in base_slice)
-        base_low = min(float(k[3]) for k in base_slice)
-    except Exception:
-        return None, None
-    if base_low <= 0:
-        return None, None
-    return base_high, base_low
+        current_vol = float(k5[trigger_idx][5])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    start = trigger_idx - VOLUME_BASELINE_BARS
+    baseline = []
+    for k in k5[start:trigger_idx]:
+        try:
+            baseline.append(float(k[5]))
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    if not baseline:
+        return None
+
+    avg_vol = sum(baseline) / len(baseline)
+    if avg_vol <= 0:
+        return None
+
+    return current_vol / avg_vol
+
+
+def get_timeframe_change(k5, bars_back):
+    """
+    FIX 2: Percentage change from N completed 5m candles before the
+    latest completed 5m trigger candle.
+    """
+    trigger_idx = len(k5) - 2
+    target_idx = trigger_idx - bars_back
+
+    if target_idx < 0:
+        return None
+
+    try:
+        trigger_close = float(k5[trigger_idx][4])
+        old_close = float(k5[target_idx][4])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    if trigger_close <= 0 or old_close <= 0:
+        return None
+
+    return ((trigger_close - old_close) / old_close) * 100
 
 
 def check_pre_pump(k15, k5):
-    """Pre-breakout compression + volume wake-up. Uses completed candles only."""
     try:
-        base_high, base_low = get_base_levels(k15)
+        base_high, base_low, base_slice = get_trigger_base(k15, k5)
         if base_high is None:
             return None
 
         base_range_pct = ((base_high - base_low) / base_low) * 100
-        if base_range_pct > 4.0:
+        if base_range_pct > MAX_BASE_RANGE_PCT:
             return None
 
-        # Latest completed 5m close (this is the trigger period reference)
         current_price = float(k5[-2][4])
         previous_price = float(k5[-3][4])
         if previous_price <= 0 or current_price <= 0:
             return None
 
-        change_5m = ((current_price - previous_price) / previous_price) * 100
+        if current_price < base_low:
+            return None
 
-        # Directional filter: reject if the last 5m is red
+        change_5m = ((current_price - previous_price) / previous_price) * 100
         if change_5m <= 0:
             return None
 
-        closed5 = k5[:-1]
-        if len(closed5) < 22:
-            return None
-        current_5m_vol = float(closed5[-1][5])
-        baseline = [float(k[5]) for k in closed5[-22:-1]]
-        avg_5m_vol = sum(baseline) / len(baseline) if baseline else 0
-        if avg_5m_vol <= 0:
-            return None
-        vol_ratio = current_5m_vol / avg_5m_vol
-        if vol_ratio < 1.5:
+        vol_ratio = get_volume_ratio(k5)
+        if vol_ratio is None or vol_ratio < 1.5:
             return None
 
         dist_to_base_high = ((base_high - current_price) / current_price) * 100
-        if dist_to_base_high < 0.5:
+        if dist_to_base_high < MIN_DIST_TO_BASE_HIGH:
             return None
+
+        dead_hours = count_dead_base_hours(base_slice)
 
         return {
             "price": current_price,
@@ -361,6 +455,7 @@ def check_pre_pump(k15, k5):
             "dist_to_base_high": dist_to_base_high,
             "base_high": base_high,
             "base_low": base_low,
+            "dead_hours": dead_hours,
         }
     except Exception as e:
         print(f"pre_pump error: {e}")
@@ -368,10 +463,6 @@ def check_pre_pump(k15, k5):
 
 
 def detect_breakout(symbol, k15, k5, ist_hour):
-    """
-    Return (data_dict, reasons_list).
-    data_dict is non-None only if a structural breakout passed.
-    """
     reasons = []
 
     completed_5m = k5[-2]
@@ -381,7 +472,6 @@ def detect_breakout(symbol, k15, k5, ist_hour):
     c_high = float(completed_5m[2])
     c_low = float(completed_5m[3])
     c_close = float(completed_5m[4])
-    c_vol = float(completed_5m[5])
 
     if c_close <= 0 or c_low <= 0:
         return None, ["bad_price"]
@@ -391,82 +481,82 @@ def detect_breakout(symbol, k15, k5, ist_hour):
         return None, ["bad_prev"]
     change_5m = ((c_close - prev_close) / prev_close) * 100
 
-    price_1h_ago = float(k15[-6][4])
-    change_1h = ((c_close - price_1h_ago) / price_1h_ago) * 100
-
-    price_6h_ago = float(k15[-26][4])
-    change_6h = ((c_close - price_6h_ago) / price_6h_ago) * 100
-
-    quiet_vols_5m = [float(k[5]) for k in k5[-22:-2]]
-    quiet_avg_5m = sum(quiet_vols_5m) / len(quiet_vols_5m) if quiet_vols_5m else 0
-    if quiet_avg_5m <= 0:
-        return None, ["quiet_avg_zero"]
-    explosion_ratio = c_vol / quiet_avg_5m
-
-    rng = c_high - c_low
-    if rng <= 0:
-        return None, ["zero_range"]
-    upper_wick = (c_high - max(c_open, c_close)) / rng
-    clv = (c_close - c_low) / rng
-
-    dead_hours = count_dead_base_hours(k15)
-    closes_15m = [float(k[4]) for k in k15[:-1]]
-    rsi_15m = compute_rsi(closes_15m, 14)
-
-    recent_taker = sum(float(k[9]) for k in k5[-5:-1])
-    recent_total = sum(float(k[5]) for k in k5[-5:-1])
-    buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
-
-    # Structural base
-    base_high, base_low = get_base_levels(k15)
+    # Timestamp-aligned base
+    base_high, base_low, base_slice = get_trigger_base(k15, k5)
     if base_high is None:
         return None, ["no_base"]
 
-    # STRUCTURAL BREAKOUT check
+    base_range_pct = ((base_high - base_low) / base_low) * 100
+    if base_range_pct > MAX_BASE_RANGE_PCT:
+        return None, [f"wide_base_{base_range_pct:.1f}%"]
+
     if c_close <= base_high:
         reasons.append("no_structure_break")
 
-    bid_depth, ask_depth = check_depth(symbol, c_close)
-    if bid_depth is None:
-        return None, ["depth_unavailable"]
-    bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
+    if c_close <= c_open:
+        reasons.append("red_candle")
 
     tier = 1 if symbol in OWN_CHAIN else 2
-    if tier == 1:
-        min_5m = 1.2
-        min_vol = 2.0
-    else:
-        min_5m = 1.5
-        min_vol = 2.5
+    min_5m = 1.2 if tier == 1 else 1.5
+    min_vol = 2.0 if tier == 1 else 2.5
 
     prime = PRIME_START_H <= ist_hour < PRIME_END_H
     if prime:
         min_5m -= 0.3
         min_vol -= 0.5
 
-    if c_close <= c_open:
-        reasons.append("red_candle")
     if change_5m < min_5m:
         reasons.append(f"5m_{change_5m:.1f}%")
     if change_5m > 6.0:
         reasons.append(f"5m_high_{change_5m:.1f}%")
+
+    explosion_ratio = get_volume_ratio(k5)
+    if explosion_ratio is None:
+        return None, ["volume_baseline_zero"]
     if explosion_ratio < min_vol:
         reasons.append(f"vol_{explosion_ratio:.1f}x")
+
+    rng = c_high - c_low
+    if rng <= 0:
+        return None, ["zero_range"]
+    upper_wick = (c_high - max(c_open, c_close)) / rng
+    clv = (c_close - c_low) / rng
     if upper_wick > 0.35:
         reasons.append(f"wick_{upper_wick*100:.0f}%")
     if clv < 0.70:
         reasons.append(f"clv_{clv:.2f}")
+
+    recent_taker = sum(float(k[9]) for k in k5[-5:-1])
+    recent_total = sum(float(k[5]) for k in k5[-5:-1])
+    buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
     if buy_pressure < 0.55:
         reasons.append(f"buy_{buy_pressure*100:.0f}%")
+
+    if reasons:
+        return None, reasons
+
+    # Depth is the LAST check
+    bid_depth, ask_depth = check_depth(symbol, c_close)
+    if bid_depth is None:
+        return None, ["depth_unavailable"]
+    bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
     if bid_ask_ratio < 0.9:
         reasons.append(f"ratio_{bid_ask_ratio:.2f}")
     if bid_depth < 15_000:
         reasons.append(f"bid_{bid_depth:.0f}")
     if ask_depth < 15_000:
         reasons.append(f"ask_{ask_depth:.0f}")
-
     if reasons:
         return None, reasons
+
+    dead_hours = count_dead_base_hours(base_slice)
+    closes_15m = [float(k[4]) for k in k15[:-1]]
+    rsi_15m = compute_rsi(closes_15m, 14)
+
+    change_1h = get_timeframe_change(k5, ONE_HOUR_BARS)
+    change_6h = get_timeframe_change(k5, SIX_HOUR_BARS)
+    if change_1h is None or change_6h is None:
+        return None, ["not_enough_5m_history"]
 
     return {
         "price": c_close,
@@ -475,7 +565,6 @@ def detect_breakout(symbol, k15, k5, ist_hour):
         "change_5m": change_5m,
         "change_1h": change_1h,
         "change_6h": change_6h,
-        "quiet_ratio": 1.0,
         "explosion_ratio": explosion_ratio,
         "vol_5m_ratio": explosion_ratio,
         "rsi": rsi_15m,
@@ -486,36 +575,29 @@ def detect_breakout(symbol, k15, k5, ist_hour):
         "prime": prime,
         "base_high": base_high,
         "base_low": base_low,
+        "base_range_pct": base_range_pct,
     }, []
 
 
 def detect_stage(symbol, ist_hour):
     try:
         url_15m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
-        r_15m = requests.get(url_15m, timeout=15)
-        if r_15m.status_code != 200:
-            return None, ["http_15m"]
-        k15 = r_15m.json()
+        k15 = http_get_json(url_15m, timeout=15, retries=1)
         if not isinstance(k15, list) or len(k15) < 50:
             return None, ["not_enough_15m"]
 
-        url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=30"
-        r_5m = requests.get(url_5m, timeout=10)
-        if r_5m.status_code != 200:
-            return None, ["http_5m"]
-        k5 = r_5m.json()
-        if not isinstance(k5, list) or len(k5) < 15:
+        # 100 x 5m candles for 6h + safety
+        url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
+        k5 = http_get_json(url_5m, timeout=10, retries=1)
+        if not isinstance(k5, list) or len(k5) < 20:
             return None, ["not_enough_5m"]
 
-        # BREAKOUT FIRST
         breakout_data, breakout_reasons = detect_breakout(symbol, k15, k5, ist_hour)
         if breakout_data is not None:
             return "BREAKOUT", breakout_data
 
-        # Then WATCHLIST
         pre_pump = check_pre_pump(k15, k5)
         if pre_pump is not None:
-            dead_hours = count_dead_base_hours(k15)
             return "WATCHLIST", {
                 "price": pre_pump["price"],
                 "base_range_pct": pre_pump["base_range_pct"],
@@ -524,7 +606,7 @@ def detect_stage(symbol, ist_hour):
                 "base_high": pre_pump["base_high"],
                 "base_low": pre_pump["base_low"],
                 "tier": 1 if symbol in OWN_CHAIN else 2,
-                "dead_hours": dead_hours,
+                "dead_hours": pre_pump["dead_hours"],
                 "change_5m": pre_pump["change_5m"],
                 "change_1h": 0,
                 "change_6h": 0,
@@ -615,9 +697,9 @@ def main():
                 f"<b>Distance to Base High:</b> {h['dist_to_base_high']:.2f}%\n\n"
                 f"⚠️ <b>DO NOT BUY YET.</b> Watch for a breakout above {format_price(h['base_high'])}."
             )
-            send_telegram(msg)
-            record_alert(h["symbol"], "WATCHLIST")
-            log_signal(h["symbol"], "WATCHLIST", h, session)
+            if send_telegram(msg):
+                record_alert(h["symbol"], "WATCHLIST")
+                log_signal(h["symbol"], "WATCHLIST", h, session)
             continue
 
         if stage == "BREAKOUT":
@@ -625,10 +707,6 @@ def main():
             tier_label = "Tier 1 — Own Chain" if tier == 1 else "Tier 2 — Token"
             prime_flag = " ⚡PRIME" if h.get("prime") else ""
             header = f"🚀 BREAKOUT [{tier_label}]{prime_flag} [{session}]"
-
-            record_alert(h["symbol"], "BREAKOUT")
-            log_signal(h["symbol"], "BREAKOUT", h, session)
-            fired_symbols.add(h["symbol"])
 
             stop = h["price"] * 0.97
             target_5 = h["price"] * 1.05
@@ -642,6 +720,8 @@ def main():
                 f"<b>Base High:</b> {format_price(h.get('base_high', 0))}\n"
                 f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
                 f"<b>5m Change:</b> {h['change_5m']:+.2f}%\n"
+                f"<b>1h Change:</b> {h['change_1h']:+.2f}%\n"
+                f"<b>6h Change:</b> {h['change_6h']:+.2f}%\n"
                 f"<b>Volume:</b> {h['explosion_ratio']:.2f}x quiet\n"
                 f"<b>RSI(15m):</b> {h['rsi']:.1f}\n"
                 f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
@@ -654,7 +734,10 @@ def main():
                 f"<b>Targets:</b> +5% {format_price(target_5)} | +10% {format_price(target_10)} | +25% {format_price(target_25)}\n\n"
                 f"✅ ENTER NOW — Buy at market. SL {format_price(stop)}."
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                record_alert(h["symbol"], "BREAKOUT")
+                log_signal(h["symbol"], "BREAKOUT", h, session)
+                fired_symbols.add(h["symbol"])
 
     for fired in fired_symbols:
         pair = ECOSYSTEM_PAIRS.get(fired)
