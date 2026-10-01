@@ -56,7 +56,6 @@ jobs:
           name: monitoring-rejections
           path: monitor_rejections.json
           retention-days: 1
-          overwrite: true
           if-no-files-found: ignore
       - name: Upload signals
         uses: actions/upload-artifact@v4
@@ -65,5 +64,4 @@ jobs:
           name: monitoring-signals
           path: monitor_signals.json
           retention-days: 7
-          overwrite: true
           if-no-files-found: ignore
