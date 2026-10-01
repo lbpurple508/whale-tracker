@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# FIX: anchor all paths to the script directory
 BASE_DIR = Path(__file__).resolve().parent
 
 BINANCE_API = "https://data-api.binance.vision"
@@ -20,7 +19,7 @@ PUMP_TARGET = 30.0
 MAX_SIGNAL_AGE_HOURS = 48
 
 SIGNAL_SOURCES = [
-    ("MONITOR", BASE_DIR / "monitor" / "monitor_signals.json"),
+    ("MONITOR", BASE_DIR / "monitor_signals.json"),   # FIXED: matches scanner output
 ]
 
 VALID_SOURCES = ("MONITOR",)
@@ -96,7 +95,6 @@ def parse_ts(s):
 
 
 def get_price(symbol):
-    """FIX: retry once on 429 / 5xx."""
     for attempt in range(2):
         try:
             url = f"{BINANCE_API}/api/v3/ticker/price?symbol={symbol}"
@@ -272,7 +270,6 @@ def update_signals(state):
             if t:
                 s["time_to_dip_min"] = int((now - t).total_seconds() / 60)
 
-        # Exit logic: simulate actual exit at target or stop
         if s["peak_pct"] >= PUMP_TARGET:
             s["status"] = "TP30_HIT"
             s["exit_pct"] = PUMP_TARGET
