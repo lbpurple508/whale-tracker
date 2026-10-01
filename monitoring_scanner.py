@@ -16,7 +16,7 @@ BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = BASE_DIR / "monitor_cooldown.json"
 REJECT_FILE = BASE_DIR / "monitor_rejections.json"
 HISTORY_FILE = BASE_DIR / "monitor_history.json"
-SIGNALS_FILE = BASE_DIR / "monitor" / "monitor_signals.json"
+SIGNALS_FILE = BASE_DIR / "monitor_signals.json"   # FIXED: no subfolder
 
 COOLDOWN_MINUTES = 240
 COOLDOWN_BREAKOUT_MINUTES = 240
@@ -49,12 +49,8 @@ PRIME_END_H = 13
 
 MAX_BASE_RANGE_PCT = 4.0
 MIN_DIST_TO_BASE_HIGH = 0.5
-
-# Base window: 16 completed 15m candles = 4 hours
 BASE_BARS = 16
-# Volume baseline: previous 20 completed 5m candles
 VOLUME_BASELINE_BARS = 20
-# 1h = 12 x 5m; 6h = 72 x 5m
 ONE_HOUR_BARS = 12
 SIX_HOUR_BARS = 72
 
@@ -265,7 +261,6 @@ def log_rejection(symbol, reasons, price=0, change_24h=0):
 
 
 def check_depth(symbol, price):
-    """Depth limited to 100 levels (weight 5 instead of 25)."""
     url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
     book = http_get_json(url, timeout=10, retries=1)
     if not isinstance(book, dict):
@@ -302,17 +297,9 @@ def compute_rsi(closes, period=14):
 
 
 def get_trigger_base(k15, k5):
-    """
-    FIX 1: Timestamp-aligned base.
-    Returns (base_high, base_low, base_slice) where base_slice is the
-    last BASE_BARS completed 15m candles whose close was BEFORE the
-    latest completed 5m trigger candle opened.
-    """
     if len(k5) < 3 or len(k15) < BASE_BARS + 2:
         return None, None, None
-
     trigger_open_ms = int(k5[-2][0])
-
     eligible = []
     for k in k15:
         try:
@@ -321,26 +308,20 @@ def get_trigger_base(k15, k5):
             continue
         if close_ms <= trigger_open_ms:
             eligible.append(k)
-
     if len(eligible) < BASE_BARS:
         return None, None, None
-
     base_slice = eligible[-BASE_BARS:]
-
     try:
         base_high = max(float(k[2]) for k in base_slice)
         base_low = min(float(k[3]) for k in base_slice)
     except (TypeError, ValueError, IndexError):
         return None, None, None
-
     if base_low <= 0:
         return None, None, None
-
     return base_high, base_low, base_slice
 
 
 def count_dead_base_hours(base_slice):
-    """Counts consecutive quiet (range<1%) 15m candles within base_slice."""
     if not base_slice:
         return 0.0
     dead = 0
@@ -361,19 +342,13 @@ def count_dead_base_hours(base_slice):
 
 
 def get_volume_ratio(k5):
-    """
-    FIX 3: Single volume-baseline helper used by both stages.
-    Latest completed 5m vs previous VOLUME_BASELINE_BARS completed 5m.
-    """
     trigger_idx = len(k5) - 2
     if trigger_idx < VOLUME_BASELINE_BARS:
         return None
-
     try:
         current_vol = float(k5[trigger_idx][5])
     except (TypeError, ValueError, IndexError):
         return None
-
     start = trigger_idx - VOLUME_BASELINE_BARS
     baseline = []
     for k in k5[start:trigger_idx]:
@@ -381,37 +356,26 @@ def get_volume_ratio(k5):
             baseline.append(float(k[5]))
         except (TypeError, ValueError, IndexError):
             continue
-
     if not baseline:
         return None
-
     avg_vol = sum(baseline) / len(baseline)
     if avg_vol <= 0:
         return None
-
     return current_vol / avg_vol
 
 
 def get_timeframe_change(k5, bars_back):
-    """
-    FIX 2: Percentage change from N completed 5m candles before the
-    latest completed 5m trigger candle.
-    """
     trigger_idx = len(k5) - 2
     target_idx = trigger_idx - bars_back
-
     if target_idx < 0:
         return None
-
     try:
         trigger_close = float(k5[trigger_idx][4])
         old_close = float(k5[target_idx][4])
     except (TypeError, ValueError, IndexError):
         return None
-
     if trigger_close <= 0 or old_close <= 0:
         return None
-
     return ((trigger_close - old_close) / old_close) * 100
 
 
@@ -420,33 +384,25 @@ def check_pre_pump(k15, k5):
         base_high, base_low, base_slice = get_trigger_base(k15, k5)
         if base_high is None:
             return None
-
         base_range_pct = ((base_high - base_low) / base_low) * 100
         if base_range_pct > MAX_BASE_RANGE_PCT:
             return None
-
         current_price = float(k5[-2][4])
         previous_price = float(k5[-3][4])
         if previous_price <= 0 or current_price <= 0:
             return None
-
         if current_price < base_low:
             return None
-
         change_5m = ((current_price - previous_price) / previous_price) * 100
         if change_5m <= 0:
             return None
-
         vol_ratio = get_volume_ratio(k5)
         if vol_ratio is None or vol_ratio < 1.5:
             return None
-
         dist_to_base_high = ((base_high - current_price) / current_price) * 100
         if dist_to_base_high < MIN_DIST_TO_BASE_HIGH:
             return None
-
         dead_hours = count_dead_base_hours(base_slice)
-
         return {
             "price": current_price,
             "change_5m": change_5m,
@@ -464,35 +420,28 @@ def check_pre_pump(k15, k5):
 
 def detect_breakout(symbol, k15, k5, ist_hour):
     reasons = []
-
     completed_5m = k5[-2]
     prev_completed_5m = k5[-3]
-
     c_open = float(completed_5m[1])
     c_high = float(completed_5m[2])
     c_low = float(completed_5m[3])
     c_close = float(completed_5m[4])
-
     if c_close <= 0 or c_low <= 0:
         return None, ["bad_price"]
-
     prev_close = float(prev_completed_5m[4])
     if prev_close <= 0:
         return None, ["bad_prev"]
     change_5m = ((c_close - prev_close) / prev_close) * 100
 
-    # Timestamp-aligned base
     base_high, base_low, base_slice = get_trigger_base(k15, k5)
     if base_high is None:
         return None, ["no_base"]
-
     base_range_pct = ((base_high - base_low) / base_low) * 100
     if base_range_pct > MAX_BASE_RANGE_PCT:
         return None, [f"wide_base_{base_range_pct:.1f}%"]
 
     if c_close <= base_high:
         reasons.append("no_structure_break")
-
     if c_close <= c_open:
         reasons.append("red_candle")
 
@@ -535,7 +484,6 @@ def detect_breakout(symbol, k15, k5, ist_hour):
     if reasons:
         return None, reasons
 
-    # Depth is the LAST check
     bid_depth, ask_depth = check_depth(symbol, c_close)
     if bid_depth is None:
         return None, ["depth_unavailable"]
@@ -586,7 +534,6 @@ def detect_stage(symbol, ist_hour):
         if not isinstance(k15, list) or len(k15) < 50:
             return None, ["not_enough_15m"]
 
-        # 100 x 5m candles for 6h + safety
         url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
         k5 = http_get_json(url_5m, timeout=10, retries=1)
         if not isinstance(k5, list) or len(k5) < 20:
@@ -667,8 +614,6 @@ def main():
     ist = now_utc() + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
-
-    SIGNALS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     if not SIGNALS_FILE.exists():
         SIGNALS_FILE.write_text('{"signals": []}')
