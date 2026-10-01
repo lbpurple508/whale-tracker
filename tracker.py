@@ -30,6 +30,9 @@ def now_utc():
 def should_track(source, stage):
     if source not in VALID_SOURCES:
         return False
+    # Do NOT track WATCHLIST alerts as trades — only actual BREAKOUT signals.
+    if stage == "WATCHLIST":
+        return False
     return True
 
 
