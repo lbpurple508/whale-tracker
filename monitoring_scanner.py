@@ -13,7 +13,8 @@ BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("monitor_cooldown.json")
 REJECT_FILE = Path("monitor_rejections.json")
 HISTORY_FILE = Path("monitor_history.json")
-SIGNALS_FILE = Path("monitor/monitor_signals.json")  # FIXED PATH
+SIGNALS_FILE = Path("monitor/monitor_signals.json")  # fixed path
+
 COOLDOWN_MINUTES = 240
 COOLDOWN_BREAKOUT_MINUTES = 240
 COOLDOWN_WATCHLIST_MINUTES = 60
@@ -119,17 +120,39 @@ def load_cooldown():
         if t is None:
             continue
         stage = info.get("stage", "BREAKOUT")
-        
         if stage == "BREAKOUT":
             minutes = COOLDOWN_BREAKOUT_MINUTES
         elif stage == "WATCHLIST":
             minutes = COOLDOWN_WATCHLIST_MINUTES
         else:
             minutes = COOLDOWN_MINUTES
-            
         if (now - t).total_seconds() < minutes * 60:
             cleaned[sym] = info
     return cleaned
+
+
+def cooldown_blocks(cooldown, symbol, stage):
+    """Return True if this stage is blocked by existing cooldown."""
+    info = cooldown.get(symbol)
+    if not isinstance(info, dict):
+        return False
+
+    ts = parse_ts_safe(info.get("ts", ""))
+    if ts is None:
+        return False
+
+    age_min = (now_utc() - ts).total_seconds() / 60
+    prev_stage = info.get("stage", "")
+
+    # A recent BREAKOUT blocks everything
+    if prev_stage == "BREAKOUT":
+        return age_min < COOLDOWN_BREAKOUT_MINUTES
+
+    # A WATCHLIST cooldown only blocks another WATCHLIST
+    if prev_stage == "WATCHLIST":
+        return stage == "WATCHLIST" and age_min < COOLDOWN_WATCHLIST_MINUTES
+
+    return False
 
 
 def record_alert(symbol, stage):
@@ -245,7 +268,9 @@ def compute_rsi(closes, period=14):
 
 def count_dead_base_hours(k15):
     dead = 0
-    for k in reversed(k15[:-2]):
+    # only completed candles
+    completed = k15[:-1]
+    for k in reversed(completed):
         try:
             h = float(k[2])
             l = float(k[3])
@@ -262,47 +287,41 @@ def count_dead_base_hours(k15):
 
 
 def check_pre_pump(k15, k5):
-    """
-    Detects the 'WATCHLIST' phase: tight base + volume ticking up + price still near base.
-    """
+    """Detect tight base + volume waking up. Only completed candles."""
     try:
-        closes = [float(k[4]) for k in k15]
-        highs = [float(k[2]) for k in k15]
-        lows = [float(k[3]) for k in k15]
-        volumes = [float(k[5]) for k in k15]
-        
+        closed15 = k15[:-1]
+        closes = [float(k[4]) for k in closed15]
+        highs = [float(k[2]) for k in closed15]
+        lows = [float(k[3]) for k in closed15]
+
         current_price = closes[-1]
-        
-        # 1. Compression: Is the last 4 hours (16 candles) tight?
+
         recent_high = max(highs[-16:])
         recent_low = min(lows[-16:])
-        if recent_low <= 0: return None
-        
+        if recent_low <= 0:
+            return None
+
         base_range_pct = ((recent_high - recent_low) / recent_low) * 100
-        
-        # We want a tight base. For monitoring coins, < 4% is tight.
         if base_range_pct > 4.0:
             return None
-            
-        # 2. Volume Anomaly
-        avg_15m_vol = sum(volumes[-16:]) / 16
-        current_5m_vol = float(k5[-2][5])
-        avg_5m_vol = avg_15m_vol / 3.0
-        
-        if avg_5m_vol <= 0: return None
+
+        # volume: use completed 5m candles
+        closed5 = k5[:-1]
+        current_5m_vol = float(closed5[-1][5])
+        baseline = [float(k[5]) for k in closed5[-22:-1]]
+        if not baseline:
+            return None
+        avg_5m_vol = sum(baseline) / len(baseline)
+        if avg_5m_vol <= 0:
+            return None
         vol_ratio = current_5m_vol / avg_5m_vol
-        
-        # Volume must be picking up, but price hasn't exploded yet
         if vol_ratio < 1.5:
             return None
-            
-        # 3. Price is still near the base
+
         dist_to_base_high = ((recent_high - current_price) / current_price) * 100
-        
-        # If it's already broken out, we don't want to send a WATCHLIST alert
         if dist_to_base_high < 0.5:
             return None
-            
+
         return {
             "price": current_price,
             "base_range_pct": base_range_pct,
@@ -311,7 +330,6 @@ def check_pre_pump(k15, k5):
             "base_high": recent_high,
             "base_low": recent_low,
         }
-        
     except Exception as e:
         print(f"pre_pump error: {e}")
         return None
@@ -332,7 +350,7 @@ def detect_stage(symbol, ist_hour):
         if not isinstance(k5, list) or len(k5) < 15:
             return None, ["not_enough_5m"]
 
-        # --- PRE-PUMP WATCHLIST CHECK ---
+        # WATCHLIST check first
         pre_pump = check_pre_pump(k15, k5)
         if pre_pump:
             return "WATCHLIST", {
@@ -355,7 +373,7 @@ def detect_stage(symbol, ist_hour):
                 "prime": False,
             }
 
-        # --- EXISTING BREAKOUT LOGIC ---
+        # BREAKOUT logic
         completed_5m = k5[-2]
         prev_completed_5m = k5[-3]
 
@@ -415,16 +433,26 @@ def detect_stage(symbol, ist_hour):
             min_5m -= 0.3
             min_vol -= 0.5
 
-        if c_close <= c_open: reasons.append("red_candle")
-        if change_5m < min_5m: reasons.append(f"5m_{change_5m:.1f}%")
-        if change_5m > 6.0: reasons.append(f"5m_high_{change_5m:.1f}%")
-        if explosion_ratio < min_vol: reasons.append(f"vol_{explosion_ratio:.1f}x")
-        if upper_wick > 0.35: reasons.append(f"wick_{upper_wick*100:.0f}%")
-        if clv < 0.70: reasons.append(f"clv_{clv:.2f}")
-        if buy_pressure < 0.55: reasons.append(f"buy_{buy_pressure*100:.0f}%")
-        if bid_ask_ratio < 0.9: reasons.append(f"ratio_{bid_ask_ratio:.2f}")
-        if bid_depth < 15_000: reasons.append(f"bid_{bid_depth:.0f}")
-        if ask_depth < 15_000: reasons.append(f"ask_{ask_depth:.0f}")
+        if c_close <= c_open:
+            reasons.append("red_candle")
+        if change_5m < min_5m:
+            reasons.append(f"5m_{change_5m:.1f}%")
+        if change_5m > 6.0:
+            reasons.append(f"5m_high_{change_5m:.1f}%")
+        if explosion_ratio < min_vol:
+            reasons.append(f"vol_{explosion_ratio:.1f}x")
+        if upper_wick > 0.35:
+            reasons.append(f"wick_{upper_wick*100:.0f}%")
+        if clv < 0.70:
+            reasons.append(f"clv_{clv:.2f}")
+        if buy_pressure < 0.55:
+            reasons.append(f"buy_{buy_pressure*100:.0f}%")
+        if bid_ask_ratio < 0.9:
+            reasons.append(f"ratio_{bid_ask_ratio:.2f}")
+        if bid_depth < 15_000:
+            reasons.append(f"bid_{bid_depth:.0f}")
+        if ask_depth < 15_000:
+            reasons.append(f"ask_{ask_depth:.0f}")
 
         if reasons:
             return None, reasons
@@ -465,7 +493,7 @@ def scan(session, ist_hour):
             else:
                 stage, data = None, ["exception"]
             if stage:
-                if symbol in cooldown:
+                if cooldown_blocks(cooldown, symbol, stage):
                     continue
                 data["symbol"] = symbol
                 data["stage"] = stage
@@ -480,9 +508,12 @@ def scan(session, ist_hour):
 
 
 def get_session_label(hour):
-    if 8 <= hour <= 11: return "Asia"
-    if 12 <= hour <= 15: return "Europe"
-    if 18 <= hour <= 22: return "US"
+    if 8 <= hour <= 11:
+        return "Asia"
+    if 12 <= hour <= 15:
+        return "Europe"
+    if 18 <= hour <= 22:
+        return "US"
     return "Off"
 
 
@@ -491,9 +522,8 @@ def main():
     session = get_session_label(ist.hour)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
 
-    # FIXED: Ensure the monitor directory exists
     SIGNALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    
+
     if not SIGNALS_FILE.exists():
         SIGNALS_FILE.write_text('{"signals": []}')
     else:
@@ -510,9 +540,8 @@ def main():
     fired_symbols = set()
     for h in hits:
         stage = h.get("stage")
-        
+
         if stage == "WATCHLIST":
-            # Send WATCHLIST alert
             msg = (
                 f"👀 <b>WATCHLIST: {h['symbol']}</b>\n\n"
                 f"<b>Price:</b> {format_price(h['price'])}\n"
