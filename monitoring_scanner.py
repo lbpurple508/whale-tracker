@@ -13,7 +13,7 @@ BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("monitor_cooldown.json")
 REJECT_FILE = Path("monitor_rejections.json")
 HISTORY_FILE = Path("monitor_history.json")
-SIGNALS_FILE = Path("monitor/monitor_signals.json")  # fixed path
+SIGNALS_FILE = Path("monitor/monitor_signals.json")
 
 COOLDOWN_MINUTES = 240
 COOLDOWN_BREAKOUT_MINUTES = 240
@@ -132,7 +132,6 @@ def load_cooldown():
 
 
 def cooldown_blocks(cooldown, symbol, stage):
-    """Return True if this stage is blocked by existing cooldown."""
     info = cooldown.get(symbol)
     if not isinstance(info, dict):
         return False
@@ -144,11 +143,9 @@ def cooldown_blocks(cooldown, symbol, stage):
     age_min = (now_utc() - ts).total_seconds() / 60
     prev_stage = info.get("stage", "")
 
-    # A recent BREAKOUT blocks everything
     if prev_stage == "BREAKOUT":
         return age_min < COOLDOWN_BREAKOUT_MINUTES
 
-    # A WATCHLIST cooldown only blocks another WATCHLIST
     if prev_stage == "WATCHLIST":
         return stage == "WATCHLIST" and age_min < COOLDOWN_WATCHLIST_MINUTES
 
@@ -202,6 +199,12 @@ def log_signal(symbol, stage, data, session):
             "bid_ask_ratio": data.get("bid_ask_ratio"),
             "change_1h": data.get("change_1h"),
             "change_6h": data.get("change_6h"),
+            # WATCHLIST-specific research fields
+            "base_range_pct": data.get("base_range_pct"),
+            "base_high": data.get("base_high"),
+            "base_low": data.get("base_low"),
+            "dist_to_base_high": data.get("dist_to_base_high"),
+            "watch_volume_ratio": data.get("vol_ratio"),
         })
         if len(signals["signals"]) > 500:
             signals["signals"] = signals["signals"][-500:]
@@ -230,18 +233,21 @@ def log_rejection(symbol, reasons, price=0, change_24h=0):
 
 
 def check_depth(symbol, price):
+    """Return (bid, ask) or (None, None) on API failure."""
     try:
         url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=500"
         r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return None, None
         book = r.json()
         if not isinstance(book, dict):
-            return 0, 0
+            return None, None
         low, high = price * 0.98, price * 1.02
         bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
         ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
         return bid_depth, ask_depth
     except Exception:
-        return 0, 0
+        return None, None
 
 
 def compute_rsi(closes, period=14):
@@ -268,7 +274,6 @@ def compute_rsi(closes, period=14):
 
 def count_dead_base_hours(k15):
     dead = 0
-    # only completed candles
     completed = k15[:-1]
     for k in reversed(completed):
         try:
@@ -286,82 +291,241 @@ def count_dead_base_hours(k15):
     return dead / 4.0
 
 
-def check_pre_pump(k15, k5):
-    """Detect tight base + volume waking up. Only completed candles."""
+def get_base_levels(k15):
+    """
+    Return (base_high, base_low) using 15m candles EXCLUDING the last completed
+    15m candle (because the trigger 5m candle may be inside it).
+    Returns (None, None) if not enough data.
+    """
+    if len(k15) < 20:
+        return None, None
+    # k15[-1] = forming; k15[-2] = latest completed (may contain trigger);
+    # we use k15[-18:-2] as the base window
+    base_slice = k15[-18:-2]
+    if len(base_slice) < 8:
+        return None, None
     try:
-        closed15 = k15[:-1]
-        closes = [float(k[4]) for k in closed15]
-        highs = [float(k[2]) for k in closed15]
-        lows = [float(k[3]) for k in closed15]
+        base_high = max(float(k[2]) for k in base_slice)
+        base_low = min(float(k[3]) for k in base_slice)
+    except Exception:
+        return None, None
+    if base_low <= 0:
+        return None, None
+    return base_high, base_low
 
-        current_price = closes[-1]
 
-        recent_high = max(highs[-16:])
-        recent_low = min(lows[-16:])
-        if recent_low <= 0:
+def check_pre_pump(k15, k5):
+    """Pre-breakout compression + volume wake-up. Uses completed candles only."""
+    try:
+        base_high, base_low = get_base_levels(k15)
+        if base_high is None:
             return None
 
-        base_range_pct = ((recent_high - recent_low) / recent_low) * 100
+        base_range_pct = ((base_high - base_low) / base_low) * 100
         if base_range_pct > 4.0:
             return None
 
-        # volume: use completed 5m candles
+        # Latest completed 5m close (this is the trigger period reference)
+        current_price = float(k5[-2][4])
+        previous_price = float(k5[-3][4])
+        if previous_price <= 0 or current_price <= 0:
+            return None
+
+        change_5m = ((current_price - previous_price) / previous_price) * 100
+
+        # Directional filter: reject if the last 5m is red
+        if change_5m <= 0:
+            return None
+
         closed5 = k5[:-1]
+        if len(closed5) < 22:
+            return None
         current_5m_vol = float(closed5[-1][5])
         baseline = [float(k[5]) for k in closed5[-22:-1]]
-        if not baseline:
-            return None
-        avg_5m_vol = sum(baseline) / len(baseline)
+        avg_5m_vol = sum(baseline) / len(baseline) if baseline else 0
         if avg_5m_vol <= 0:
             return None
         vol_ratio = current_5m_vol / avg_5m_vol
         if vol_ratio < 1.5:
             return None
 
-        dist_to_base_high = ((recent_high - current_price) / current_price) * 100
+        dist_to_base_high = ((base_high - current_price) / current_price) * 100
         if dist_to_base_high < 0.5:
             return None
 
         return {
             "price": current_price,
+            "change_5m": change_5m,
             "base_range_pct": base_range_pct,
             "vol_ratio": vol_ratio,
             "dist_to_base_high": dist_to_base_high,
-            "base_high": recent_high,
-            "base_low": recent_low,
+            "base_high": base_high,
+            "base_low": base_low,
         }
     except Exception as e:
         print(f"pre_pump error: {e}")
         return None
 
 
-def detect_stage(symbol, ist_hour):
+def detect_breakout(symbol, k15, k5, ist_hour):
+    """
+    Return (data_dict, reasons_list).
+    data_dict is non-None only if a structural breakout passed.
+    """
     reasons = []
+
+    completed_5m = k5[-2]
+    prev_completed_5m = k5[-3]
+
+    c_open = float(completed_5m[1])
+    c_high = float(completed_5m[2])
+    c_low = float(completed_5m[3])
+    c_close = float(completed_5m[4])
+    c_vol = float(completed_5m[5])
+
+    if c_close <= 0 or c_low <= 0:
+        return None, ["bad_price"]
+
+    prev_close = float(prev_completed_5m[4])
+    if prev_close <= 0:
+        return None, ["bad_prev"]
+    change_5m = ((c_close - prev_close) / prev_close) * 100
+
+    price_1h_ago = float(k15[-6][4])
+    change_1h = ((c_close - price_1h_ago) / price_1h_ago) * 100
+
+    price_6h_ago = float(k15[-26][4])
+    change_6h = ((c_close - price_6h_ago) / price_6h_ago) * 100
+
+    quiet_vols_5m = [float(k[5]) for k in k5[-22:-2]]
+    quiet_avg_5m = sum(quiet_vols_5m) / len(quiet_vols_5m) if quiet_vols_5m else 0
+    if quiet_avg_5m <= 0:
+        return None, ["quiet_avg_zero"]
+    explosion_ratio = c_vol / quiet_avg_5m
+
+    rng = c_high - c_low
+    if rng <= 0:
+        return None, ["zero_range"]
+    upper_wick = (c_high - max(c_open, c_close)) / rng
+    clv = (c_close - c_low) / rng
+
+    dead_hours = count_dead_base_hours(k15)
+    closes_15m = [float(k[4]) for k in k15[:-1]]
+    rsi_15m = compute_rsi(closes_15m, 14)
+
+    recent_taker = sum(float(k[9]) for k in k5[-5:-1])
+    recent_total = sum(float(k[5]) for k in k5[-5:-1])
+    buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
+
+    # Structural base
+    base_high, base_low = get_base_levels(k15)
+    if base_high is None:
+        return None, ["no_base"]
+
+    # STRUCTURAL BREAKOUT check
+    if c_close <= base_high:
+        reasons.append("no_structure_break")
+
+    bid_depth, ask_depth = check_depth(symbol, c_close)
+    if bid_depth is None:
+        return None, ["depth_unavailable"]
+    bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
+
+    tier = 1 if symbol in OWN_CHAIN else 2
+    if tier == 1:
+        min_5m = 1.2
+        min_vol = 2.0
+    else:
+        min_5m = 1.5
+        min_vol = 2.5
+
+    prime = PRIME_START_H <= ist_hour < PRIME_END_H
+    if prime:
+        min_5m -= 0.3
+        min_vol -= 0.5
+
+    if c_close <= c_open:
+        reasons.append("red_candle")
+    if change_5m < min_5m:
+        reasons.append(f"5m_{change_5m:.1f}%")
+    if change_5m > 6.0:
+        reasons.append(f"5m_high_{change_5m:.1f}%")
+    if explosion_ratio < min_vol:
+        reasons.append(f"vol_{explosion_ratio:.1f}x")
+    if upper_wick > 0.35:
+        reasons.append(f"wick_{upper_wick*100:.0f}%")
+    if clv < 0.70:
+        reasons.append(f"clv_{clv:.2f}")
+    if buy_pressure < 0.55:
+        reasons.append(f"buy_{buy_pressure*100:.0f}%")
+    if bid_ask_ratio < 0.9:
+        reasons.append(f"ratio_{bid_ask_ratio:.2f}")
+    if bid_depth < 15_000:
+        reasons.append(f"bid_{bid_depth:.0f}")
+    if ask_depth < 15_000:
+        reasons.append(f"ask_{ask_depth:.0f}")
+
+    if reasons:
+        return None, reasons
+
+    return {
+        "price": c_close,
+        "tier": tier,
+        "dead_hours": dead_hours,
+        "change_5m": change_5m,
+        "change_1h": change_1h,
+        "change_6h": change_6h,
+        "quiet_ratio": 1.0,
+        "explosion_ratio": explosion_ratio,
+        "vol_5m_ratio": explosion_ratio,
+        "rsi": rsi_15m,
+        "buy_pressure": buy_pressure * 100,
+        "bid_depth": bid_depth,
+        "ask_depth": ask_depth,
+        "bid_ask_ratio": bid_ask_ratio,
+        "prime": prime,
+        "base_high": base_high,
+        "base_low": base_low,
+    }, []
+
+
+def detect_stage(symbol, ist_hour):
     try:
         url_15m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
         r_15m = requests.get(url_15m, timeout=15)
+        if r_15m.status_code != 200:
+            return None, ["http_15m"]
         k15 = r_15m.json()
         if not isinstance(k15, list) or len(k15) < 50:
             return None, ["not_enough_15m"]
 
         url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=30"
         r_5m = requests.get(url_5m, timeout=10)
+        if r_5m.status_code != 200:
+            return None, ["http_5m"]
         k5 = r_5m.json()
         if not isinstance(k5, list) or len(k5) < 15:
             return None, ["not_enough_5m"]
 
-        # WATCHLIST check first
+        # BREAKOUT FIRST
+        breakout_data, breakout_reasons = detect_breakout(symbol, k15, k5, ist_hour)
+        if breakout_data is not None:
+            return "BREAKOUT", breakout_data
+
+        # Then WATCHLIST
         pre_pump = check_pre_pump(k15, k5)
-        if pre_pump:
+        if pre_pump is not None:
+            dead_hours = count_dead_base_hours(k15)
             return "WATCHLIST", {
                 "price": pre_pump["price"],
                 "base_range_pct": pre_pump["base_range_pct"],
                 "vol_ratio": pre_pump["vol_ratio"],
                 "dist_to_base_high": pre_pump["dist_to_base_high"],
                 "base_high": pre_pump["base_high"],
+                "base_low": pre_pump["base_low"],
                 "tier": 1 if symbol in OWN_CHAIN else 2,
-                "dead_hours": 0,
-                "change_5m": 0,
+                "dead_hours": dead_hours,
+                "change_5m": pre_pump["change_5m"],
                 "change_1h": 0,
                 "change_6h": 0,
                 "explosion_ratio": pre_pump["vol_ratio"],
@@ -373,107 +537,7 @@ def detect_stage(symbol, ist_hour):
                 "prime": False,
             }
 
-        # BREAKOUT logic
-        completed_5m = k5[-2]
-        prev_completed_5m = k5[-3]
-
-        c_open = float(completed_5m[1])
-        c_high = float(completed_5m[2])
-        c_low = float(completed_5m[3])
-        c_close = float(completed_5m[4])
-        c_vol = float(completed_5m[5])
-
-        if c_close <= 0 or c_low <= 0:
-            return None, ["bad_price"]
-
-        prev_close = float(prev_completed_5m[4])
-        if prev_close <= 0:
-            return None, ["bad_prev"]
-        change_5m = ((c_close - prev_close) / prev_close) * 100
-
-        price_1h_ago = float(k15[-6][4])
-        change_1h = ((c_close - price_1h_ago) / price_1h_ago) * 100
-
-        price_6h_ago = float(k15[-26][4])
-        change_6h = ((c_close - price_6h_ago) / price_6h_ago) * 100
-
-        quiet_vols_5m = [float(k[5]) for k in k5[-22:-2]]
-        quiet_avg_5m = sum(quiet_vols_5m) / len(quiet_vols_5m) if quiet_vols_5m else 0
-        if quiet_avg_5m <= 0:
-            return None, ["quiet_avg_zero"]
-        explosion_ratio = c_vol / quiet_avg_5m
-
-        rng = c_high - c_low
-        if rng <= 0:
-            return None, ["zero_range"]
-        upper_wick = (c_high - max(c_open, c_close)) / rng
-        clv = (c_close - c_low) / rng
-
-        dead_hours = count_dead_base_hours(k15)
-        closes_15m = [float(k[4]) for k in k15[:-1]]
-        rsi_15m = compute_rsi(closes_15m, 14)
-
-        recent_taker = sum(float(k[9]) for k in k5[-5:-1])
-        recent_total = sum(float(k[5]) for k in k5[-5:-1])
-        buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
-
-        bid_depth, ask_depth = check_depth(symbol, c_close)
-        bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
-
-        tier = 1 if symbol in OWN_CHAIN else 2
-        if tier == 1:
-            min_5m = 1.2
-            min_vol = 2.0
-        else:
-            min_5m = 1.5
-            min_vol = 2.5
-
-        prime = PRIME_START_H <= ist_hour < PRIME_END_H
-        if prime:
-            min_5m -= 0.3
-            min_vol -= 0.5
-
-        if c_close <= c_open:
-            reasons.append("red_candle")
-        if change_5m < min_5m:
-            reasons.append(f"5m_{change_5m:.1f}%")
-        if change_5m > 6.0:
-            reasons.append(f"5m_high_{change_5m:.1f}%")
-        if explosion_ratio < min_vol:
-            reasons.append(f"vol_{explosion_ratio:.1f}x")
-        if upper_wick > 0.35:
-            reasons.append(f"wick_{upper_wick*100:.0f}%")
-        if clv < 0.70:
-            reasons.append(f"clv_{clv:.2f}")
-        if buy_pressure < 0.55:
-            reasons.append(f"buy_{buy_pressure*100:.0f}%")
-        if bid_ask_ratio < 0.9:
-            reasons.append(f"ratio_{bid_ask_ratio:.2f}")
-        if bid_depth < 15_000:
-            reasons.append(f"bid_{bid_depth:.0f}")
-        if ask_depth < 15_000:
-            reasons.append(f"ask_{ask_depth:.0f}")
-
-        if reasons:
-            return None, reasons
-
-        return "BREAKOUT", {
-            "price": c_close,
-            "tier": tier,
-            "dead_hours": dead_hours,
-            "change_5m": change_5m,
-            "change_1h": change_1h,
-            "change_6h": change_6h,
-            "quiet_ratio": 1.0,
-            "explosion_ratio": explosion_ratio,
-            "vol_5m_ratio": explosion_ratio,
-            "rsi": rsi_15m,
-            "buy_pressure": buy_pressure * 100,
-            "bid_depth": bid_depth,
-            "ask_depth": ask_depth,
-            "bid_ask_ratio": bid_ask_ratio,
-            "prime": prime,
-        }
+        return None, breakout_reasons if breakout_reasons else ["no_setup"]
     except Exception as e:
         return None, [f"exception_{e}"]
 
@@ -547,6 +611,7 @@ def main():
                 f"<b>Price:</b> {format_price(h['price'])}\n"
                 f"<b>Base Range:</b> {h['base_range_pct']:.2f}%\n"
                 f"<b>Volume Ratio:</b> {h['vol_ratio']:.2f}x quiet\n"
+                f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
                 f"<b>Distance to Base High:</b> {h['dist_to_base_high']:.2f}%\n\n"
                 f"⚠️ <b>DO NOT BUY YET.</b> Watch for a breakout above {format_price(h['base_high'])}."
             )
@@ -574,6 +639,7 @@ def main():
                 f"{header}\n\n"
                 f"<b>Coin:</b> {h['symbol']}\n"
                 f"<b>Price:</b> {format_price(h['price'])}\n"
+                f"<b>Base High:</b> {format_price(h.get('base_high', 0))}\n"
                 f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
                 f"<b>5m Change:</b> {h['change_5m']:+.2f}%\n"
                 f"<b>Volume:</b> {h['explosion_ratio']:.2f}x quiet\n"
