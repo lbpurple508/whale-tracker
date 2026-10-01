@@ -28,15 +28,6 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Download dip confirmed
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: dip-confirmed
-          workflow: dip_watcher.yml
-          path: dip/
-          if_no_artifact_found: ignore
-
       - name: Restore tracker state
         uses: actions/cache/restore@v4
         with:
@@ -44,6 +35,14 @@ jobs:
           key: tracker-state-${{ github.run_id }}
           restore-keys: |
             tracker-state-
+
+      - name: Restore monitor signals
+        uses: actions/cache/restore@v4
+        with:
+          path: monitor_signals.json
+          key: monitor-cooldown-${{ github.run_id }}
+          restore-keys: |
+            monitor-cooldown-
 
       - name: Run tracker
         env:
