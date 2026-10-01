@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from pathlib import Path
 from datetime import datetime, timezone
@@ -8,15 +9,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# FIX: anchor all paths to the script directory
+BASE_DIR = Path(__file__).resolve().parent
+
 BINANCE_API = "https://data-api.binance.vision"
-TRACKER_FILE = Path("tracker_state.json")
+TRACKER_FILE = BASE_DIR / "tracker_state.json"
 
 STOP_PCT = -3.0
 PUMP_TARGET = 30.0
 MAX_SIGNAL_AGE_HOURS = 48
 
 SIGNAL_SOURCES = [
-    ("MONITOR", Path("monitor/monitor_signals.json")),
+    ("MONITOR", BASE_DIR / "monitor" / "monitor_signals.json"),
 ]
 
 VALID_SOURCES = ("MONITOR",)
@@ -73,6 +77,7 @@ def load_json(path):
 
 def save_json(path, data):
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data))
         tmp.replace(path)
@@ -91,14 +96,25 @@ def parse_ts(s):
 
 
 def get_price(symbol):
-    try:
-        url = f"{BINANCE_API}/api/v3/ticker/price?symbol={symbol}"
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
+    """FIX: retry once on 429 / 5xx."""
+    for attempt in range(2):
+        try:
+            url = f"{BINANCE_API}/api/v3/ticker/price?symbol={symbol}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                return float(r.json().get("price", 0))
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                return 0.0
             return 0.0
-        return float(r.json().get("price", 0))
-    except Exception:
-        return 0.0
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return 0.0
+    return 0.0
 
 
 def clean_state(state):
