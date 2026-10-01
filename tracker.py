@@ -14,7 +14,6 @@ TRACKER_FILE = Path("tracker_state.json")
 STOP_PCT = -3.0
 PUMP_TARGET = 30.0
 MAX_SIGNAL_AGE_HOURS = 48
-MAX_PUMPED_AGE_HOURS = 72
 
 SIGNAL_SOURCES = [
     ("MONITOR", Path("monitor/monitor_signals.json")),
@@ -28,12 +27,7 @@ def now_utc():
 
 
 def should_track(source, stage):
-    if source not in VALID_SOURCES:
-        return False
-    # Do NOT track WATCHLIST alerts as trades — only actual BREAKOUT signals.
-    if stage == "WATCHLIST":
-        return False
-    return True
+    return source in VALID_SOURCES and stage == "BREAKOUT"
 
 
 def format_price(p):
@@ -224,7 +218,7 @@ def update_signals(state):
     signals = state.get("signals", [])
     if not isinstance(signals, list):
         return 0
-    trackable = [s for s in signals if isinstance(s, dict) and s.get("status") in ("ACTIVE", "PUMPED")]
+    trackable = [s for s in signals if isinstance(s, dict) and s.get("status") == "ACTIVE"]
     if not trackable:
         return 0
 
@@ -242,11 +236,6 @@ def update_signals(state):
         p = prices.get(s["symbol"], 0)
         if p <= 0:
             continue
-
-        if "dip_pct_tracked" not in s:
-            s["dip_pct_tracked"] = 0.0
-        if "peak_pct" not in s:
-            s["peak_pct"] = 0.0
 
         s["current"] = p
         s["current_pct"] = ((p - s["entry"]) / s["entry"]) * 100
@@ -267,21 +256,15 @@ def update_signals(state):
             if t:
                 s["time_to_dip_min"] = int((now - t).total_seconds() / 60)
 
-        if s["status"] == "ACTIVE":
-            if s["peak_pct"] >= PUMP_TARGET:
-                s["status"] = "PUMPED"
-            elif s["current_pct"] <= STOP_PCT:
-                s["status"] = "STOPPED"
-                s["exit_pct"] = STOP_PCT
-                s["closed_ts"] = now.isoformat()
-        elif s["status"] == "PUMPED":
-            entry_dt = parse_ts(s["entry_ts"])
-            if entry_dt:
-                age_hours = (now - entry_dt).total_seconds() / 3600
-                if age_hours > MAX_PUMPED_AGE_HOURS:
-                    s["status"] = "CLOSED"
-                    s["exit_pct"] = s["current_pct"]
-                    s["closed_ts"] = now.isoformat()
+        # Exit logic: simulate actual exit at target or stop
+        if s["peak_pct"] >= PUMP_TARGET:
+            s["status"] = "TP30_HIT"
+            s["exit_pct"] = PUMP_TARGET
+            s["closed_ts"] = now.isoformat()
+        elif s["current_pct"] <= STOP_PCT:
+            s["status"] = "STOPPED"
+            s["exit_pct"] = STOP_PCT
+            s["closed_ts"] = now.isoformat()
 
         s["last_update"] = now.isoformat()
         updated += 1
@@ -295,11 +278,10 @@ def build_report(state):
         signals = []
     total = len(signals)
     active = [s for s in signals if s.get("status") == "ACTIVE"]
-    pumped = [s for s in signals if s.get("status") == "PUMPED"]
+    tp30 = [s for s in signals if s.get("status") == "TP30_HIT"]
     stopped = [s for s in signals if s.get("status") == "STOPPED"]
-    closed = [s for s in signals if s.get("status") == "CLOSED"]
 
-    wins = len(pumped) + len([s for s in closed if s.get("peak_pct", 0) >= PUMP_TARGET])
+    wins = len(tp30)
     losses = len(stopped)
     closed_total = wins + losses
     wr = (wins / closed_total * 100) if closed_total > 0 else 0
@@ -309,17 +291,16 @@ def build_report(state):
     lines.append(
         f"Total: <b>{total}</b> | "
         f"🟡 Active: <b>{len(active)}</b> | "
-        f"🟢 Pumped: <b>{len(pumped)}</b> | "
-        f"🔴 Stopped: <b>{len(stopped)}</b> | "
-        f"⚫ Closed: <b>{len(closed)}</b>"
+        f"🟢 TP30 Hit: <b>{len(tp30)}</b> | "
+        f"🔴 Stopped: <b>{len(stopped)}</b>"
     )
     if closed_total > 0:
         lines.append(f"WR: <b>{wr:.0f}%</b> | LR: <b>{lr:.0f}%</b> ({closed_total} closed)")
 
-    if pumped:
+    if tp30:
         lines.append("")
-        lines.append("🟢 <b>PUMPED (+30%+)</b>")
-        for s in pumped[-5:]:
+        lines.append("🟢 <b>TP30 HIT (+30%)</b>")
+        for s in tp30[-5:]:
             peak = s.get("peak_pct", 0)
             ttp = s.get("time_to_peak_min", 0)
             lines.append(
