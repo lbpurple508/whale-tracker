@@ -13,9 +13,10 @@ BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = Path("monitor_cooldown.json")
 REJECT_FILE = Path("monitor_rejections.json")
 HISTORY_FILE = Path("monitor_history.json")
-SIGNALS_FILE = Path("monitor_signals.json")
+SIGNALS_FILE = Path("monitor/monitor_signals.json")  # FIXED PATH
 COOLDOWN_MINUTES = 240
 COOLDOWN_BREAKOUT_MINUTES = 240
+COOLDOWN_WATCHLIST_MINUTES = 60
 HISTORY_HOURS = 6
 
 MONITORING_TOKENS = [
@@ -118,7 +119,14 @@ def load_cooldown():
         if t is None:
             continue
         stage = info.get("stage", "BREAKOUT")
-        minutes = COOLDOWN_BREAKOUT_MINUTES if stage == "BREAKOUT" else COOLDOWN_MINUTES
+        
+        if stage == "BREAKOUT":
+            minutes = COOLDOWN_BREAKOUT_MINUTES
+        elif stage == "WATCHLIST":
+            minutes = COOLDOWN_WATCHLIST_MINUTES
+        else:
+            minutes = COOLDOWN_MINUTES
+            
         if (now - t).total_seconds() < minutes * 60:
             cleaned[sym] = info
     return cleaned
@@ -253,6 +261,62 @@ def count_dead_base_hours(k15):
     return dead / 4.0
 
 
+def check_pre_pump(k15, k5):
+    """
+    Detects the 'WATCHLIST' phase: tight base + volume ticking up + price still near base.
+    """
+    try:
+        closes = [float(k[4]) for k in k15]
+        highs = [float(k[2]) for k in k15]
+        lows = [float(k[3]) for k in k15]
+        volumes = [float(k[5]) for k in k15]
+        
+        current_price = closes[-1]
+        
+        # 1. Compression: Is the last 4 hours (16 candles) tight?
+        recent_high = max(highs[-16:])
+        recent_low = min(lows[-16:])
+        if recent_low <= 0: return None
+        
+        base_range_pct = ((recent_high - recent_low) / recent_low) * 100
+        
+        # We want a tight base. For monitoring coins, < 4% is tight.
+        if base_range_pct > 4.0:
+            return None
+            
+        # 2. Volume Anomaly
+        avg_15m_vol = sum(volumes[-16:]) / 16
+        current_5m_vol = float(k5[-2][5])
+        avg_5m_vol = avg_15m_vol / 3.0
+        
+        if avg_5m_vol <= 0: return None
+        vol_ratio = current_5m_vol / avg_5m_vol
+        
+        # Volume must be picking up, but price hasn't exploded yet
+        if vol_ratio < 1.5:
+            return None
+            
+        # 3. Price is still near the base
+        dist_to_base_high = ((recent_high - current_price) / current_price) * 100
+        
+        # If it's already broken out, we don't want to send a WATCHLIST alert
+        if dist_to_base_high < 0.5:
+            return None
+            
+        return {
+            "price": current_price,
+            "base_range_pct": base_range_pct,
+            "vol_ratio": vol_ratio,
+            "dist_to_base_high": dist_to_base_high,
+            "base_high": recent_high,
+            "base_low": recent_low,
+        }
+        
+    except Exception as e:
+        print(f"pre_pump error: {e}")
+        return None
+
+
 def detect_stage(symbol, ist_hour):
     reasons = []
     try:
@@ -268,7 +332,30 @@ def detect_stage(symbol, ist_hour):
         if not isinstance(k5, list) or len(k5) < 15:
             return None, ["not_enough_5m"]
 
-        # 5m trigger candle
+        # --- PRE-PUMP WATCHLIST CHECK ---
+        pre_pump = check_pre_pump(k15, k5)
+        if pre_pump:
+            return "WATCHLIST", {
+                "price": pre_pump["price"],
+                "base_range_pct": pre_pump["base_range_pct"],
+                "vol_ratio": pre_pump["vol_ratio"],
+                "dist_to_base_high": pre_pump["dist_to_base_high"],
+                "base_high": pre_pump["base_high"],
+                "tier": 1 if symbol in OWN_CHAIN else 2,
+                "dead_hours": 0,
+                "change_5m": 0,
+                "change_1h": 0,
+                "change_6h": 0,
+                "explosion_ratio": pre_pump["vol_ratio"],
+                "rsi": 50,
+                "buy_pressure": 50,
+                "bid_depth": 0,
+                "ask_depth": 0,
+                "bid_ask_ratio": 0,
+                "prime": False,
+            }
+
+        # --- EXISTING BREAKOUT LOGIC ---
         completed_5m = k5[-2]
         prev_completed_5m = k5[-3]
 
@@ -286,35 +373,28 @@ def detect_stage(symbol, ist_hour):
             return None, ["bad_prev"]
         change_5m = ((c_close - prev_close) / prev_close) * 100
 
-        # 1h and 6h changes using 15m for context
         price_1h_ago = float(k15[-6][4])
         change_1h = ((c_close - price_1h_ago) / price_1h_ago) * 100
 
         price_6h_ago = float(k15[-26][4])
         change_6h = ((c_close - price_6h_ago) / price_6h_ago) * 100
 
-        # Volume base: 5m quiet average over last 20 completed candles
         quiet_vols_5m = [float(k[5]) for k in k5[-22:-2]]
         quiet_avg_5m = sum(quiet_vols_5m) / len(quiet_vols_5m) if quiet_vols_5m else 0
         if quiet_avg_5m <= 0:
             return None, ["quiet_avg_zero"]
         explosion_ratio = c_vol / quiet_avg_5m
 
-        # Candle quality
         rng = c_high - c_low
         if rng <= 0:
             return None, ["zero_range"]
         upper_wick = (c_high - max(c_open, c_close)) / rng
         clv = (c_close - c_low) / rng
 
-        # Dead base: count hours flat on 15m
         dead_hours = count_dead_base_hours(k15)
-
-        # RSI 15m (informational)
         closes_15m = [float(k[4]) for k in k15[:-1]]
         rsi_15m = compute_rsi(closes_15m, 14)
 
-        # Buy pressure from last 4 completed 5m candles
         recent_taker = sum(float(k[9]) for k in k5[-5:-1])
         recent_total = sum(float(k[5]) for k in k5[-5:-1])
         buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
@@ -322,7 +402,6 @@ def detect_stage(symbol, ist_hour):
         bid_depth, ask_depth = check_depth(symbol, c_close)
         bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
 
-        # Tier thresholds
         tier = 1 if symbol in OWN_CHAIN else 2
         if tier == 1:
             min_5m = 1.2
@@ -336,26 +415,16 @@ def detect_stage(symbol, ist_hour):
             min_5m -= 0.3
             min_vol -= 0.5
 
-        if c_close <= c_open:
-            reasons.append("red_candle")
-        if change_5m < min_5m:
-            reasons.append(f"5m_{change_5m:.1f}%")
-        if change_5m > 6.0:
-            reasons.append(f"5m_high_{change_5m:.1f}%")
-        if explosion_ratio < min_vol:
-            reasons.append(f"vol_{explosion_ratio:.1f}x")
-        if upper_wick > 0.35:
-            reasons.append(f"wick_{upper_wick*100:.0f}%")
-        if clv < 0.70:
-            reasons.append(f"clv_{clv:.2f}")
-        if buy_pressure < 0.55:
-            reasons.append(f"buy_{buy_pressure*100:.0f}%")
-        if bid_ask_ratio < 0.9:
-            reasons.append(f"ratio_{bid_ask_ratio:.2f}")
-        if bid_depth < 15_000:
-            reasons.append(f"bid_{bid_depth:.0f}")
-        if ask_depth < 15_000:
-            reasons.append(f"ask_{ask_depth:.0f}")
+        if c_close <= c_open: reasons.append("red_candle")
+        if change_5m < min_5m: reasons.append(f"5m_{change_5m:.1f}%")
+        if change_5m > 6.0: reasons.append(f"5m_high_{change_5m:.1f}%")
+        if explosion_ratio < min_vol: reasons.append(f"vol_{explosion_ratio:.1f}x")
+        if upper_wick > 0.35: reasons.append(f"wick_{upper_wick*100:.0f}%")
+        if clv < 0.70: reasons.append(f"clv_{clv:.2f}")
+        if buy_pressure < 0.55: reasons.append(f"buy_{buy_pressure*100:.0f}%")
+        if bid_ask_ratio < 0.9: reasons.append(f"ratio_{bid_ask_ratio:.2f}")
+        if bid_depth < 15_000: reasons.append(f"bid_{bid_depth:.0f}")
+        if ask_depth < 15_000: reasons.append(f"ask_{ask_depth:.0f}")
 
         if reasons:
             return None, reasons
@@ -410,18 +479,10 @@ def scan(session, ist_hour):
     return hits
 
 
-def is_active_session(ist_hour, ist_minute):
-    total_min = ist_hour * 60 + ist_minute
-    start_min = 8 * 60 + 30
-    end_min = 15 * 60 + 30
-    return start_min <= total_min <= end_min
-
-
 def get_session_label(hour):
-    if 8 <= hour <= 11:
-        return "Asia"
-    if 12 <= hour <= 15:
-        return "Europe"
+    if 8 <= hour <= 11: return "Asia"
+    if 12 <= hour <= 15: return "Europe"
+    if 18 <= hour <= 22: return "US"
     return "Off"
 
 
@@ -430,10 +491,9 @@ def main():
     session = get_session_label(ist.hour)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
 
-    if not is_active_session(ist.hour, ist.minute):
-        print("Outside 8:30-15:30 IST. Skipping.")
-        return
-
+    # FIXED: Ensure the monitor directory exists
+    SIGNALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
     if not SIGNALS_FILE.exists():
         SIGNALS_FILE.write_text('{"signals": []}')
     else:
@@ -449,39 +509,57 @@ def main():
 
     fired_symbols = set()
     for h in hits:
-        tier = h.get("tier", 2)
-        tier_label = "Tier 1 — Own Chain" if tier == 1 else "Tier 2 — Token"
-        prime_flag = " ⚡PRIME" if h.get("prime") else ""
-        header = f"🚀 BREAKOUT [{tier_label}]{prime_flag} [{session}]"
+        stage = h.get("stage")
+        
+        if stage == "WATCHLIST":
+            # Send WATCHLIST alert
+            msg = (
+                f"👀 <b>WATCHLIST: {h['symbol']}</b>\n\n"
+                f"<b>Price:</b> {format_price(h['price'])}\n"
+                f"<b>Base Range:</b> {h['base_range_pct']:.2f}%\n"
+                f"<b>Volume Ratio:</b> {h['vol_ratio']:.2f}x quiet\n"
+                f"<b>Distance to Base High:</b> {h['dist_to_base_high']:.2f}%\n\n"
+                f"⚠️ <b>DO NOT BUY YET.</b> Watch for a breakout above {format_price(h['base_high'])}."
+            )
+            send_telegram(msg)
+            record_alert(h["symbol"], "WATCHLIST")
+            log_signal(h["symbol"], "WATCHLIST", h, session)
+            continue
 
-        record_alert(h["symbol"], "BREAKOUT")
-        log_signal(h["symbol"], "BREAKOUT", h, session)
-        fired_symbols.add(h["symbol"])
+        if stage == "BREAKOUT":
+            tier = h.get("tier", 2)
+            tier_label = "Tier 1 — Own Chain" if tier == 1 else "Tier 2 — Token"
+            prime_flag = " ⚡PRIME" if h.get("prime") else ""
+            header = f"🚀 BREAKOUT [{tier_label}]{prime_flag} [{session}]"
 
-        stop = h["price"] * 0.97
-        target_5 = h["price"] * 1.05
-        target_10 = h["price"] * 1.10
-        target_25 = h["price"] * 1.25
+            record_alert(h["symbol"], "BREAKOUT")
+            log_signal(h["symbol"], "BREAKOUT", h, session)
+            fired_symbols.add(h["symbol"])
 
-        msg = (
-            f"{header}\n\n"
-            f"<b>Coin:</b> {h['symbol']}\n"
-            f"<b>Price:</b> {format_price(h['price'])}\n"
-            f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
-            f"<b>5m Change:</b> {h['change_5m']:+.2f}%\n"
-            f"<b>Volume:</b> {h['explosion_ratio']:.2f}x quiet\n"
-            f"<b>RSI(15m):</b> {h['rsi']:.1f}\n"
-            f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
-            f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
-            f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
-            f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
-            f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"<b>Entry:</b> {format_price(h['price'])}\n"
-            f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
-            f"<b>Targets:</b> +5% {format_price(target_5)} | +10% {format_price(target_10)} | +25% {format_price(target_25)}\n\n"
-            f"✅ ENTER NOW — Buy at market. SL {format_price(stop)}."
-        )
-        send_telegram(msg)
+            stop = h["price"] * 0.97
+            target_5 = h["price"] * 1.05
+            target_10 = h["price"] * 1.10
+            target_25 = h["price"] * 1.25
+
+            msg = (
+                f"{header}\n\n"
+                f"<b>Coin:</b> {h['symbol']}\n"
+                f"<b>Price:</b> {format_price(h['price'])}\n"
+                f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
+                f"<b>5m Change:</b> {h['change_5m']:+.2f}%\n"
+                f"<b>Volume:</b> {h['explosion_ratio']:.2f}x quiet\n"
+                f"<b>RSI(15m):</b> {h['rsi']:.1f}\n"
+                f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
+                f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
+                f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
+                f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
+                f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
+                f"<b>Entry:</b> {format_price(h['price'])}\n"
+                f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
+                f"<b>Targets:</b> +5% {format_price(target_5)} | +10% {format_price(target_10)} | +25% {format_price(target_25)}\n\n"
+                f"✅ ENTER NOW — Buy at market. SL {format_price(stop)}."
+            )
+            send_telegram(msg)
 
     for fired in fired_symbols:
         pair = ECOSYSTEM_PAIRS.get(fired)
