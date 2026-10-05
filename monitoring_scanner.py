@@ -33,6 +33,9 @@ CONFIRM_MIN_HOURS = 1.0
 CONFIRM_MAX_HOURS = 6.0
 MAX_EXTENSION_PCT = 5.0
 
+# Maximum Telegram send retries for a confirmation before we drop the entry.
+MAX_CONFIRM_SEND_FAILURES = 3
+
 # Binance Spot kline field indexes.
 KLINE_OPEN_TIME = 0
 KLINE_OPEN = 1
@@ -48,9 +51,6 @@ KLINE_TAKER_BUY_QUOTE_VOLUME = 10
 
 KLINE_INTERVAL = "5m"
 KLINE_LIMIT = 500
-
-# Explicit minimums. Fetch must return MIN_RAW_CANDLES to safely give us
-# MIN_CLOSED_CANDLES after removing the potentially-forming candle.
 MIN_CLOSED_CANDLES = 288
 MIN_RAW_CANDLES = MIN_CLOSED_CANDLES + 10
 
@@ -66,7 +66,6 @@ MONITORING_TOKENS = [
     "QKCUSDT", "GNSUSDT",
 ]
 
-# Kept for compatibility with your existing configuration.
 OWN_CHAIN = {
     "MOVRUSDT", "GLMRUSDT", "ARKUSDT", "SCRUSDT", "EPICUSDT",
     "STXUSDT", "LSKUSDT", "SYNUSDT", "SOPHUSDT", "HEIUSDT",
@@ -377,11 +376,6 @@ def compute_rsi(closes, period=14):
 
 
 def compute_rsi_15m(closes_5m):
-    """Approximate 15m RSI by sampling every 3rd 5m close.
-
-    Uses 45 recent 5m closes -> 15 sampled 15m closes -> 14-period RSI.
-    Falls back to 50.0 if there is not enough data.
-    """
     if len(closes_5m) < 45:
         return 50.0
     closes_15m = closes_5m[-45::3]
@@ -483,17 +477,14 @@ def compute_trend_features(k5):
     range_4h = (max(highs[-48:]) - min(lows[-48:])) / min(lows[-48:]) * 100.0
     range_12h = (max(highs[-144:]) - min(lows[-144:])) / min(lows[-144:]) * 100.0
 
-    # Proper 15m RSI derived from 5m closes.
     rsi_15m = compute_rsi_15m(closes)
 
-    # Binance Spot [9] is taker-buy BASE volume and [5] is total BASE volume.
     recent_taker_buy_base = sum(taker_buy_base[-12:])
     recent_base_volume = sum(volumes[-12:])
     taker_ratio = recent_taker_buy_base / recent_base_volume if recent_base_volume > 0 else 0.5
 
     base_high_4h = max(highs[-48:])
 
-    # Features use closed candles only; current price comes from the newest candle.
     try:
         current_price = float(k5[-1][KLINE_CLOSE])
     except (TypeError, ValueError, IndexError):
@@ -555,7 +546,6 @@ def check_confirmation(entry, features_now):
 
     atr_now = float(features_now["atr_slope_12h"])
 
-    # Reject a true collapse: current slope is below 50% of entry slope.
     if atr_before > 0 and atr_now < atr_before * 0.5:
         return False, "atr_collapse"
 
@@ -634,7 +624,6 @@ def scan(session, ist_hour):
             print(f"Confirmation error for {symbol}: {exc}")
 
     # STAGE 1: new watchlist candidates.
-    # Active entries are deliberately skipped so their 1-6 hour window is not reset.
     active_watchlist = set(watchlist_state.keys())
     watchlist_hits = []
     rejection = {}
@@ -728,6 +717,18 @@ def main():
             cooldown[symbol] = record_alert(symbol, "BREAKOUT")
             log_signal(symbol, "BREAKOUT", info, session)
             watchlist_state.pop(symbol, None)
+        else:
+            # Telegram failed. Track consecutive failures.
+            entry = watchlist_state.get(symbol)
+            if not isinstance(entry, dict):
+                continue
+
+            failures = int(entry.get("failed_sends", 0)) + 1
+            if failures >= MAX_CONFIRM_SEND_FAILURES:
+                print(f"Dropping {symbol} after {failures} failed confirmation sends")
+                watchlist_state.pop(symbol, None)
+            else:
+                entry["failed_sends"] = failures
 
     for hit in watchlist_hits:
         symbol = hit["symbol"]
@@ -760,6 +761,7 @@ def main():
                 "trades_slope_12h": features["trades_slope_12h"],
                 "range_4h_pct": features["range_4h_pct"],
                 "entry_price": features["current_price"],
+                "failed_sends": 0,
             }
 
     save_json(WATCHLIST_STATE_FILE, watchlist_state)
