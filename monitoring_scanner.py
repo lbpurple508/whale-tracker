@@ -32,8 +32,6 @@ SIG_RANGE_4H_MIN = 10.0
 CONFIRM_MIN_HOURS = 1.0
 CONFIRM_MAX_HOURS = 6.0
 MAX_EXTENSION_PCT = 5.0
-
-# Maximum Telegram send retries for a confirmation before we drop the entry.
 MAX_CONFIRM_SEND_FAILURES = 3
 
 # Binance Spot kline field indexes.
@@ -53,7 +51,6 @@ KLINE_INTERVAL = "5m"
 KLINE_LIMIT = 500
 MIN_CLOSED_CANDLES = 288
 MIN_RAW_CANDLES = MIN_CLOSED_CANDLES + 10
-
 MAX_WORKERS = 8
 
 MONITORING_TOKENS = [
@@ -175,7 +172,8 @@ def load_json(path):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print(f"load error for {path}: {exc}")
         return {}
 
 
@@ -188,7 +186,7 @@ def save_json(path, data):
             encoding="utf-8",
         )
         tmp.replace(path)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         print(f"save error for {path}: {exc}")
 
 
@@ -226,8 +224,12 @@ def load_cooldown():
         else:
             continue
 
-        if (now - timestamp).total_seconds() < minutes * 60:
-            cleaned[symbol] = {"ts": timestamp.isoformat(), "stage": stage}
+        age_seconds = (now - timestamp).total_seconds()
+        if 0 <= age_seconds < minutes * 60:
+            cleaned[symbol] = {
+                "ts": timestamp.isoformat(),
+                "stage": stage,
+            }
 
     if cleaned != data:
         save_json(COOLDOWN_FILE, cleaned)
@@ -245,7 +247,10 @@ def cooldown_blocks(cooldown, symbol, stage, now=None):
         return False
 
     current_time = now or now_utc()
-    age_minutes = (current_time - timestamp).total_seconds() / 60
+    age_minutes = (current_time - timestamp).total_seconds() / 60.0
+    if age_minutes < 0:
+        return True
+
     previous_stage = info.get("stage", "")
 
     if previous_stage == "BREAKOUT":
@@ -275,7 +280,8 @@ def record_alert(symbol, stage, now=None):
         timestamp = parse_ts_safe(ts)
         if timestamp is None:
             continue
-        if (alert_time - timestamp).total_seconds() < HISTORY_HOURS * 3600:
+        age_seconds = (alert_time - timestamp).total_seconds()
+        if 0 <= age_seconds < HISTORY_HOURS * 3600:
             cleaned_events.append(ts)
 
     history[symbol]["events"] = cleaned_events
@@ -305,10 +311,10 @@ def log_signal(symbol, stage, data, session):
             "trades_slope_12h": data.get("trades_slope_12h"),
             "range_4h_pct": data.get("range_4h_pct"),
             "range_12h_pct": data.get("range_12h_pct"),
-            "rsi_15m": data.get("rsi_15m"),
-            "taker_buy_ratio": data.get("taker_buy_ratio"),
-            "vol_ratio_1h_24h": data.get("vol_ratio_1h_24h"),
-            "base_high_4h": data.get("base_high_4h"),
+            "rsi_15m": data.get("rsi_15m") if data.get("rsi_15m") is not None else data.get("rsi"),
+            "taker_buy_ratio": data.get("taker_buy_ratio") if data.get("taker_buy_ratio") is not None else data.get("taker_ratio"),
+            "vol_ratio_1h_24h": data.get("vol_ratio_1h_24h") if data.get("vol_ratio_1h_24h") is not None else data.get("vol_ratio_now"),
+            "base_high_4h": data.get("base_high_4h") if data.get("base_high_4h") is not None else data.get("base_high"),
             "atr_slope_now": data.get("atr_slope_now"),
             "vol_ratio_now": data.get("vol_ratio_now"),
             "trades_slope_now": data.get("trades_slope_now"),
@@ -392,10 +398,12 @@ def _closed_klines(k5, now_ms=None):
     for kline in k5:
         if not isinstance(kline, list) or len(kline) < 12:
             continue
+
         try:
             close_time = int(kline[KLINE_CLOSE_TIME])
         except (TypeError, ValueError):
             continue
+
         if close_time < current_ms:
             closed.append(kline)
 
@@ -422,6 +430,8 @@ def compute_trend_features(k5):
 
     if any(price <= 0 for price in highs + lows + closes):
         return None
+    if any(high < low for high, low in zip(highs, lows)):
+        return None
     if any(volume < 0 for volume in volumes):
         return None
     if any(count < 0 for count in trades):
@@ -432,17 +442,17 @@ def compute_trend_features(k5):
     trs = []
     for i in range(1, len(closed)):
         previous_close = closes[i - 1]
-        tr = max(
+        true_range = max(
             highs[i] - lows[i],
             abs(highs[i] - previous_close),
             abs(lows[i] - previous_close),
         )
-        trs.append(tr)
-
-    if len(trs) < 14:
-        return None
+        trs.append(true_range)
 
     atr_period = 14
+    if len(trs) < atr_period:
+        return None
+
     atr_series = [
         sum(trs[i - atr_period:i]) / atr_period
         for i in range(atr_period, len(trs) + 1)
@@ -481,14 +491,14 @@ def compute_trend_features(k5):
 
     recent_taker_buy_base = sum(taker_buy_base[-12:])
     recent_base_volume = sum(volumes[-12:])
-    taker_ratio = recent_taker_buy_base / recent_base_volume if recent_base_volume > 0 else 0.5
+    taker_ratio = (
+        recent_taker_buy_base / recent_base_volume
+        if recent_base_volume > 0
+        else 0.5
+    )
+    taker_ratio = min(max(taker_ratio, 0.0), 1.0)
 
     base_high_4h = max(highs[-48:])
-
-    try:
-        current_price = float(k5[-1][KLINE_CLOSE])
-    except (TypeError, ValueError, IndexError):
-        current_price = closes[-1]
 
     return {
         "atr_slope_12h": atr_slope,
@@ -500,8 +510,32 @@ def compute_trend_features(k5):
         "rsi_15m": rsi_15m,
         "taker_buy_ratio": taker_ratio,
         "base_high_4h": base_high_4h,
-        "current_price": current_price,
+        "current_price": closes[-1],
     }
+
+
+def fetch_current_price(symbol, fallback=None):
+    data = http_get_json(
+        f"{BASE_URL}/api/v3/ticker/price",
+        params={"symbol": symbol},
+        timeout=10,
+        retries=1,
+    )
+
+    try:
+        if isinstance(data, dict):
+            price = float(data["price"])
+        elif isinstance(data, list) and data:
+            price = float(data[0]["price"])
+        else:
+            raise ValueError("unexpected ticker response")
+
+        if price > 0:
+            return price
+    except (KeyError, TypeError, ValueError, IndexError):
+        pass
+
+    return float(fallback) if fallback is not None else None
 
 
 def detect_watchlist(features):
@@ -530,13 +564,13 @@ def check_confirmation(entry, features_now):
     try:
         base_high = float(entry.get("base_high_4h", 0))
         atr_before = float(entry.get("atr_slope_12h", 0))
-    except (TypeError, ValueError):
+        current_price = float(features_now["current_price"])
+    except (TypeError, ValueError, KeyError):
         return False, "bad_entry"
 
-    if base_high <= 0:
-        return False, "no_base"
+    if base_high <= 0 or current_price <= 0:
+        return False, "bad_price"
 
-    current_price = float(features_now["current_price"])
     if current_price <= base_high:
         return False, "no_break"
 
@@ -569,7 +603,11 @@ def check_confirmation(entry, features_now):
 def fetch_klines_5m(symbol, limit=KLINE_LIMIT):
     data = http_get_json(
         f"{BASE_URL}/api/v3/klines",
-        params={"symbol": symbol, "interval": KLINE_INTERVAL, "limit": limit},
+        params={
+            "symbol": symbol,
+            "interval": KLINE_INTERVAL,
+            "limit": limit,
+        },
         timeout=15,
         retries=1,
     )
@@ -602,6 +640,9 @@ def scan(session, ist_hour):
             continue
 
         hours_since = (now - entry_dt).total_seconds() / 3600.0
+        if hours_since < 0:
+            del watchlist_state[symbol]
+            continue
         if hours_since > CONFIRM_MAX_HOURS:
             del watchlist_state[symbol]
             continue
@@ -616,6 +657,11 @@ def scan(session, ist_hour):
             features_now = compute_trend_features(k5)
             if features_now is None:
                 continue
+
+            live_price = fetch_current_price(symbol, fallback=features_now["current_price"])
+            if live_price is None:
+                continue
+            features_now["current_price"] = live_price
 
             ok, info = check_confirmation(entry, features_now)
             if ok:
@@ -636,16 +682,28 @@ def scan(session, ist_hour):
 
             features = compute_trend_features(k5)
             ok, info = detect_watchlist(features)
-            if ok:
-                return symbol, info, None
-            return symbol, None, info
+            if not ok:
+                return symbol, None, info
+
+            live_price = fetch_current_price(symbol, fallback=info["current_price"])
+            if live_price is None:
+                return symbol, None, "no_price"
+
+            info["current_price"] = live_price
+            return symbol, info, None
         except Exception as exc:
             return symbol, None, f"scan_error:{type(exc).__name__}"
 
-    symbols_to_scan = [symbol for symbol in MONITORING_TOKENS if symbol not in active_watchlist]
+    symbols_to_scan = [
+        symbol for symbol in MONITORING_TOKENS
+        if symbol not in active_watchlist
+    ]
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_scan_one, symbol): symbol for symbol in symbols_to_scan}
+        futures = {
+            executor.submit(_scan_one, symbol): symbol
+            for symbol in symbols_to_scan
+        }
 
         for future in as_completed(futures):
             symbol = futures[future]
@@ -658,7 +716,7 @@ def scan(session, ist_hour):
             if info:
                 watchlist_hits.append({"symbol": symbol, "features": info})
             elif isinstance(reason, str):
-                reason_key = reason.split("_")[0]
+                reason_key = reason.split("_", 1)[0]
                 rejection[reason_key] = rejection.get(reason_key, 0) + 1
                 log_rejection(symbol, [reason])
 
@@ -691,7 +749,10 @@ def main():
     if not SIGNALS_FILE.exists():
         save_json(SIGNALS_FILE, {"signals": []})
 
-    watchlist_hits, confirmations, watchlist_state, cooldown = scan(session, ist.hour)
+    watchlist_hits, confirmations, watchlist_state, cooldown = scan(
+        session,
+        ist.hour,
+    )
 
     for confirmation in confirmations:
         symbol = confirmation["symbol"]
@@ -714,15 +775,14 @@ def main():
         )
 
         if send_telegram(msg):
-            cooldown[symbol] = record_alert(symbol, "BREAKOUT")
+            alert_ts = now_utc()
+            cooldown[symbol] = record_alert(symbol, "BREAKOUT", now=alert_ts)
             log_signal(symbol, "BREAKOUT", info, session)
             watchlist_state.pop(symbol, None)
         else:
-            # Telegram failed. Track consecutive failures.
             entry = watchlist_state.get(symbol)
             if not isinstance(entry, dict):
                 continue
-
             failures = int(entry.get("failed_sends", 0)) + 1
             if failures >= MAX_CONFIRM_SEND_FAILURES:
                 print(f"Dropping {symbol} after {failures} failed confirmation sends")
