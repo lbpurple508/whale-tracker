@@ -2,26 +2,59 @@ import os
 import json
 import html
 import time
-import requests
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_DIR = Path(__file__).resolve().parent
-
 BASE_URL = "https://data-api.binance.vision"
 COOLDOWN_FILE = BASE_DIR / "monitor_cooldown.json"
 REJECT_FILE = BASE_DIR / "monitor_rejections.json"
 HISTORY_FILE = BASE_DIR / "monitor_history.json"
-SIGNALS_FILE = BASE_DIR / "monitor_signals.json"   # FIXED: no subfolder
+SIGNALS_FILE = BASE_DIR / "monitor_signals.json"
+WATCHLIST_STATE_FILE = BASE_DIR / "monitor_watchlist_state.json"
 
-COOLDOWN_MINUTES = 240
 COOLDOWN_BREAKOUT_MINUTES = 240
 COOLDOWN_WATCHLIST_MINUTES = 60
 HISTORY_HOURS = 6
+
+SIG_ATR_SLOPE_12H = 20.0
+SIG_VOL_SLOPE_12H = 30.0
+SIG_TRADES_SLOPE_12H = 20.0
+SIG_RANGE_4H_MIN = 10.0
+
+CONFIRM_MIN_HOURS = 1.0
+CONFIRM_MAX_HOURS = 6.0
+MAX_EXTENSION_PCT = 5.0
+
+# Binance Spot kline field indexes.
+KLINE_OPEN_TIME = 0
+KLINE_OPEN = 1
+KLINE_HIGH = 2
+KLINE_LOW = 3
+KLINE_CLOSE = 4
+KLINE_VOLUME = 5
+KLINE_CLOSE_TIME = 6
+KLINE_QUOTE_VOLUME = 7
+KLINE_TRADES = 8
+KLINE_TAKER_BUY_BASE_VOLUME = 9
+KLINE_TAKER_BUY_QUOTE_VOLUME = 10
+
+KLINE_INTERVAL = "5m"
+KLINE_LIMIT = 500
+
+# Explicit minimums. Fetch must return MIN_RAW_CANDLES to safely give us
+# MIN_CLOSED_CANDLES after removing the potentially-forming candle.
+MIN_CLOSED_CANDLES = 288
+MIN_RAW_CANDLES = MIN_CLOSED_CANDLES + 10
+
+MAX_WORKERS = 8
 
 MONITORING_TOKENS = [
     "RAREUSDT", "ARKUSDT", "WIFUSDT", "QIUSDT", "MOVEUSDT",
@@ -33,6 +66,7 @@ MONITORING_TOKENS = [
     "QKCUSDT", "GNSUSDT",
 ]
 
+# Kept for compatibility with your existing configuration.
 OWN_CHAIN = {
     "MOVRUSDT", "GLMRUSDT", "ARKUSDT", "SCRUSDT", "EPICUSDT",
     "STXUSDT", "LSKUSDT", "SYNUSDT", "SOPHUSDT", "HEIUSDT",
@@ -44,48 +78,60 @@ ECOSYSTEM_PAIRS = {
     "MOVRUSDT": "GLMRUSDT",
 }
 
-PRIME_START_H = 10
-PRIME_END_H = 13
-
-MAX_BASE_RANGE_PCT = 4.0
-MIN_DIST_TO_BASE_HIGH = 0.5
-BASE_BARS = 16
-VOLUME_BASELINE_BARS = 20
-ONE_HOUR_BARS = 12
-SIX_HOUR_BARS = 72
+if KLINE_LIMIT < MIN_RAW_CANDLES:
+    raise ValueError(
+        f"KLINE_LIMIT ({KLINE_LIMIT}) must be >= MIN_RAW_CANDLES ({MIN_RAW_CANDLES})"
+    )
 
 
 def now_utc():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def format_price(p):
-    if p >= 1:
-        return f"${p:.4f}"
-    if p >= 0.01:
-        return f"${p:.5f}"
-    if p >= 0.0001:
-        return f"${p:.6f}"
-    return f"${p:.8f}"
+def format_price(price):
+    price = float(price)
+    if price >= 1:
+        return f"${price:.4f}"
+    if price >= 0.01:
+        return f"${price:.5f}"
+    if price >= 0.0001:
+        return f"${price:.6f}"
+    return f"${price:.8f}"
 
 
-def http_get_json(url, timeout=10, retries=1):
+def http_get_json(url, params=None, timeout=10, retries=1):
     for attempt in range(retries + 1):
         try:
-            r = requests.get(url, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                if attempt < retries:
-                    time.sleep(2)
-                    continue
-                return None
+            response = requests.get(url, params=params, timeout=timeout)
+
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except ValueError:
+                    print(f"Invalid JSON from {url}")
+                    return None
+
+            retryable = response.status_code == 429 or 500 <= response.status_code < 600
+            if retryable and attempt < retries:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = max(0.5, min(float(retry_after), 10.0)) if retry_after else 2.0
+                except (TypeError, ValueError):
+                    delay = 2.0
+                time.sleep(delay)
+                continue
+
+            if response.status_code != 404:
+                print(f"HTTP error {response.status_code} from {url}")
             return None
-        except Exception:
+
+        except requests.RequestException as exc:
             if attempt < retries:
                 time.sleep(2)
                 continue
+            print(f"HTTP request error for {url}: {exc}")
             return None
+
     return None
 
 
@@ -93,50 +139,70 @@ def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram env vars missing")
         return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+    }
+
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
-            print(f"Telegram HTTP error: {response.status_code} - {response.text}")
+            print(f"Telegram HTTP error: {response.status_code}")
             return False
-        body = response.json()
+
+        try:
+            body = response.json()
+        except ValueError:
+            print("Telegram returned invalid JSON")
+            return False
+
         if not body.get("ok"):
             print(f"Telegram API error: {body}")
             return False
+
         return True
-    except Exception as e:
-        print(f"Telegram error: {e}")
+    except requests.RequestException as exc:
+        print(f"Telegram error: {exc}")
         return False
 
 
 def load_json(path):
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def save_json(path, data):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data))
+        tmp.write_text(
+            json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
         tmp.replace(path)
-    except Exception as e:
-        print(f"save error: {e}")
+    except OSError as exc:
+        print(f"save error for {path}: {exc}")
 
 
 def parse_ts_safe(ts_str):
+    if not isinstance(ts_str, str) or not ts_str:
+        return None
+
     try:
-        t = datetime.fromisoformat(ts_str)
-        if t.tzinfo is not None:
-            t = t.astimezone(timezone.utc).replace(tzinfo=None)
-        return t
-    except Exception:
+        timestamp = datetime.fromisoformat(ts_str)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+        return timestamp
+    except ValueError:
         return None
 
 
@@ -144,66 +210,83 @@ def load_cooldown():
     data = load_json(COOLDOWN_FILE)
     now = now_utc()
     cleaned = {}
-    for sym, info in data.items():
+
+    for symbol, info in data.items():
         if not isinstance(info, dict):
             continue
-        ts = info.get("ts", "")
-        if not isinstance(ts, str):
+
+        timestamp = parse_ts_safe(info.get("ts", ""))
+        if timestamp is None:
             continue
-        t = parse_ts_safe(ts)
-        if t is None:
-            continue
-        stage = info.get("stage", "BREAKOUT")
+
+        stage = info.get("stage")
         if stage == "BREAKOUT":
             minutes = COOLDOWN_BREAKOUT_MINUTES
         elif stage == "WATCHLIST":
             minutes = COOLDOWN_WATCHLIST_MINUTES
         else:
-            minutes = COOLDOWN_MINUTES
-        if (now - t).total_seconds() < minutes * 60:
-            cleaned[sym] = info
+            continue
+
+        if (now - timestamp).total_seconds() < minutes * 60:
+            cleaned[symbol] = {"ts": timestamp.isoformat(), "stage": stage}
+
+    if cleaned != data:
+        save_json(COOLDOWN_FILE, cleaned)
+
     return cleaned
 
 
-def cooldown_blocks(cooldown, symbol, stage):
+def cooldown_blocks(cooldown, symbol, stage, now=None):
     info = cooldown.get(symbol)
     if not isinstance(info, dict):
         return False
-    ts = parse_ts_safe(info.get("ts", ""))
-    if ts is None:
+
+    timestamp = parse_ts_safe(info.get("ts", ""))
+    if timestamp is None:
         return False
-    age_min = (now_utc() - ts).total_seconds() / 60
-    prev_stage = info.get("stage", "")
-    if prev_stage == "BREAKOUT":
-        return age_min < COOLDOWN_BREAKOUT_MINUTES
-    if prev_stage == "WATCHLIST":
-        return stage == "WATCHLIST" and age_min < COOLDOWN_WATCHLIST_MINUTES
+
+    current_time = now or now_utc()
+    age_minutes = (current_time - timestamp).total_seconds() / 60
+    previous_stage = info.get("stage", "")
+
+    if previous_stage == "BREAKOUT":
+        return age_minutes < COOLDOWN_BREAKOUT_MINUTES
+
+    if previous_stage == "WATCHLIST":
+        return stage == "WATCHLIST" and age_minutes < COOLDOWN_WATCHLIST_MINUTES
+
     return False
 
 
-def record_alert(symbol, stage):
+def record_alert(symbol, stage, now=None):
+    alert_time = now or now_utc()
+
     history = load_json(HISTORY_FILE)
-    now = now_utc()
     if symbol not in history or not isinstance(history[symbol], dict):
         history[symbol] = {"events": []}
-    if not isinstance(history[symbol].get("events"), list):
-        history[symbol]["events"] = []
-    history[symbol]["events"].append(now.isoformat())
-    cleaned = []
-    for ts in history[symbol]["events"]:
-        if not isinstance(ts, str):
+
+    events = history[symbol].get("events")
+    if not isinstance(events, list):
+        events = []
+
+    events.append(alert_time.isoformat())
+
+    cleaned_events = []
+    for ts in events:
+        timestamp = parse_ts_safe(ts)
+        if timestamp is None:
             continue
-        t = parse_ts_safe(ts)
-        if t is None:
-            continue
-        if (now - t).total_seconds() < HISTORY_HOURS * 3600:
-            cleaned.append(ts)
-    history[symbol]["events"] = cleaned
+        if (alert_time - timestamp).total_seconds() < HISTORY_HOURS * 3600:
+            cleaned_events.append(ts)
+
+    history[symbol]["events"] = cleaned_events
     save_json(HISTORY_FILE, history)
 
     cooldown = load_json(COOLDOWN_FILE)
-    cooldown[symbol] = {"ts": now.isoformat(), "stage": stage}
+    cooldown[symbol] = {"ts": alert_time.isoformat(), "stage": stage}
     save_json(COOLDOWN_FILE, cooldown)
+
+    return {"ts": alert_time.isoformat(), "stage": stage}
 
 
 def log_signal(symbol, stage, data, session):
@@ -211,393 +294,393 @@ def log_signal(symbol, stage, data, session):
         signals = load_json(SIGNALS_FILE)
         if not isinstance(signals.get("signals"), list):
             signals["signals"] = []
+
         signals["signals"].append({
             "ts": now_utc().isoformat(),
             "session": session,
             "symbol": symbol,
             "stage": stage,
-            "tier": data.get("tier"),
-            "price": data.get("price"),
-            "dead_hours": data.get("dead_hours"),
-            "change_5m": data.get("change_5m"),
-            "volume_ratio": data.get("explosion_ratio"),
-            "rsi": data.get("rsi"),
-            "buy_pressure": data.get("buy_pressure"),
-            "bid_depth": data.get("bid_depth"),
-            "ask_depth": data.get("ask_depth"),
-            "bid_ask_ratio": data.get("bid_ask_ratio"),
-            "change_1h": data.get("change_1h"),
-            "change_6h": data.get("change_6h"),
-            "base_range_pct": data.get("base_range_pct"),
-            "base_high": data.get("base_high"),
-            "base_low": data.get("base_low"),
-            "dist_to_base_high": data.get("dist_to_base_high"),
-            "watch_volume_ratio": data.get("vol_ratio"),
+            "price": data.get("price") or data.get("current_price"),
+            "atr_slope_12h": data.get("atr_slope_12h"),
+            "vol_slope_12h": data.get("vol_slope_12h"),
+            "trades_slope_12h": data.get("trades_slope_12h"),
+            "range_4h_pct": data.get("range_4h_pct"),
+            "range_12h_pct": data.get("range_12h_pct"),
+            "rsi_15m": data.get("rsi_15m"),
+            "taker_buy_ratio": data.get("taker_buy_ratio"),
+            "vol_ratio_1h_24h": data.get("vol_ratio_1h_24h"),
+            "base_high_4h": data.get("base_high_4h"),
+            "atr_slope_now": data.get("atr_slope_now"),
+            "vol_ratio_now": data.get("vol_ratio_now"),
+            "trades_slope_now": data.get("trades_slope_now"),
+            "break_pct": data.get("break_pct"),
         })
+
         if len(signals["signals"]) > 500:
             signals["signals"] = signals["signals"][-500:]
+
         save_json(SIGNALS_FILE, signals)
-    except Exception as e:
-        print(f"log_signal error: {e}")
+    except Exception as exc:
+        print(f"log_signal error: {exc}")
 
 
-def log_rejection(symbol, reasons, price=0, change_24h=0):
+def log_rejection(symbol, reasons, price=0):
     try:
         data = load_json(REJECT_FILE)
         if symbol not in data or not isinstance(data.get(symbol), dict):
-            data[symbol] = {"symbol": symbol, "count": 0, "price": price, "change_24h": change_24h}
-        data[symbol]["count"] += 1
+            data[symbol] = {"symbol": symbol, "count": 0}
+
+        data[symbol]["count"] = int(data[symbol].get("count", 0)) + 1
         data[symbol]["last_seen"] = now_utc().isoformat()
         data[symbol]["price"] = price
-        data[symbol]["change_24h"] = change_24h
         data[symbol]["top_reason"] = ",".join(reasons) if reasons else "unknown"
+
         if len(data) > 200:
-            valid = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("last_seen")}
-            sorted_items = sorted(valid.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)
+            valid = {
+                key: value
+                for key, value in data.items()
+                if isinstance(value, dict) and value.get("last_seen")
+            }
+            sorted_items = sorted(
+                valid.items(),
+                key=lambda item: item[1].get("last_seen", ""),
+                reverse=True,
+            )
             data = dict(sorted_items[:200])
+
         save_json(REJECT_FILE, data)
-    except Exception as e:
-        print(f"reject log error: {e}")
-
-
-def check_depth(symbol, price):
-    url = f"{BASE_URL}/api/v3/depth?symbol={symbol}&limit=100"
-    book = http_get_json(url, timeout=10, retries=1)
-    if not isinstance(book, dict):
-        return None, None
-    try:
-        low, high = price * 0.98, price * 1.02
-        bid_depth = sum(float(b[1]) * float(b[0]) for b in book.get("bids", []) if float(b[0]) >= low)
-        ask_depth = sum(float(a[1]) * float(a[0]) for a in book.get("asks", []) if float(a[0]) <= high)
-        return bid_depth, ask_depth
-    except Exception:
-        return None, None
+    except Exception as exc:
+        print(f"reject log error: {exc}")
 
 
 def compute_rsi(closes, period=14):
     if len(closes) < period + 1:
-        return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        if diff > 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(diff))
+        return 50.0
+
+    gains = []
+    losses = []
+    for previous, current in zip(closes, closes[1:]):
+        diff = current - previous
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
+
     if avg_loss == 0 and avg_gain == 0:
-        return 50
+        return 50.0
     if avg_loss == 0:
-        return 100
+        return 100.0
+
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def get_trigger_base(k15, k5):
-    if len(k5) < 3 or len(k15) < BASE_BARS + 2:
-        return None, None, None
-    trigger_open_ms = int(k5[-2][0])
-    eligible = []
-    for k in k15:
-        try:
-            close_ms = int(k[6])
-        except (TypeError, ValueError, IndexError):
+def compute_rsi_15m(closes_5m):
+    """Approximate 15m RSI by sampling every 3rd 5m close.
+
+    Uses 45 recent 5m closes -> 15 sampled 15m closes -> 14-period RSI.
+    Falls back to 50.0 if there is not enough data.
+    """
+    if len(closes_5m) < 45:
+        return 50.0
+    closes_15m = closes_5m[-45::3]
+    return compute_rsi(closes_15m, 14)
+
+
+def _closed_klines(k5, now_ms=None):
+    if not isinstance(k5, list):
+        return []
+
+    current_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    closed = []
+
+    for kline in k5:
+        if not isinstance(kline, list) or len(kline) < 12:
             continue
-        if close_ms <= trigger_open_ms:
-            eligible.append(k)
-    if len(eligible) < BASE_BARS:
-        return None, None, None
-    base_slice = eligible[-BASE_BARS:]
-    try:
-        base_high = max(float(k[2]) for k in base_slice)
-        base_low = min(float(k[3]) for k in base_slice)
-    except (TypeError, ValueError, IndexError):
-        return None, None, None
-    if base_low <= 0:
-        return None, None, None
-    return base_high, base_low, base_slice
-
-
-def count_dead_base_hours(base_slice):
-    if not base_slice:
-        return 0.0
-    dead = 0
-    for k in reversed(base_slice):
         try:
-            h = float(k[2])
-            l = float(k[3])
-            if l <= 0:
-                break
-            rng = (h - l) / l * 100
-            if rng < 1.0:
-                dead += 1
-            else:
-                break
-        except Exception:
-            break
-    return dead / 4.0
-
-
-def get_volume_ratio(k5):
-    trigger_idx = len(k5) - 2
-    if trigger_idx < VOLUME_BASELINE_BARS:
-        return None
-    try:
-        current_vol = float(k5[trigger_idx][5])
-    except (TypeError, ValueError, IndexError):
-        return None
-    start = trigger_idx - VOLUME_BASELINE_BARS
-    baseline = []
-    for k in k5[start:trigger_idx]:
-        try:
-            baseline.append(float(k[5]))
-        except (TypeError, ValueError, IndexError):
+            close_time = int(kline[KLINE_CLOSE_TIME])
+        except (TypeError, ValueError):
             continue
-    if not baseline:
-        return None
-    avg_vol = sum(baseline) / len(baseline)
-    if avg_vol <= 0:
-        return None
-    return current_vol / avg_vol
+        if close_time < current_ms:
+            closed.append(kline)
+
+    return closed
 
 
-def get_timeframe_change(k5, bars_back):
-    trigger_idx = len(k5) - 2
-    target_idx = trigger_idx - bars_back
-    if target_idx < 0:
+def compute_trend_features(k5):
+    if not isinstance(k5, list) or len(k5) < MIN_RAW_CANDLES:
         return None
+
+    closed = _closed_klines(k5)
+    if len(closed) < MIN_CLOSED_CANDLES:
+        return None
+
     try:
-        trigger_close = float(k5[trigger_idx][4])
-        old_close = float(k5[target_idx][4])
+        highs = [float(k[KLINE_HIGH]) for k in closed]
+        lows = [float(k[KLINE_LOW]) for k in closed]
+        closes = [float(k[KLINE_CLOSE]) for k in closed]
+        volumes = [float(k[KLINE_VOLUME]) for k in closed]
+        trades = [float(k[KLINE_TRADES]) for k in closed]
+        taker_buy_base = [float(k[KLINE_TAKER_BUY_BASE_VOLUME]) for k in closed]
     except (TypeError, ValueError, IndexError):
         return None
-    if trigger_close <= 0 or old_close <= 0:
+
+    if any(price <= 0 for price in highs + lows + closes):
         return None
-    return ((trigger_close - old_close) / old_close) * 100
+    if any(volume < 0 for volume in volumes):
+        return None
+    if any(count < 0 for count in trades):
+        return None
+    if any(volume < 0 for volume in taker_buy_base):
+        return None
 
+    trs = []
+    for i in range(1, len(closed)):
+        previous_close = closes[i - 1]
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - previous_close),
+            abs(lows[i] - previous_close),
+        )
+        trs.append(tr)
 
-def check_pre_pump(k15, k5):
+    if len(trs) < 14:
+        return None
+
+    atr_period = 14
+    atr_series = [
+        sum(trs[i - atr_period:i]) / atr_period
+        for i in range(atr_period, len(trs) + 1)
+    ]
+
+    if len(atr_series) < 144 or len(volumes) < 288 or len(trades) < 144:
+        return None
+
+    atr_1h = sum(atr_series[-12:]) / 12
+    atr_12h = sum(atr_series[-144:]) / 144
+    if atr_12h <= 0:
+        return None
+
+    atr_slope = (atr_1h - atr_12h) / atr_12h * 100.0
+
+    vol_1h = sum(volumes[-12:]) / 12
+    vol_12h = sum(volumes[-144:]) / 144
+    vol_24h = sum(volumes[-288:]) / 288
+    if vol_12h <= 0 or vol_24h <= 0:
+        return None
+
+    vol_slope = (vol_1h - vol_12h) / vol_12h * 100.0
+    vol_ratio_1h_24h = vol_1h / vol_24h
+
+    trades_1h = sum(trades[-12:]) / 12
+    trades_12h = sum(trades[-144:]) / 144
+    if trades_12h <= 0:
+        return None
+
+    trades_slope = (trades_1h - trades_12h) / trades_12h * 100.0
+
+    range_4h = (max(highs[-48:]) - min(lows[-48:])) / min(lows[-48:]) * 100.0
+    range_12h = (max(highs[-144:]) - min(lows[-144:])) / min(lows[-144:]) * 100.0
+
+    # Proper 15m RSI derived from 5m closes.
+    rsi_15m = compute_rsi_15m(closes)
+
+    # Binance Spot [9] is taker-buy BASE volume and [5] is total BASE volume.
+    recent_taker_buy_base = sum(taker_buy_base[-12:])
+    recent_base_volume = sum(volumes[-12:])
+    taker_ratio = recent_taker_buy_base / recent_base_volume if recent_base_volume > 0 else 0.5
+
+    base_high_4h = max(highs[-48:])
+
+    # Features use closed candles only; current price comes from the newest candle.
     try:
-        base_high, base_low, base_slice = get_trigger_base(k15, k5)
-        if base_high is None:
-            return None
-        base_range_pct = ((base_high - base_low) / base_low) * 100
-        if base_range_pct > MAX_BASE_RANGE_PCT:
-            return None
-        current_price = float(k5[-2][4])
-        previous_price = float(k5[-3][4])
-        if previous_price <= 0 or current_price <= 0:
-            return None
-        if current_price < base_low:
-            return None
-        change_5m = ((current_price - previous_price) / previous_price) * 100
-        if change_5m <= 0:
-            return None
-        vol_ratio = get_volume_ratio(k5)
-        if vol_ratio is None or vol_ratio < 1.5:
-            return None
-        dist_to_base_high = ((base_high - current_price) / current_price) * 100
-        if dist_to_base_high < MIN_DIST_TO_BASE_HIGH:
-            return None
-        dead_hours = count_dead_base_hours(base_slice)
-        return {
-            "price": current_price,
-            "change_5m": change_5m,
-            "base_range_pct": base_range_pct,
-            "vol_ratio": vol_ratio,
-            "dist_to_base_high": dist_to_base_high,
-            "base_high": base_high,
-            "base_low": base_low,
-            "dead_hours": dead_hours,
-        }
-    except Exception as e:
-        print(f"pre_pump error: {e}")
-        return None
-
-
-def detect_breakout(symbol, k15, k5, ist_hour):
-    reasons = []
-    completed_5m = k5[-2]
-    prev_completed_5m = k5[-3]
-    c_open = float(completed_5m[1])
-    c_high = float(completed_5m[2])
-    c_low = float(completed_5m[3])
-    c_close = float(completed_5m[4])
-    if c_close <= 0 or c_low <= 0:
-        return None, ["bad_price"]
-    prev_close = float(prev_completed_5m[4])
-    if prev_close <= 0:
-        return None, ["bad_prev"]
-    change_5m = ((c_close - prev_close) / prev_close) * 100
-
-    base_high, base_low, base_slice = get_trigger_base(k15, k5)
-    if base_high is None:
-        return None, ["no_base"]
-    base_range_pct = ((base_high - base_low) / base_low) * 100
-    if base_range_pct > MAX_BASE_RANGE_PCT:
-        return None, [f"wide_base_{base_range_pct:.1f}%"]
-
-    if c_close <= base_high:
-        reasons.append("no_structure_break")
-    if c_close <= c_open:
-        reasons.append("red_candle")
-
-    tier = 1 if symbol in OWN_CHAIN else 2
-    min_5m = 1.2 if tier == 1 else 1.5
-    min_vol = 2.0 if tier == 1 else 2.5
-
-    prime = PRIME_START_H <= ist_hour < PRIME_END_H
-    if prime:
-        min_5m -= 0.3
-        min_vol -= 0.5
-
-    if change_5m < min_5m:
-        reasons.append(f"5m_{change_5m:.1f}%")
-    if change_5m > 6.0:
-        reasons.append(f"5m_high_{change_5m:.1f}%")
-
-    explosion_ratio = get_volume_ratio(k5)
-    if explosion_ratio is None:
-        return None, ["volume_baseline_zero"]
-    if explosion_ratio < min_vol:
-        reasons.append(f"vol_{explosion_ratio:.1f}x")
-
-    rng = c_high - c_low
-    if rng <= 0:
-        return None, ["zero_range"]
-    upper_wick = (c_high - max(c_open, c_close)) / rng
-    clv = (c_close - c_low) / rng
-    if upper_wick > 0.35:
-        reasons.append(f"wick_{upper_wick*100:.0f}%")
-    if clv < 0.70:
-        reasons.append(f"clv_{clv:.2f}")
-
-    recent_taker = sum(float(k[9]) for k in k5[-5:-1])
-    recent_total = sum(float(k[5]) for k in k5[-5:-1])
-    buy_pressure = recent_taker / recent_total if recent_total > 0 else 0
-    if buy_pressure < 0.55:
-        reasons.append(f"buy_{buy_pressure*100:.0f}%")
-
-    if reasons:
-        return None, reasons
-
-    bid_depth, ask_depth = check_depth(symbol, c_close)
-    if bid_depth is None:
-        return None, ["depth_unavailable"]
-    bid_ask_ratio = bid_depth / ask_depth if ask_depth > 0 else 0
-    if bid_ask_ratio < 0.9:
-        reasons.append(f"ratio_{bid_ask_ratio:.2f}")
-    if bid_depth < 15_000:
-        reasons.append(f"bid_{bid_depth:.0f}")
-    if ask_depth < 15_000:
-        reasons.append(f"ask_{ask_depth:.0f}")
-    if reasons:
-        return None, reasons
-
-    dead_hours = count_dead_base_hours(base_slice)
-    closes_15m = [float(k[4]) for k in k15[:-1]]
-    rsi_15m = compute_rsi(closes_15m, 14)
-
-    change_1h = get_timeframe_change(k5, ONE_HOUR_BARS)
-    change_6h = get_timeframe_change(k5, SIX_HOUR_BARS)
-    if change_1h is None or change_6h is None:
-        return None, ["not_enough_5m_history"]
+        current_price = float(k5[-1][KLINE_CLOSE])
+    except (TypeError, ValueError, IndexError):
+        current_price = closes[-1]
 
     return {
-        "price": c_close,
-        "tier": tier,
-        "dead_hours": dead_hours,
-        "change_5m": change_5m,
-        "change_1h": change_1h,
-        "change_6h": change_6h,
-        "explosion_ratio": explosion_ratio,
-        "vol_5m_ratio": explosion_ratio,
-        "rsi": rsi_15m,
-        "buy_pressure": buy_pressure * 100,
-        "bid_depth": bid_depth,
-        "ask_depth": ask_depth,
-        "bid_ask_ratio": bid_ask_ratio,
-        "prime": prime,
-        "base_high": base_high,
-        "base_low": base_low,
-        "base_range_pct": base_range_pct,
-    }, []
+        "atr_slope_12h": atr_slope,
+        "vol_slope_12h": vol_slope,
+        "trades_slope_12h": trades_slope,
+        "range_4h_pct": range_4h,
+        "range_12h_pct": range_12h,
+        "vol_ratio_1h_24h": vol_ratio_1h_24h,
+        "rsi_15m": rsi_15m,
+        "taker_buy_ratio": taker_ratio,
+        "base_high_4h": base_high_4h,
+        "current_price": current_price,
+    }
 
 
-def detect_stage(symbol, ist_hour):
+def detect_watchlist(features):
+    if features is None:
+        return False, "no_features"
+
+    reasons = []
+    if features["atr_slope_12h"] < SIG_ATR_SLOPE_12H:
+        reasons.append(f"atr_{features['atr_slope_12h']:.0f}%")
+    if features["vol_slope_12h"] < SIG_VOL_SLOPE_12H:
+        reasons.append(f"vol_{features['vol_slope_12h']:.0f}%")
+    if features["trades_slope_12h"] < SIG_TRADES_SLOPE_12H:
+        reasons.append(f"trades_{features['trades_slope_12h']:.0f}%")
+    if features["range_4h_pct"] < SIG_RANGE_4H_MIN:
+        reasons.append(f"range_{features['range_4h_pct']:.1f}%")
+
+    if reasons:
+        return False, ",".join(reasons)
+    return True, features
+
+
+def check_confirmation(entry, features_now):
+    if features_now is None:
+        return False, "no_features"
+
     try:
-        url_15m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=15m&limit=100"
-        k15 = http_get_json(url_15m, timeout=15, retries=1)
-        if not isinstance(k15, list) or len(k15) < 50:
-            return None, ["not_enough_15m"]
+        base_high = float(entry.get("base_high_4h", 0))
+        atr_before = float(entry.get("atr_slope_12h", 0))
+    except (TypeError, ValueError):
+        return False, "bad_entry"
 
-        url_5m = f"{BASE_URL}/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
-        k5 = http_get_json(url_5m, timeout=10, retries=1)
-        if not isinstance(k5, list) or len(k5) < 20:
-            return None, ["not_enough_5m"]
+    if base_high <= 0:
+        return False, "no_base"
 
-        breakout_data, breakout_reasons = detect_breakout(symbol, k15, k5, ist_hour)
-        if breakout_data is not None:
-            return "BREAKOUT", breakout_data
+    current_price = float(features_now["current_price"])
+    if current_price <= base_high:
+        return False, "no_break"
 
-        pre_pump = check_pre_pump(k15, k5)
-        if pre_pump is not None:
-            return "WATCHLIST", {
-                "price": pre_pump["price"],
-                "base_range_pct": pre_pump["base_range_pct"],
-                "vol_ratio": pre_pump["vol_ratio"],
-                "dist_to_base_high": pre_pump["dist_to_base_high"],
-                "base_high": pre_pump["base_high"],
-                "base_low": pre_pump["base_low"],
-                "tier": 1 if symbol in OWN_CHAIN else 2,
-                "dead_hours": pre_pump["dead_hours"],
-                "change_5m": pre_pump["change_5m"],
-                "change_1h": 0,
-                "change_6h": 0,
-                "explosion_ratio": pre_pump["vol_ratio"],
-                "rsi": 50,
-                "buy_pressure": 50,
-                "bid_depth": 0,
-                "ask_depth": 0,
-                "bid_ask_ratio": 0,
-                "prime": False,
-            }
+    break_pct = (current_price - base_high) / base_high * 100.0
+    if break_pct > MAX_EXTENSION_PCT:
+        return False, f"too_late_{break_pct:.1f}%"
 
-        return None, breakout_reasons if breakout_reasons else ["no_setup"]
-    except Exception as e:
-        return None, [f"exception_{e}"]
+    atr_now = float(features_now["atr_slope_12h"])
+
+    # Reject a true collapse: current slope is below 50% of entry slope.
+    if atr_before > 0 and atr_now < atr_before * 0.5:
+        return False, "atr_collapse"
+
+    if features_now["vol_ratio_1h_24h"] < 0.5:
+        return False, "vol_dead"
+    if features_now["trades_slope_12h"] < 0:
+        return False, "trades_dead"
+
+    return True, {
+        "base_high": base_high,
+        "current_price": current_price,
+        "break_pct": break_pct,
+        "atr_slope_now": atr_now,
+        "vol_ratio_now": features_now["vol_ratio_1h_24h"],
+        "trades_slope_now": features_now["trades_slope_12h"],
+        "rsi": features_now["rsi_15m"],
+        "taker_ratio": features_now["taker_buy_ratio"],
+    }
+
+
+def fetch_klines_5m(symbol, limit=KLINE_LIMIT):
+    data = http_get_json(
+        f"{BASE_URL}/api/v3/klines",
+        params={"symbol": symbol, "interval": KLINE_INTERVAL, "limit": limit},
+        timeout=15,
+        retries=1,
+    )
+
+    if not isinstance(data, list) or len(data) < MIN_RAW_CANDLES:
+        return None
+    return data
 
 
 def scan(session, ist_hour):
     print(f"Scanning {len(MONITORING_TOKENS)} monitoring tokens...")
+
     cooldown = load_cooldown()
-    hits = []
+    watchlist_state = load_json(WATCHLIST_STATE_FILE)
+    if not isinstance(watchlist_state, dict):
+        watchlist_state = {}
+
+    now = now_utc()
+
+    # STAGE 2: confirmations.
+    confirmations = []
+    for symbol, entry in list(watchlist_state.items()):
+        if not isinstance(entry, dict):
+            del watchlist_state[symbol]
+            continue
+
+        entry_dt = parse_ts_safe(entry.get("ts", ""))
+        if entry_dt is None:
+            del watchlist_state[symbol]
+            continue
+
+        hours_since = (now - entry_dt).total_seconds() / 3600.0
+        if hours_since > CONFIRM_MAX_HOURS:
+            del watchlist_state[symbol]
+            continue
+        if hours_since < CONFIRM_MIN_HOURS:
+            continue
+
+        try:
+            k5 = fetch_klines_5m(symbol)
+            if k5 is None:
+                continue
+
+            features_now = compute_trend_features(k5)
+            if features_now is None:
+                continue
+
+            ok, info = check_confirmation(entry, features_now)
+            if ok:
+                confirmations.append({"symbol": symbol, "info": info})
+        except Exception as exc:
+            print(f"Confirmation error for {symbol}: {exc}")
+
+    # STAGE 1: new watchlist candidates.
+    # Active entries are deliberately skipped so their 1-6 hour window is not reset.
+    active_watchlist = set(watchlist_state.keys())
+    watchlist_hits = []
     rejection = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(detect_stage, s, ist_hour): s for s in MONITORING_TOKENS}
+
+    def _scan_one(symbol):
+        try:
+            k5 = fetch_klines_5m(symbol)
+            if k5 is None:
+                return symbol, None, "no_data"
+
+            features = compute_trend_features(k5)
+            ok, info = detect_watchlist(features)
+            if ok:
+                return symbol, info, None
+            return symbol, None, info
+        except Exception as exc:
+            return symbol, None, f"scan_error:{type(exc).__name__}"
+
+    symbols_to_scan = [symbol for symbol in MONITORING_TOKENS if symbol not in active_watchlist]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_scan_one, symbol): symbol for symbol in symbols_to_scan}
+
         for future in as_completed(futures):
             symbol = futures[future]
-            stage_data = future.result()
-            if isinstance(stage_data, tuple):
-                stage, data = stage_data
-            else:
-                stage, data = None, ["exception"]
-            if stage:
-                if cooldown_blocks(cooldown, symbol, stage):
-                    continue
-                data["symbol"] = symbol
-                data["stage"] = stage
-                hits.append(data)
-            else:
-                if isinstance(data, list) and data:
-                    top = data[0].split("_")[0]
-                    rejection[top] = rejection.get(top, 0) + 1
-                    log_rejection(symbol, data)
+            try:
+                symbol, info, reason = future.result()
+            except Exception as exc:
+                print(f"Worker failure for {symbol}: {exc}")
+                continue
+
+            if info:
+                watchlist_hits.append({"symbol": symbol, "features": info})
+            elif isinstance(reason, str):
+                reason_key = reason.split("_")[0]
+                rejection[reason_key] = rejection.get(reason_key, 0) + 1
+                log_rejection(symbol, [reason])
+
+    watchlist_hits.sort(key=lambda item: item["symbol"])
+    confirmations.sort(key=lambda item: item["symbol"])
+
     print(f"Rejection: {rejection}")
-    return hits
+    print(f"New WATCHLIST: {len(watchlist_hits)}")
+    print(f"Confirmations ready: {len(confirmations)}")
+
+    return watchlist_hits, confirmations, watchlist_state, cooldown
 
 
 def get_session_label(hour):
@@ -611,96 +694,86 @@ def get_session_label(hour):
 
 
 def main():
-    ist = now_utc() + timedelta(hours=5, minutes=30)
+    now = now_utc()
+    ist = now + timedelta(hours=5, minutes=30)
     session = get_session_label(ist.hour)
     print(f"Monitoring Scanner starting at {ist} IST — Session: {session}")
 
     if not SIGNALS_FILE.exists():
-        SIGNALS_FILE.write_text('{"signals": []}')
-    else:
-        try:
-            data = json.loads(SIGNALS_FILE.read_text())
-            if not isinstance(data, dict) or not isinstance(data.get("signals"), list):
-                SIGNALS_FILE.write_text('{"signals": []}')
-        except Exception:
-            SIGNALS_FILE.write_text('{"signals": []}')
+        save_json(SIGNALS_FILE, {"signals": []})
 
-    hits = scan(session, ist.hour)
-    print(f"Found {len(hits)} signals")
+    watchlist_hits, confirmations, watchlist_state, cooldown = scan(session, ist.hour)
 
-    fired_symbols = set()
-    for h in hits:
-        stage = h.get("stage")
+    for confirmation in confirmations:
+        symbol = confirmation["symbol"]
+        info = confirmation["info"]
 
-        if stage == "WATCHLIST":
-            msg = (
-                f"👀 <b>WATCHLIST: {h['symbol']}</b>\n\n"
-                f"<b>Price:</b> {format_price(h['price'])}\n"
-                f"<b>Base Range:</b> {h['base_range_pct']:.2f}%\n"
-                f"<b>Volume Ratio:</b> {h['vol_ratio']:.2f}x quiet\n"
-                f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
-                f"<b>Distance to Base High:</b> {h['dist_to_base_high']:.2f}%\n\n"
-                f"⚠️ <b>DO NOT BUY YET.</b> Watch for a breakout above {format_price(h['base_high'])}."
-            )
-            if send_telegram(msg):
-                record_alert(h["symbol"], "WATCHLIST")
-                log_signal(h["symbol"], "WATCHLIST", h, session)
+        msg = (
+            f"🚀 <b>CONFIRMED BREAKOUT [{html.escape(session)}]</b>\n\n"
+            f"<b>Coin:</b> {html.escape(symbol)}\n"
+            f"<b>Entry:</b> {format_price(info['current_price'])}\n"
+            f"<b>Base High (broken):</b> {format_price(info['base_high'])}\n"
+            f"<b>Break:</b> +{info['break_pct']:.2f}%\n"
+            f"<b>RSI(15m):</b> {info['rsi']:.1f}\n"
+            f"<b>Buyers:</b> {info['taker_ratio'] * 100:.1f}%\n"
+            f"<b>ATR trend:</b> {info['atr_slope_now']:+.0f}%\n"
+            f"<b>Volume:</b> {info['vol_ratio_now']:.2f}x vs 24h avg\n"
+            f"<b>Trades trend:</b> {info['trades_slope_now']:+.0f}%\n"
+            f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
+            f"✅ <b>ENTER NOW</b> at market.\n"
+            f"Stop: -3% | Targets: +5% / +10% / +25%"
+        )
+
+        if send_telegram(msg):
+            cooldown[symbol] = record_alert(symbol, "BREAKOUT")
+            log_signal(symbol, "BREAKOUT", info, session)
+            watchlist_state.pop(symbol, None)
+
+    for hit in watchlist_hits:
+        symbol = hit["symbol"]
+        features = hit["features"]
+
+        if cooldown_blocks(cooldown, symbol, stage="WATCHLIST"):
             continue
 
-        if stage == "BREAKOUT":
-            tier = h.get("tier", 2)
-            tier_label = "Tier 1 — Own Chain" if tier == 1 else "Tier 2 — Token"
-            prime_flag = " ⚡PRIME" if h.get("prime") else ""
-            header = f"🚀 BREAKOUT [{tier_label}]{prime_flag} [{session}]"
+        msg = (
+            f"👀 <b>WATCHLIST: {html.escape(symbol)}</b>\n\n"
+            f"<b>Price:</b> {format_price(features['current_price'])}\n"
+            f"<b>ATR rising:</b> {features['atr_slope_12h']:+.0f}% (12h)\n"
+            f"<b>Volume rising:</b> {features['vol_slope_12h']:+.0f}% (12h)\n"
+            f"<b>Trades rising:</b> {features['trades_slope_12h']:+.0f}% (12h)\n"
+            f"<b>Range 4h:</b> {features['range_4h_pct']:.1f}%\n"
+            f"<b>RSI(15m):</b> {features['rsi_15m']:.1f}\n\n"
+            f"⚠️ <b>DO NOT BUY YET.</b>\n"
+            f"Confirmation in 1 hour if price breaks {format_price(features['base_high_4h'])}."
+        )
 
-            stop = h["price"] * 0.97
-            target_5 = h["price"] * 1.05
-            target_10 = h["price"] * 1.10
-            target_25 = h["price"] * 1.25
+        if send_telegram(msg):
+            alert_ts = now_utc()
+            cooldown[symbol] = record_alert(symbol, "WATCHLIST", now=alert_ts)
+            log_signal(symbol, "WATCHLIST", features, session)
+            watchlist_state[symbol] = {
+                "ts": alert_ts.isoformat(),
+                "base_high_4h": features["base_high_4h"],
+                "atr_slope_12h": features["atr_slope_12h"],
+                "vol_slope_12h": features["vol_slope_12h"],
+                "trades_slope_12h": features["trades_slope_12h"],
+                "range_4h_pct": features["range_4h_pct"],
+                "entry_price": features["current_price"],
+            }
 
-            msg = (
-                f"{header}\n\n"
-                f"<b>Coin:</b> {h['symbol']}\n"
-                f"<b>Price:</b> {format_price(h['price'])}\n"
-                f"<b>Base High:</b> {format_price(h.get('base_high', 0))}\n"
-                f"<b>Dead Base:</b> {h['dead_hours']:.1f}h\n"
-                f"<b>5m Change:</b> {h['change_5m']:+.2f}%\n"
-                f"<b>1h Change:</b> {h['change_1h']:+.2f}%\n"
-                f"<b>6h Change:</b> {h['change_6h']:+.2f}%\n"
-                f"<b>Volume:</b> {h['explosion_ratio']:.2f}x quiet\n"
-                f"<b>RSI(15m):</b> {h['rsi']:.1f}\n"
-                f"<b>Buyers:</b> {h['buy_pressure']:.1f}%\n"
-                f"<b>Bid/Ask:</b> {h['bid_ask_ratio']:.2f}\n"
-                f"<b>Bid Depth:</b> ${h['bid_depth']:,.0f}\n"
-                f"<b>Ask Depth:</b> ${h['ask_depth']:,.0f}\n"
-                f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-                f"<b>Entry:</b> {format_price(h['price'])}\n"
-                f"<b>Stop Loss:</b> {format_price(stop)} (-3%)\n"
-                f"<b>Targets:</b> +5% {format_price(target_5)} | +10% {format_price(target_10)} | +25% {format_price(target_25)}\n\n"
-                f"✅ ENTER NOW — Buy at market. SL {format_price(stop)}."
-            )
-            if send_telegram(msg):
-                record_alert(h["symbol"], "BREAKOUT")
-                log_signal(h["symbol"], "BREAKOUT", h, session)
-                fired_symbols.add(h["symbol"])
-
-    for fired in fired_symbols:
-        pair = ECOSYSTEM_PAIRS.get(fired)
-        if pair and pair not in fired_symbols:
-            pair_msg = (
-                f"🔗 <b>ECOSYSTEM ROTATION</b>\n\n"
-                f"<b>{fired}</b> just fired.\n"
-                f"<b>{pair}</b> is paired (same ecosystem).\n"
-                f"Watch {pair} next — whales often rotate between them."
-            )
-            send_telegram(pair_msg)
+    save_json(WATCHLIST_STATE_FILE, watchlist_state)
+    print(f"Saved state with {len(watchlist_state)} active watchlist entries")
 
 
 def safe_main():
     try:
         main()
-    except Exception as e:
-        send_telegram(f"🚨 MONITORING SCANNER CRASHED\n\nError: {html.escape(str(e)[:300])}")
+    except Exception as exc:
+        send_telegram(
+            "🚨 SCANNER CRASHED\n\n"
+            f"Error: {html.escape(str(exc)[:300])}"
+        )
         raise
 
 
