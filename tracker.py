@@ -546,8 +546,12 @@ def main() -> None:
         print("State was not saved successfully")
         return
 
-    report = build_report(state)
-    send_telegram(report)
+    # Only send Telegram when at least one signal exists.
+    if state.get("signals"):
+        report = build_report(state)
+        send_telegram(report)
+    else:
+        print("No signals tracked. Skipping report.")
 
 
 if __name__ == "__main__":
