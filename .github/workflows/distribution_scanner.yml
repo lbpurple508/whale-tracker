@@ -2,7 +2,7 @@ name: Distribution Scanner
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -18,11 +18,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: pip install requests
+
       - name: Restore tracker state
         uses: actions/cache/restore@v4
         with:
@@ -30,6 +33,7 @@ jobs:
           key: tracker-state-${{ github.run_id }}
           restore-keys: |
             tracker-state-
+
       - name: Restore distribution cooldown
         uses: actions/cache/restore@v4
         with:
@@ -37,14 +41,32 @@ jobs:
           key: dist-cooldown-${{ github.run_id }}
           restore-keys: |
             dist-cooldown-
+
       - name: Run distribution scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python distribution_scanner.py
+
       - name: Save distribution cooldown
         uses: actions/cache/save@v4
         if: always()
         with:
           path: dist_cooldown.json
           key: dist-cooldown-${{ github.run_id }}
+
+      - name: Purge old caches
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          cutoff=$(date -u -d '2 days ago' +%s 2>/dev/null || date -u -v-2d +%s)
+          gh api "/repos/${{ github.repository }}/actions/caches?per_page=100" --paginate \
+            --jq '.actions_caches[] | "\(.id) \(.created_at)"' 2>/dev/null \
+            | while read id created; do
+              created_ts=$(date -u -d "$created" +%s 2>/dev/null || echo 0)
+              if [ "$created_ts" -gt 0 ] && [ "$created_ts" -lt "$cutoff" ]; then
+                gh api -X DELETE "/repos/${{ github.repository }}/actions/caches/$id" 2>/dev/null || true
+              fi
+            done
