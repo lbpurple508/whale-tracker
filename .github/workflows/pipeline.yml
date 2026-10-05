@@ -1,0 +1,207 @@
+name: Scanner Pipeline
+
+on:
+  schedule:
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: scanner-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests
+          fi
+
+      - name: Get UTC day
+        id: day
+        shell: bash
+        run: |
+          echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            monitor_cooldown.json
+            monitor_rejections.json
+            monitor_history.json
+            monitor_signals.json
+            monitor_watchlist_state.json
+          key: monitor-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
+          restore-keys: |
+            monitor-state-${{ steps.day.outputs.day }}-
+            monitor-state-
+
+      - name: Run monitoring scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python monitoring_scanner.py
+
+      - name: Save monitor state
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            monitor_cooldown.json
+            monitor_rejections.json
+            monitor_history.json
+            monitor_signals.json
+            monitor_watchlist_state.json
+          key: monitor-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
+
+
+  track:
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests
+          fi
+
+      - name: Get UTC day
+        id: day
+        shell: bash
+        run: |
+          echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore tracker state
+        uses: actions/cache/restore@v4
+        with:
+          path: tracker_state.json
+          key: tracker-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
+          restore-keys: |
+            tracker-state-${{ steps.day.outputs.day }}-
+            tracker-state-
+
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            monitor_cooldown.json
+            monitor_rejections.json
+            monitor_history.json
+            monitor_signals.json
+            monitor_watchlist_state.json
+          key: monitor-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
+          restore-keys: |
+            monitor-state-${{ steps.day.outputs.day }}-
+            monitor-state-
+
+      - name: Run tracker
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python tracker.py
+
+      - name: Save tracker state
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: tracker_state.json
+          key: tracker-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
+
+
+  distribute:
+    needs: track
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests
+          fi
+
+      - name: Get UTC day
+        id: day
+        shell: bash
+        run: |
+          echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore tracker state
+        uses: actions/cache/restore@v4
+        with:
+          path: tracker_state.json
+          key: tracker-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
+          restore-keys: |
+            tracker-state-${{ steps.day.outputs.day }}-
+            tracker-state-
+
+      - name: Restore distribution cooldown
+        uses: actions/cache/restore@v4
+        with:
+          path: dist_cooldown.json
+          key: dist-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
+          restore-keys: |
+            dist-state-${{ steps.day.outputs.day }}-
+            dist-state-
+
+      - name: Run distribution scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python distribution_scanner.py
+
+      - name: Save distribution cooldown
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: dist_cooldown.json
+          key: dist-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
