@@ -1,10 +1,14 @@
-import os
 import json
+import math
+import os
 import time
-import requests
-from pathlib import Path
-from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -17,23 +21,35 @@ TRACKER_FILE = BASE_DIR / "tracker_state.json"
 STOP_PCT = -3.0
 PUMP_TARGET = 30.0
 MAX_SIGNAL_AGE_HOURS = 48
+MAX_FUTURE_SKEW_MINUTES = 5
+REQUEST_TIMEOUT = 10
+PRICE_RETRIES = 2
+
+RESET_CUTOFF = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
 
 SIGNAL_SOURCES = [
-    ("MONITOR", BASE_DIR / "monitor_signals.json"),   # FIXED: matches scanner output
+    ("MONITOR", BASE_DIR / "monitor_signals.json"),
 ]
 
 VALID_SOURCES = ("MONITOR",)
 
 
-def now_utc():
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def should_track(source, stage):
-    return source in VALID_SOURCES and stage == "BREAKOUT"
+def should_track(source: str, stage: str) -> bool:
+    return source in VALID_SOURCES and str(stage).upper() == "BREAKOUT"
 
 
-def format_price(p):
+def format_price(value: Any) -> str:
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return "$0.00000000"
+
+    if not math.isfinite(p):
+        return "$0.00000000"
     if p >= 1:
         return f"${p:.4f}"
     if p >= 0.01:
@@ -43,117 +59,229 @@ def format_price(p):
     return f"${p:.8f}"
 
 
-def send_telegram(message):
+def send_telegram(message: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram env vars missing")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(
+        response = requests.post(
             url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+            },
+            timeout=REQUEST_TIMEOUT,
         )
-        if r.status_code != 200:
-            print(f"Telegram HTTP error: {r.status_code} - {r.text}")
+        if response.status_code != 200:
+            print(f"Telegram HTTP error: {response.status_code} - {response.text}")
             return
-        body = r.json()
+
+        try:
+            body = response.json()
+        except ValueError:
+            print("Telegram returned non-JSON response")
+            return
+
         if not body.get("ok"):
             print(f"Telegram API error: {body}")
-    except Exception as e:
-        print(f"Telegram error: {e}")
+    except requests.RequestException as exc:
+        print(f"Telegram network error: {exc}")
+    except Exception as exc:
+        print(f"Telegram error: {exc}")
 
 
-def load_json(path):
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"load error for {path}: {exc}")
+        return {}
 
 
-def save_json(path, data):
+def save_json(path: Path, data: dict) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data))
+        tmp = path.with_name(f"{path.name}.tmp")
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         tmp.replace(path)
-    except Exception as e:
-        print(f"save error: {e}")
+        return True
+    except OSError as exc:
+        print(f"save error: {exc}")
+        return False
 
 
-def parse_ts(s):
-    try:
-        t = datetime.fromisoformat(s)
-        if t.tzinfo is not None:
-            t = t.astimezone(timezone.utc).replace(tzinfo=None)
-        return t
-    except Exception:
+def parse_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
         return None
 
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
 
-def get_price(symbol):
-    for attempt in range(2):
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+def get_price(symbol: str) -> float:
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        return 0.0
+
+    url = f"{BINANCE_API}/api/v3/ticker/price"
+    for attempt in range(PRICE_RETRIES):
         try:
-            url = f"{BINANCE_API}/api/v3/ticker/price?symbol={symbol}"
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                return float(r.json().get("price", 0))
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                if attempt == 0:
-                    time.sleep(2)
-                    continue
-                return 0.0
-            return 0.0
-        except Exception:
-            if attempt == 0:
+            response = requests.get(
+                url,
+                params={"symbol": symbol},
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 200:
+                payload = response.json()
+                price = float(payload.get("price", 0))
+                return price if math.isfinite(price) and price > 0 else 0.0
+
+            retryable = response.status_code == 429 or 500 <= response.status_code < 600
+            if retryable and attempt + 1 < PRICE_RETRIES:
                 time.sleep(2)
                 continue
             return 0.0
+        except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError):
+            if attempt + 1 < PRICE_RETRIES:
+                time.sleep(2)
+                continue
+            return 0.0
+        except Exception:
+            if attempt + 1 < PRICE_RETRIES:
+                time.sleep(2)
+                continue
+            return 0.0
+
     return 0.0
 
 
-def clean_state(state):
+def _as_finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def _signal_key(source: str, ts: str, symbol: str) -> str:
+    return f"{source}|{ts}|{symbol}"
+
+
+def normalize_signal(signal: dict) -> dict | None:
+    source = signal.get("source", "")
+    stage = signal.get("stage", "")
+    symbol = str(signal.get("symbol", "")).strip().upper()
+    entry = _as_finite_float(signal.get("entry"), 0.0)
+    entry_dt = parse_ts(signal.get("entry_ts"))
+
+    if not should_track(source, stage) or not symbol or entry <= 0:
+        return None
+    if entry_dt is None or entry_dt < RESET_CUTOFF:
+        return None
+
+    normalized = dict(signal)
+    normalized["source"] = source
+    normalized["stage"] = str(stage).upper()
+    normalized["symbol"] = symbol
+    normalized["entry"] = entry
+    normalized["entry_ts"] = entry_dt.isoformat()
+    normalized["key"] = normalized.get("key") or _signal_key(source, normalized["entry_ts"], symbol)
+
+    if "dip_pct_tracked" not in normalized and "dip_pct" in normalized:
+        normalized["dip_pct_tracked"] = _as_finite_float(normalized.pop("dip_pct"), 0.0)
+    else:
+        normalized["dip_pct_tracked"] = _as_finite_float(
+            normalized.get("dip_pct_tracked"), 0.0
+        )
+
+    normalized["entry_dip_pct"] = _as_finite_float(normalized.get("entry_dip_pct"), 0.0)
+    normalized["signal_price"] = _as_finite_float(normalized.get("signal_price"), entry) or entry
+    normalized["peak"] = _as_finite_float(normalized.get("peak"), entry)
+    normalized["peak_pct"] = _as_finite_float(normalized.get("peak_pct"), 0.0)
+    normalized["peak_ts"] = normalized.get("peak_ts") or normalized["entry_ts"]
+    normalized["dip"] = _as_finite_float(normalized.get("dip"), entry)
+    normalized["dip_ts"] = normalized.get("dip_ts") or normalized["entry_ts"]
+    normalized["current"] = _as_finite_float(normalized.get("current"), entry)
+    normalized["current_pct"] = _as_finite_float(normalized.get("current_pct"), 0.0)
+    normalized["time_to_peak_min"] = max(0, int(_as_finite_float(normalized.get("time_to_peak_min"), 0)))
+    normalized["time_to_dip_min"] = max(0, int(_as_finite_float(normalized.get("time_to_dip_min"), 0)))
+    normalized["tier"] = normalized.get("tier", 2)
+    normalized["dead_hours"] = _as_finite_float(normalized.get("dead_hours"), 0.0)
+    normalized["status"] = normalized.get("status") or "ACTIVE"
+    normalized["closed_ts"] = normalized.get("closed_ts")
+    normalized["exit_pct"] = (
+        None
+        if normalized.get("exit_pct") is None
+        else _as_finite_float(normalized.get("exit_pct"), 0.0)
+    )
+    normalized["last_update"] = normalized.get("last_update") or normalized["entry_ts"]
+
+    return normalized
+
+
+def clean_state(state: dict) -> int:
     signals = state.get("signals", [])
     if not isinstance(signals, list):
+        state["signals"] = []
         return 0
+
     before = len(signals)
     cleaned = []
-    for s in signals:
-        if not isinstance(s, dict):
+    seen_keys = set()
+
+    for raw_signal in signals:
+        if not isinstance(raw_signal, dict):
             continue
-        if not should_track(s.get("source", ""), s.get("stage", "")):
+
+        signal = normalize_signal(raw_signal)
+        if signal is None:
             continue
-        if "dip_pct_tracked" not in s:
-            s["dip_pct_tracked"] = 0.0
-        if "entry_dip_pct" not in s and "dip_pct" in s:
-            s["entry_dip_pct"] = s.pop("dip_pct")
-        if "entry_dip_pct" not in s:
-            s["entry_dip_pct"] = 0.0
-        if "signal_price" not in s:
-            s["signal_price"] = s.get("entry", 0)
-        if "peak_pct" not in s:
-            s["peak_pct"] = 0.0
-        if "current_pct" not in s:
-            s["current_pct"] = 0.0
-        if "tier" not in s:
-            s["tier"] = 2
-        if "dead_hours" not in s:
-            s["dead_hours"] = 0
-        cleaned.append(s)
+
+        key = signal["key"]
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        cleaned.append(signal)
+
     state["signals"] = cleaned
     return before - len(cleaned)
 
 
-def load_new_signals(state):
+def load_new_signals(state: dict) -> int:
     seen = state.get("seen", {})
     if not isinstance(seen, dict):
         seen = {}
+
     signals = state.get("signals", [])
     if not isinstance(signals, list):
         signals = []
+
+    existing_keys = {
+        s.get("key") for s in signals if isinstance(s, dict) and s.get("key")
+    }
     added = 0
     now = now_utc()
 
@@ -162,65 +290,78 @@ def load_new_signals(state):
         entries = data.get("signals", [])
         if not isinstance(entries, list):
             continue
-        for s in entries:
-            if not isinstance(s, dict):
-                continue
-            ts = s.get("ts")
-            symbol = s.get("symbol")
-            price = s.get("price")
-            if not ts or not symbol or not price:
-                continue
-            try:
-                entry = float(price)
-            except (ValueError, TypeError):
-                continue
-            if entry <= 0:
+
+        for raw in entries:
+            if not isinstance(raw, dict):
                 continue
 
-            key = f"{source}|{ts}|{symbol}"
-            if key in seen:
+            ts = raw.get("ts")
+            symbol = str(raw.get("symbol", "")).strip().upper()
+            price = raw.get("price")
+            if not ts or not symbol or price is None:
                 continue
 
-            stage = s.get("stage", "BREAKOUT")
-            if not should_track(source, stage):
+            key = _signal_key(source, str(ts), symbol)
+            if key in seen or key in existing_keys:
+                continue
+
+            ts_dt = parse_ts(ts)
+            if ts_dt is None or ts_dt < RESET_CUTOFF:
                 seen[key] = True
                 continue
 
-            entry_dt = parse_ts(ts)
-            if not entry_dt:
+            age_hours = (now - ts_dt).total_seconds() / 3600.0
+            if age_hours < -MAX_FUTURE_SKEW_MINUTES / 60.0:
+                print(f"Skipping future signal: {key}")
+                seen[key] = True
                 continue
-            age_hours = (now - entry_dt).total_seconds() / 3600
             if age_hours > MAX_SIGNAL_AGE_HOURS:
                 seen[key] = True
                 continue
 
-            signals.append({
-                "key": key,
-                "source": source,
-                "symbol": symbol,
-                "entry": entry,
-                "entry_ts": ts,
-                "stage": stage,
-                "tier": s.get("tier", 2),
-                "dead_hours": s.get("dead_hours", 0),
-                "signal_price": entry,
-                "entry_dip_pct": 0.0,
-                "peak": entry,
-                "peak_pct": 0.0,
-                "peak_ts": ts,
-                "dip": entry,
-                "dip_pct_tracked": 0.0,
-                "dip_ts": ts,
-                "current": entry,
-                "current_pct": 0.0,
-                "time_to_peak_min": 0,
-                "time_to_dip_min": 0,
-                "status": "ACTIVE",
-                "last_update": ts,
-                "closed_ts": None,
-                "exit_pct": None,
-            })
+            try:
+                entry = float(price)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(entry) or entry <= 0:
+                continue
+
+            stage = str(raw.get("stage", "BREAKOUT")).upper()
+            if not should_track(source, stage):
+                seen[key] = True
+                continue
+
+            entry_ts = ts_dt.isoformat()
+            signals.append(
+                {
+                    "key": key,
+                    "source": source,
+                    "symbol": symbol,
+                    "entry": entry,
+                    "entry_ts": entry_ts,
+                    "stage": stage,
+                    "tier": raw.get("tier", 2),
+                    "dead_hours": _as_finite_float(raw.get("dead_hours"), 0.0),
+                    "signal_price": entry,
+                    "entry_dip_pct": 0.0,
+                    "peak": entry,
+                    "peak_pct": 0.0,
+                    "peak_ts": entry_ts,
+                    "dip": entry,
+                    "dip_pct_tracked": 0.0,
+                    "dip_ts": entry_ts,
+                    "current": entry,
+                    "current_pct": 0.0,
+                    "time_to_peak_min": 0,
+                    "time_to_dip_min": 0,
+                    "status": "ACTIVE",
+                    "last_update": now.isoformat(),
+                    "closed_ts": None,
+                    "exit_pct": None,
+                }
+            )
             seen[key] = True
+            existing_keys.add(key)
             added += 1
 
     state["signals"] = signals
@@ -228,77 +369,112 @@ def load_new_signals(state):
     return added
 
 
-def update_signals(state):
+def update_signals(state: dict) -> int:
     signals = state.get("signals", [])
     if not isinstance(signals, list):
         return 0
-    trackable = [s for s in signals if isinstance(s, dict) and s.get("status") == "ACTIVE"]
+
+    trackable = [
+        signal
+        for signal in signals
+        if isinstance(signal, dict) and signal.get("status") == "ACTIVE"
+    ]
     if not trackable:
         return 0
 
-    symbols = list({s["symbol"] for s in trackable if s.get("symbol")})
-    prices = {}
+    symbols = sorted({
+        str(signal.get("symbol", "")).strip().upper()
+        for signal in trackable
+        if signal.get("symbol")
+    })
+
+    prices: dict[str, float] = {}
     if symbols:
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            futures = {ex.submit(get_price, sym): sym for sym in symbols}
-            for f in as_completed(futures):
-                prices[futures[f]] = f.result()
+        max_workers = min(8, len(symbols))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(get_price, symbol): symbol for symbol in symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    prices[symbol] = future.result()
+                except Exception as exc:
+                    print(f"Price update failed for {symbol}: {exc}")
+                    prices[symbol] = 0.0
 
     now = now_utc()
     updated = 0
-    for s in trackable:
-        p = prices.get(s["symbol"], 0)
-        if p <= 0:
+
+    for signal in trackable:
+        symbol = str(signal.get("symbol", "")).strip().upper()
+        entry = _as_finite_float(signal.get("entry"), 0.0)
+        price = prices.get(symbol, 0.0)
+        if entry <= 0 or not math.isfinite(price) or price <= 0:
             continue
 
-        s["current"] = p
-        s["current_pct"] = ((p - s["entry"]) / s["entry"]) * 100
+        current_pct = ((price - entry) / entry) * 100.0
+        if not math.isfinite(current_pct):
+            continue
 
-        if p > s["peak"]:
-            s["peak"] = p
-            s["peak_pct"] = ((p - s["entry"]) / s["entry"]) * 100
-            s["peak_ts"] = now.isoformat()
-            t = parse_ts(s["entry_ts"])
-            if t:
-                s["time_to_peak_min"] = int((now - t).total_seconds() / 60)
+        signal["current"] = price
+        signal["current_pct"] = current_pct
 
-        if p < s["dip"]:
-            s["dip"] = p
-            s["dip_pct_tracked"] = ((p - s["entry"]) / s["entry"]) * 100
-            s["dip_ts"] = now.isoformat()
-            t = parse_ts(s["entry_ts"])
-            if t:
-                s["time_to_dip_min"] = int((now - t).total_seconds() / 60)
+        peak = _as_finite_float(signal.get("peak"), entry)
+        dip = _as_finite_float(signal.get("dip"), entry)
 
-        if s["peak_pct"] >= PUMP_TARGET:
-            s["status"] = "TP30_HIT"
-            s["exit_pct"] = PUMP_TARGET
-            s["closed_ts"] = now.isoformat()
-        elif s["current_pct"] <= STOP_PCT:
-            s["status"] = "STOPPED"
-            s["exit_pct"] = STOP_PCT
-            s["closed_ts"] = now.isoformat()
+        if price > peak:
+            signal["peak"] = price
+            signal["peak_pct"] = current_pct
+            signal["peak_ts"] = now.isoformat()
+            entry_dt = parse_ts(signal.get("entry_ts"))
+            if entry_dt is not None:
+                signal["time_to_peak_min"] = max(
+                    0, int((now - entry_dt).total_seconds() / 60)
+                )
 
-        s["last_update"] = now.isoformat()
+        if price < dip:
+            signal["dip"] = price
+            signal["dip_pct_tracked"] = current_pct
+            signal["dip_ts"] = now.isoformat()
+            entry_dt = parse_ts(signal.get("entry_ts"))
+            if entry_dt is not None:
+                signal["time_to_dip_min"] = max(
+                    0, int((now - entry_dt).total_seconds() / 60)
+                )
+
+        peak_pct = _as_finite_float(signal.get("peak_pct"), 0.0)
+        if peak_pct >= PUMP_TARGET:
+            signal["status"] = "TP30_HIT"
+            signal["exit_pct"] = PUMP_TARGET
+            signal["closed_ts"] = now.isoformat()
+        elif current_pct <= STOP_PCT:
+            signal["status"] = "STOPPED"
+            signal["exit_pct"] = STOP_PCT
+            signal["closed_ts"] = now.isoformat()
+
+        signal["last_update"] = now.isoformat()
         updated += 1
 
     return updated
 
 
-def build_report(state):
+def build_report(state: dict) -> str:
     signals = state.get("signals", [])
     if not isinstance(signals, list):
         signals = []
-    total = len(signals)
-    active = [s for s in signals if s.get("status") == "ACTIVE"]
-    tp30 = [s for s in signals if s.get("status") == "TP30_HIT"]
-    stopped = [s for s in signals if s.get("status") == "STOPPED"]
+
+    valid_signals = [signal for signal in signals if isinstance(signal, dict)]
+    total = len(valid_signals)
+    active = [signal for signal in valid_signals if signal.get("status") == "ACTIVE"]
+    tp30 = [signal for signal in valid_signals if signal.get("status") == "TP30_HIT"]
+    stopped = [signal for signal in valid_signals if signal.get("status") == "STOPPED"]
 
     wins = len(tp30)
     losses = len(stopped)
     closed_total = wins + losses
-    wr = (wins / closed_total * 100) if closed_total > 0 else 0
-    lr = (losses / closed_total * 100) if closed_total > 0 else 0
+    wr = wins / closed_total * 100 if closed_total else 0
+    lr = losses / closed_total * 100 if closed_total else 0
 
     lines = ["📊 <b>SIGNAL TRACKER</b>", ""]
     lines.append(
@@ -307,56 +483,57 @@ def build_report(state):
         f"🟢 TP30 Hit: <b>{len(tp30)}</b> | "
         f"🔴 Stopped: <b>{len(stopped)}</b>"
     )
-    if closed_total > 0:
+
+    if closed_total:
         lines.append(f"WR: <b>{wr:.0f}%</b> | LR: <b>{lr:.0f}%</b> ({closed_total} closed)")
 
     if tp30:
-        lines.append("")
-        lines.append("🟢 <b>TP30 HIT (+30%)</b>")
-        for s in tp30[-5:]:
-            peak = s.get("peak_pct", 0)
-            ttp = s.get("time_to_peak_min", 0)
+        lines.extend(["", "🟢 <b>TP30 HIT (+30%)</b>"])
+        for signal in tp30[-5:]:
+            peak = _as_finite_float(signal.get("peak_pct"), 0.0)
+            ttp = max(0, int(_as_finite_float(signal.get("time_to_peak_min"), 0)))
             lines.append(
-                f"• <b>{s.get('symbol', '?')}</b> "
-                f"{format_price(s.get('entry', 0))} → +{peak:.2f}% "
+                f"• <b>{signal.get('symbol', '?')}</b> "
+                f"{format_price(signal.get('entry', 0))} → +{peak:.2f}% "
                 f"in {ttp}m"
             )
 
     if active:
-        lines.append("")
-        lines.append("🟡 <b>ACTIVE</b>")
-        for s in active[-5:]:
-            peak = s.get("peak_pct", 0)
-            dip_tr = s.get("dip_pct_tracked", 0)
-            cur = s.get("current_pct", 0)
+        lines.extend(["", "🟡 <b>ACTIVE</b>"])
+        for signal in active[-5:]:
+            peak = _as_finite_float(signal.get("peak_pct"), 0.0)
+            dip_tracked = _as_finite_float(signal.get("dip_pct_tracked"), 0.0)
+            current = _as_finite_float(signal.get("current_pct"), 0.0)
             lines.append(
-                f"• <b>{s.get('symbol', '?')}</b> "
-                f"{format_price(s.get('entry', 0))} → {cur:+.2f}% "
-                f"(peak {peak:+.2f}%, dip {dip_tr:+.2f}%)"
+                f"• <b>{signal.get('symbol', '?')}</b> "
+                f"{format_price(signal.get('entry', 0))} → {current:+.2f}% "
+                f"(peak {peak:+.2f}%, dip {dip_tracked:+.2f}%)"
             )
 
     if stopped:
-        lines.append("")
-        lines.append("🔴 <b>STOPPED (-3%)</b>")
-        for s in stopped[-5:]:
-            exit_pct = s.get("exit_pct", 0)
+        lines.extend(["", "🔴 <b>STOPPED (-3%)</b>"])
+        for signal in stopped[-5:]:
+            exit_pct = _as_finite_float(signal.get("exit_pct"), STOP_PCT)
             lines.append(
-                f"• <b>{s.get('symbol', '?')}</b> "
-                f"{format_price(s.get('entry', 0))} → {exit_pct:+.2f}%"
+                f"• <b>{signal.get('symbol', '?')}</b> "
+                f"{format_price(signal.get('entry', 0))} → {exit_pct:+.2f}%"
             )
 
     return "\n".join(lines)
 
 
-def main():
+def main() -> None:
     state = load_json(TRACKER_FILE)
+    if not isinstance(state, dict):
+        state = {}
+
     if "signals" not in state or not isinstance(state["signals"], list):
         state["signals"] = []
     if "seen" not in state or not isinstance(state["seen"], dict):
         state["seen"] = {}
 
     cleaned = clean_state(state)
-    print(f"Cleaned: {cleaned} invalid signals removed")
+    print(f"Cleaned: {cleaned} invalid/duplicate signals removed")
 
     added = load_new_signals(state)
     print(f"New signals: {added}")
@@ -365,7 +542,9 @@ def main():
     updated = update_signals(state)
     print(f"Updated: {updated}")
 
-    save_json(TRACKER_FILE, state)
+    if not save_json(TRACKER_FILE, state):
+        print("State was not saved successfully")
+        return
 
     report = build_report(state)
     send_telegram(report)
