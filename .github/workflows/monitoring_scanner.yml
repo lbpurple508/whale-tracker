@@ -56,19 +56,3 @@ jobs:
             monitor_signals.json
             monitor_watchlist_state.json
           key: monitor-cooldown-${{ github.run_id }}
-
-      - name: Purge old caches
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          cutoff=$(date -u -d '2 days ago' +%s 2>/dev/null || date -u -v-2d +%s)
-          gh api "/repos/${{ github.repository }}/actions/caches?per_page=100" --paginate \
-            --jq '.actions_caches[] | "\(.id) \(.created_at)"' 2>/dev/null \
-            | while read id created; do
-              created_ts=$(date -u -d "$created" +%s 2>/dev/null || echo 0)
-              if [ "$created_ts" -gt 0 ] && [ "$created_ts" -lt "$cutoff" ]; then
-                gh api -X DELETE "/repos/${{ github.repository }}/actions/caches/$id" 2>/dev/null || true
-              fi
-            done
