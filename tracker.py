@@ -3,7 +3,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -546,12 +546,18 @@ def main() -> None:
         print("State was not saved successfully")
         return
 
-    # Only send Telegram when at least one signal exists.
-    if state.get("signals"):
+    # Only send Telegram when at least one ACTIVE signal exists.
+    # Prevents 288 daily reports for the same closed signals.
+    has_active = any(
+        isinstance(s, dict) and s.get("status") == "ACTIVE"
+        for s in state.get("signals", [])
+    )
+
+    if has_active:
         report = build_report(state)
         send_telegram(report)
     else:
-        print("No signals tracked. Skipping report.")
+        print("No active signals. Skipping report.")
 
 
 if __name__ == "__main__":
