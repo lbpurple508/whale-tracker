@@ -1,8 +1,6 @@
 name: Scanner Pipeline
 
 on:
-  schedule:
-    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -75,7 +73,6 @@ jobs:
             monitor_watchlist_state.json
           key: monitor-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
 
-
   track:
     needs: scan
     runs-on: ubuntu-latest
@@ -142,7 +139,6 @@ jobs:
         with:
           path: tracker_state.json
           key: tracker-state-${{ steps.day.outputs.day }}-${{ github.run_id }}
-
 
   distribute:
     needs: track
