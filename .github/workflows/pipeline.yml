@@ -34,6 +34,10 @@ jobs:
             pip install requests
           fi
 
+      - name: Validate Python
+        run: |
+          python -m py_compile market_scanner.py monitoring_scanner.py tracker.py distribution_scanner.py
+
       - name: Get UTC day
         id: day
         shell: bash
