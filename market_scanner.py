@@ -607,24 +607,12 @@ def scan():
         },
     )
 
-    for key in [
-        "watch",
-        "cooldowns",
-        "last_breakout",
-        "last_missed",
-        "events",
-    ]:
-        if not isinstance(state.get(key), type({
-            "watch": {},
-            "cooldowns": {},
-            "last_breakout": {},
-            "last_missed": {},
-            "events": [],
-        })[key]):
-            state[key] = (
-                [] if key == "events"
-                else {}
-            )
+    for key in ["watch", "cooldowns", "last_breakout", "last_missed"]:
+        if not isinstance(state.get(key), dict):
+            state[key] = {}
+
+    if not isinstance(state.get("events"), list):
+        state["events"] = []
 
     symbols, prices = load_universe()
 
