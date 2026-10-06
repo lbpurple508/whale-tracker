@@ -25,3 +25,9 @@ report.txt
 
 market_state.json
 market_events.json
+.env
+.env.*
+*.pem
+*.key
+monitor_watchlist_state.json
+dist_cooldown.json
