@@ -632,7 +632,67 @@ def scan(session, ist_hour):
 
     now = now_utc()
 
-    # STAGE 2: confirmations.
+    def _scan_one(symbol):
+        try:
+            k5 = fetch_klines_5m(symbol)
+            if k5 is None:
+                return symbol, None, "no_data"
+
+            features = compute_trend_features(k5)
+            if features is None:
+                return symbol, None, "no_features"
+
+            live_price = fetch_current_price(symbol, fallback=features["current_price"])
+            if live_price is None:
+                return symbol, None, "no_price"
+
+            features["current_price"] = live_price
+            return symbol, features, None
+        except Exception as exc:
+            return symbol, None, f"scan_error:{type(exc).__name__}"
+
+    # Fetch the complete 32-coin snapshot first. Partial coverage is not acceptable
+    # for the riskier monitoring scanner because a missing coin can hide a signal.
+    features_by_symbol = {}
+    coverage_failures = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_scan_one, symbol): symbol
+            for symbol in MONITORING_TOKENS
+        }
+
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                symbol, features, reason = future.result()
+            except Exception as exc:
+                print(f"Worker failure for {symbol}: {exc}")
+                coverage_failures[symbol] = f"worker:{type(exc).__name__}"
+                continue
+
+            if features is not None:
+                features_by_symbol[symbol] = features
+            else:
+                coverage_failures[symbol] = reason or "unknown"
+
+    print(
+        f"Coverage: {len(features_by_symbol)}/{len(MONITORING_TOKENS)}"
+        + (
+            f" | Missing: {', '.join(sorted(coverage_failures))}"
+            if coverage_failures
+            else ""
+        )
+    )
+
+    if len(features_by_symbol) != len(MONITORING_TOKENS):
+        missing = sorted(set(MONITORING_TOKENS) - set(features_by_symbol))
+        raise RuntimeError(
+            f"Monitoring coverage incomplete: {len(features_by_symbol)}/{len(MONITORING_TOKENS)} "
+            f"coins available. Missing: {', '.join(missing)}"
+        )
+
+    # STAGE 2: confirmations use the same fresh snapshot as the WATCH detector.
     confirmations = []
     for symbol, entry in list(watchlist_state.items()):
         if not isinstance(entry, dict):
@@ -645,85 +705,39 @@ def scan(session, ist_hour):
             continue
 
         hours_since = (now - entry_dt).total_seconds() / 3600.0
-        if hours_since < 0:
-            del watchlist_state[symbol]
-            continue
-        if hours_since > CONFIRM_MAX_HOURS:
+        if hours_since < 0 or hours_since > CONFIRM_MAX_HOURS:
             del watchlist_state[symbol]
             continue
         if hours_since < CONFIRM_MIN_HOURS:
             continue
 
-        try:
-            k5 = fetch_klines_5m(symbol)
-            if k5 is None:
-                continue
+        features_now = features_by_symbol.get(symbol)
+        if features_now is None:
+            # Defensive only; full coverage check above should make this unreachable.
+            raise RuntimeError(f"Missing confirmation snapshot for {symbol}")
 
-            features_now = compute_trend_features(k5)
-            if features_now is None:
-                continue
+        ok, info = check_confirmation(entry, features_now)
+        if ok:
+            confirmations.append({"symbol": symbol, "info": info})
 
-            live_price = fetch_current_price(symbol, fallback=features_now["current_price"])
-            if live_price is None:
-                continue
-            features_now["current_price"] = live_price
-
-            ok, info = check_confirmation(entry, features_now)
-            if ok:
-                confirmations.append({"symbol": symbol, "info": info})
-        except Exception as exc:
-            print(f"Confirmation error for {symbol}: {exc}")
-
-    # STAGE 1: new watchlist candidates.
+    # STAGE 1: new WATCH candidates from the researched winning pattern.
     active_watchlist = set(watchlist_state.keys())
     watchlist_hits = []
     rejection = {}
 
-    def _scan_one(symbol):
-        try:
-            k5 = fetch_klines_5m(symbol)
-            if k5 is None:
-                return symbol, None, "no_data"
+    for symbol in MONITORING_TOKENS:
+        if symbol in active_watchlist:
+            continue
 
-            features = compute_trend_features(k5)
-            ok, info = detect_watchlist(features)
-            if not ok:
-                return symbol, None, info
+        features = features_by_symbol[symbol]
+        ok, info = detect_watchlist(features)
 
-            live_price = fetch_current_price(symbol, fallback=info["current_price"])
-            if live_price is None:
-                return symbol, None, "no_price"
-
-            info["current_price"] = live_price
-            return symbol, info, None
-        except Exception as exc:
-            return symbol, None, f"scan_error:{type(exc).__name__}"
-
-    symbols_to_scan = [
-        symbol for symbol in MONITORING_TOKENS
-        if symbol not in active_watchlist
-    ]
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(_scan_one, symbol): symbol
-            for symbol in symbols_to_scan
-        }
-
-        for future in as_completed(futures):
-            symbol = futures[future]
-            try:
-                symbol, info, reason = future.result()
-            except Exception as exc:
-                print(f"Worker failure for {symbol}: {exc}")
-                continue
-
-            if info:
-                watchlist_hits.append({"symbol": symbol, "features": info})
-            elif isinstance(reason, str):
-                reason_key = reason.split("_", 1)[0]
-                rejection[reason_key] = rejection.get(reason_key, 0) + 1
-                log_rejection(symbol, [reason])
+        if ok:
+            watchlist_hits.append({"symbol": symbol, "features": info})
+        elif isinstance(info, str):
+            reason_key = info.split("_", 1)[0]
+            rejection[reason_key] = rejection.get(reason_key, 0) + 1
+            log_rejection(symbol, [info])
 
     watchlist_hits.sort(key=lambda item: item["symbol"])
     confirmations.sort(key=lambda item: item["symbol"])
@@ -733,7 +747,6 @@ def scan(session, ist_hour):
     print(f"Confirmations ready: {len(confirmations)}")
 
     return watchlist_hits, confirmations, watchlist_state, cooldown
-
 
 def get_session_label(hour):
     if 8 <= hour <= 11:
