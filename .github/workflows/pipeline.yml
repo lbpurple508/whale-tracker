@@ -2,6 +2,8 @@ name: Scanner Pipeline
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "2-59/5 * * * *"
 
 concurrency:
   group: scanner-pipeline
