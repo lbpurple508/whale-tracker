@@ -516,7 +516,7 @@ def build_watch(symbol, setup):
     entry = setup["entry"]
     return (
         f"👀 <b>SPOT TOKENS • WATCH</b>\n\n"
-        f"<b>PAIR:</b> {html.escape(symbol.replace("USDT", ""))}\n"
+        f"<b>NAME:</b> {html.escape(symbol.replace("USDT", ""))}\n"
         f"<b>ENTRY:</b> {fmt_price(entry)}\n"
         f"<b>NOW:</b> {fmt_price(f['close'])}\n"
         f"<b>DISTANCE:</b> {setup['distance_before']:.2f}%\n\n"
@@ -537,7 +537,7 @@ def build_enter(
 
     return (
         f"🟢 <b>SPOT TOKENS • ENTER</b>\n\n"
-        f"<b>PAIR:</b> {html.escape(symbol.replace("USDT", ""))}\n"
+        f"<b>NAME:</b> {html.escape(symbol.replace("USDT", ""))}\n"
         f"<b>ENTRY:</b> {fmt_price(entry)}\n"
         f"<b>NOW:</b> {fmt_price(price)}\n"
         f"<b>DRIFT:</b> {late:+.2f}%\n\n"
@@ -563,7 +563,7 @@ def build_missed(
 
     return (
         f"⛔ <b>SPOT TOKENS • MISSED</b>\n\n"
-        f"<b>PAIR:</b> {html.escape(symbol.replace("USDT", ""))}\n"
+        f"<b>NAME:</b> {html.escape(symbol.replace("USDT", ""))}\n"
         f"<b>ORIGINAL ENTRY:</b> {fmt_price(entry)}\n"
         f"<b>NOW:</b> {fmt_price(price)}\n"
         f"<b>LATE:</b> +{late:.2f}%\n\n"
