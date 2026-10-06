@@ -24,6 +24,8 @@ MAX_SIGNAL_AGE_HOURS = 48
 MAX_FUTURE_SKEW_MINUTES = 5
 REQUEST_TIMEOUT = 10
 PRICE_RETRIES = 2
+TRACK_INTERVAL_MS = 5 * 60 * 1000
+KLINE_LIMIT = 1000
 
 RESET_CUTOFF = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
 
@@ -177,6 +179,54 @@ def get_price(symbol: str) -> float:
 
     return 0.0
 
+
+
+def fetch_post_entry_klines(symbol: str, entry_dt: datetime, end_dt: datetime) -> list:
+    """Fetch 5m bars beginning with the first full bar after the signal."""
+    start_ms = (
+        int(entry_dt.timestamp() * 1000) // TRACK_INTERVAL_MS + 1
+    ) * TRACK_INTERVAL_MS
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    if start_ms > end_ms:
+        return []
+
+    url = f"{BINANCE_API}/api/v3/klines"
+    for attempt in range(PRICE_RETRIES):
+        try:
+            response = requests.get(
+                url,
+                params={
+                    "symbol": symbol,
+                    "interval": "5m",
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "limit": KLINE_LIMIT,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 200:
+                payload = response.json()
+                return payload if isinstance(payload, list) else []
+
+            retryable = response.status_code == 429 or 500 <= response.status_code < 600
+            if retryable and attempt + 1 < PRICE_RETRIES:
+                time.sleep(2)
+                continue
+            return []
+        except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError):
+            if attempt + 1 < PRICE_RETRIES:
+                time.sleep(2)
+                continue
+            return []
+        except Exception:
+            if attempt + 1 < PRICE_RETRIES:
+                time.sleep(2)
+                continue
+            return []
+
+    return []
 
 def _as_finite_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -382,79 +432,121 @@ def update_signals(state: dict) -> int:
     if not trackable:
         return 0
 
-    symbols = sorted({
-        str(signal.get("symbol", "")).strip().upper()
-        for signal in trackable
-        if signal.get("symbol")
-    })
-
-    prices: dict[str, float] = {}
-    if symbols:
-        max_workers = min(8, len(symbols))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(get_price, symbol): symbol for symbol in symbols
-            }
-            for future in as_completed(futures):
-                symbol = futures[future]
-                try:
-                    prices[symbol] = future.result()
-                except Exception as exc:
-                    print(f"Price update failed for {symbol}: {exc}")
-                    prices[symbol] = 0.0
-
     now = now_utc()
     updated = 0
 
-    for signal in trackable:
+    def _update_one(signal):
         symbol = str(signal.get("symbol", "")).strip().upper()
         entry = _as_finite_float(signal.get("entry"), 0.0)
-        price = prices.get(symbol, 0.0)
-        if entry <= 0 or not math.isfinite(price) or price <= 0:
-            continue
+        entry_dt = parse_ts(signal.get("entry_ts"))
 
-        current_pct = ((price - entry) / entry) * 100.0
-        if not math.isfinite(current_pct):
-            continue
+        if not symbol or entry <= 0 or entry_dt is None:
+            return False, "invalid_signal"
 
-        signal["current"] = price
-        signal["current_pct"] = current_pct
+        age_hours = (now - entry_dt).total_seconds() / 3600.0
+        if age_hours < -MAX_FUTURE_SKEW_MINUTES / 60.0:
+            return False, "future_signal"
+
+        candles = fetch_post_entry_klines(symbol, entry_dt, now)
+        if not candles:
+            # Never manufacture a TP/SL result from missing history.
+            return False, "no_klines"
 
         peak = _as_finite_float(signal.get("peak"), entry)
         dip = _as_finite_float(signal.get("dip"), entry)
+        peak_ts = parse_ts(signal.get("peak_ts")) or entry_dt
+        dip_ts = parse_ts(signal.get("dip_ts")) or entry_dt
 
-        if price > peak:
-            signal["peak"] = price
-            signal["peak_pct"] = current_pct
-            signal["peak_ts"] = now.isoformat()
-            entry_dt = parse_ts(signal.get("entry_ts"))
-            if entry_dt is not None:
-                signal["time_to_peak_min"] = max(
-                    0, int((now - entry_dt).total_seconds() / 60)
-                )
+        first_hit = None
+        first_hit_pct = None
+        first_hit_ts = None
 
-        if price < dip:
-            signal["dip"] = price
-            signal["dip_pct_tracked"] = current_pct
-            signal["dip_ts"] = now.isoformat()
-            entry_dt = parse_ts(signal.get("entry_ts"))
-            if entry_dt is not None:
-                signal["time_to_dip_min"] = max(
-                    0, int((now - entry_dt).total_seconds() / 60)
-                )
+        for candle in candles:
+            if not isinstance(candle, list) or len(candle) < 7:
+                continue
 
-        peak_pct = _as_finite_float(signal.get("peak_pct"), 0.0)
-        if peak_pct >= PUMP_TARGET:
-            signal["status"] = "TP30_HIT"
-            signal["exit_pct"] = PUMP_TARGET
+            try:
+                open_ms = int(candle[0])
+                high = float(candle[2])
+                low = float(candle[3])
+            except (TypeError, ValueError, IndexError):
+                continue
+
+            if high <= 0 or low <= 0 or high < low:
+                continue
+
+            bar_dt = datetime.fromtimestamp(open_ms / 1000.0, tz=timezone.utc)
+
+            if high > peak:
+                peak = high
+                peak_ts = bar_dt
+
+            if low < dip:
+                dip = low
+                dip_ts = bar_dt
+
+            tp_hit = high >= entry * (1.0 + PUMP_TARGET / 100.0)
+            sl_hit = low <= entry * (1.0 + STOP_PCT / 100.0)
+
+            if first_hit is None and (tp_hit or sl_hit):
+                first_hit_ts = bar_dt.isoformat()
+
+                if tp_hit and sl_hit:
+                    # OHLC cannot reveal intrabar order, so resolve conservatively as loss.
+                    first_hit = "STOPPED"
+                    first_hit_pct = STOP_PCT
+                elif tp_hit:
+                    first_hit = "TP30_HIT"
+                    first_hit_pct = PUMP_TARGET
+                else:
+                    first_hit = "STOPPED"
+                    first_hit_pct = STOP_PCT
+
+        signal["peak"] = peak
+        signal["peak_pct"] = ((peak - entry) / entry) * 100.0
+        signal["peak_ts"] = peak_ts.isoformat()
+        signal["dip"] = dip
+        signal["dip_pct_tracked"] = ((dip - entry) / entry) * 100.0
+        signal["dip_ts"] = dip_ts.isoformat()
+        signal["time_to_peak_min"] = max(
+            0, int((peak_ts - entry_dt).total_seconds() / 60)
+        )
+        signal["time_to_dip_min"] = max(
+            0, int((dip_ts - entry_dt).total_seconds() / 60)
+        )
+
+        if first_hit:
+            signal["status"] = first_hit
+            signal["exit_pct"] = first_hit_pct
+            signal["closed_ts"] = first_hit_ts or now.isoformat()
+        elif age_hours >= MAX_SIGNAL_AGE_HOURS:
+            signal["status"] = "EXPIRED"
+            signal["exit_pct"] = None
             signal["closed_ts"] = now.isoformat()
-        elif current_pct <= STOP_PCT:
-            signal["status"] = "STOPPED"
-            signal["exit_pct"] = STOP_PCT
-            signal["closed_ts"] = now.isoformat()
+
+        current_price = get_price(symbol)
+        if current_price > 0:
+            current_pct = ((current_price - entry) / entry) * 100.0
+            if math.isfinite(current_pct):
+                signal["current"] = current_price
+                signal["current_pct"] = current_pct
 
         signal["last_update"] = now.isoformat()
-        updated += 1
+        return True, "updated"
+
+    max_workers = min(8, len(trackable))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_update_one, signal) for signal in trackable]
+
+        for future in as_completed(futures):
+            try:
+                did_update, reason = future.result()
+                if did_update:
+                    updated += 1
+                elif reason == "no_klines":
+                    print("Tracker skipped a signal because Binance history was unavailable")
+            except Exception as exc:
+                print(f"Tracker worker failure: {exc}")
 
     return updated
 
@@ -469,6 +561,7 @@ def build_report(state: dict) -> str:
     active = [signal for signal in valid_signals if signal.get("status") == "ACTIVE"]
     tp30 = [signal for signal in valid_signals if signal.get("status") == "TP30_HIT"]
     stopped = [signal for signal in valid_signals if signal.get("status") == "STOPPED"]
+    expired = [signal for signal in valid_signals if signal.get("status") == "EXPIRED"]
 
     wins = len(tp30)
     losses = len(stopped)
@@ -481,11 +574,12 @@ def build_report(state: dict) -> str:
         f"Total: <b>{total}</b> | "
         f"🟡 Active: <b>{len(active)}</b> | "
         f"🟢 TP30 Hit: <b>{len(tp30)}</b> | "
-        f"🔴 Stopped: <b>{len(stopped)}</b>"
+        f"🔴 Stopped: <b>{len(stopped)}</b> | "
+        f"⚪ Expired: <b>{len(expired)}</b>"
     )
 
     if closed_total:
-        lines.append(f"WR: <b>{wr:.0f}%</b> | LR: <b>{lr:.0f}%</b> ({closed_total} closed)")
+        lines.append(f"WR: <b>{wr:.0f}%</b> | LR: <b>{lr:.0f}%</b> ({closed_total} resolved; expired excluded)")
 
     if tp30:
         lines.extend(["", "🟢 <b>TP30 HIT (+30%)</b>"])
