@@ -26,13 +26,13 @@ REQUEST_RETRIES = 2
 
 PRICE_CAP = 2.0
 
-# Validated historical setup:
-# MARKET SIGNAL + price 0..1% below previous 4H high.
+# Internal signal profile. The public source intentionally keeps the
+# research description minimal; these values drive the live rule.
 RANGE_QUANTILE = 0.95
 ZONE_MIN_PCT = -1.0
 ZONE_MAX_PCT = 0.0
 
-# Practical alert handling.
+# Alert lifecycle settings.
 WATCH_TTL_HOURS = 6
 SYMBOL_TTL_HOURS = 12
 ENTRY_DRIFT_LIMIT = 0.25
