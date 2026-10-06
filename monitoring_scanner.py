@@ -311,6 +311,8 @@ def log_signal(symbol, stage, data, session):
             "symbol": symbol,
             "stage": stage,
             "price": data.get("price") or data.get("current_price"),
+            "atr_1h_pct": data.get("atr_1h_pct"),
+            "ret_1h_pct": data.get("ret_1h_pct"),
             "atr_slope_12h": data.get("atr_slope_12h"),
             "vol_slope_12h": data.get("vol_slope_12h"),
             "trades_slope_12h": data.get("trades_slope_12h"),
