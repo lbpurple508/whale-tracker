@@ -91,7 +91,7 @@ Credentials should never be committed to source control.
 | `tracker.py` | Signal tracking |
 | `distribution_scanner.py` | Distribution logic |
 | `.github/workflows/pipeline.yml` | Existing workflow |
-| `.github/workflows/pump_scanner.yml` | Market-signal workflow |
+| `.github/workflows/market_scanner.yml` | Market-signal workflow |
 
 ## Notes
 
