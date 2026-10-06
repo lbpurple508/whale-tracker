@@ -2,8 +2,6 @@ name: Spot Market Monitor
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "4-59/5 * * * *"
 
 concurrency:
   group: market-scanner
