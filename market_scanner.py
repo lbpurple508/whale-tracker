@@ -523,7 +523,7 @@ def build_watch(symbol, setup):
         f"👀 <b>SPOT TOKENS • WATCH</b>\n\n"
         f"<b>NAME:</b> {html.escape(display_name(symbol))}\n"
         f"<b>ENTRY:</b> {fmt_price(entry)}\n"
-        f"<b>NOW:</b> {fmt_price(f['close'])}\n"
+        f"<b>NOW:</b> {fmt_price(setup.get('current_price', f['close']))}\n"
         f"<b>DISTANCE:</b> {setup['distance_before']:.2f}%\n\n"
         f"⚠️ <b>DO NOT BUY YET.</b>"
     )
@@ -892,7 +892,7 @@ def scan():
                 "WATCH",
                 symbol,
                 setup["entry"],
-                setup["features"]["close"],
+                setup.get("current_price", setup["features"]["close"]),
                 setup["distance_before"],
             )
 
