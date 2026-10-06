@@ -812,11 +812,11 @@ def scan():
             price / entry_price - 1.0
         ) * 100.0
 
-        if late <= MAX_ENTRY_DRIFT_PCT:
+        if 0.0 <= late <= MAX_ENTRY_DRIFT_PCT:
             enter.append(
                 (symbol, item)
             )
-        elif late <= MAX_REVIEW_DRIFT_PCT:
+        elif MAX_ENTRY_DRIFT_PCT < late <= MAX_REVIEW_DRIFT_PCT:
             missed.append(
                 (symbol, item)
             )
@@ -886,13 +886,12 @@ def scan():
                 - 1.0
             ) * 100.0
 
-            if late <= MAX_ENTRY_DRIFT_PCT:
+            if 0.0 <= late <= MAX_ENTRY_DRIFT_PCT:
                 recovery["source"] = "RECOVERED"
                 enter.append(
                     (symbol, recovery)
                 )
-
-            elif late <= MAX_REVIEW_DRIFT_PCT:
+            elif MAX_ENTRY_DRIFT_PCT < late <= MAX_REVIEW_DRIFT_PCT:
                 missed.append(
                     (symbol, recovery)
                 )
