@@ -181,7 +181,7 @@ def get_price(symbol: str) -> float:
 
 
 
-def fetch_post_entry_klines(symbol: str, entry_dt: datetime, end_dt: datetime) -> list:
+def fetch_post_entry_klines(symbol: str, entry_dt: datetime, end_dt: datetime) -> list | None:
     """Fetch 5m bars beginning with the first full bar after the signal."""
     start_ms = (
         int(entry_dt.timestamp() * 1000) // TRACK_INTERVAL_MS + 1
@@ -209,7 +209,7 @@ def fetch_post_entry_klines(symbol: str, entry_dt: datetime, end_dt: datetime) -
             if response.status_code == 200:
                 payload = response.json()
                 if not isinstance(payload, list):
-                    return []
+                    return None
 
                 # Never score the currently-open 5m candle. Its high/low can
                 # move before close and would create false TP/SL outcomes.
@@ -237,19 +237,19 @@ def fetch_post_entry_klines(symbol: str, entry_dt: datetime, end_dt: datetime) -
             if retryable and attempt + 1 < PRICE_RETRIES:
                 time.sleep(2)
                 continue
-            return []
+            return None
         except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError):
             if attempt + 1 < PRICE_RETRIES:
                 time.sleep(2)
                 continue
-            return []
+            return None
         except Exception:
             if attempt + 1 < PRICE_RETRIES:
                 time.sleep(2)
                 continue
-            return []
+            return None
 
-    return []
+    return None
 
 def _as_finite_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -478,8 +478,11 @@ def update_signals(state: dict) -> int:
             entry_dt + timedelta(hours=MAX_SIGNAL_AGE_HOURS),
         )
         candles = fetch_post_entry_klines(symbol, entry_dt, tracking_end)
+        if candles is None:
+            # API failure is not evidence that the signal expired.
+            return False, "no_klines"
         if not candles and age_hours < MAX_SIGNAL_AGE_HOURS:
-            # Never manufacture a TP/SL result from missing history.
+            # Successful query, but no completed 5m bar is available yet.
             return False, "no_klines"
 
         peak = _as_finite_float(signal.get("peak"), entry)
