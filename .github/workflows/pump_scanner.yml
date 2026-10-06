@@ -47,7 +47,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python pump_scanner.py
+          python market_scanner.py
 
       - name: Save pump state
         if: always()
