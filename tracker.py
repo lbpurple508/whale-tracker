@@ -473,8 +473,12 @@ def update_signals(state: dict) -> int:
         if age_hours < -MAX_FUTURE_SKEW_MINUTES / 60.0:
             return False, "future_signal"
 
-        candles = fetch_post_entry_klines(symbol, entry_dt, now)
-        if not candles:
+        tracking_end = min(
+            now,
+            entry_dt + __import__("datetime").timedelta(hours=MAX_SIGNAL_AGE_HOURS),
+        )
+        candles = fetch_post_entry_klines(symbol, entry_dt, tracking_end)
+        if not candles and age_hours < MAX_SIGNAL_AGE_HOURS:
             # Never manufacture a TP/SL result from missing history.
             return False, "no_klines"
 
