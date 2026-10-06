@@ -50,6 +50,7 @@ KLINE_TAKER_BUY_QUOTE_VOLUME = 10
 
 KLINE_INTERVAL = "5m"
 KLINE_LIMIT = 500
+STRATEGY_ID = "ATR1H2_RET1H5_V1"
 MIN_CLOSED_CANDLES = 288
 MIN_RAW_CANDLES = MIN_CLOSED_CANDLES + 10
 MAX_WORKERS = 8
@@ -492,7 +493,53 @@ def compute_trend_features(k5):
     trades_slope = (trades_1h - trades_12h) / trades_12h * 100.0
 
     range_4h = (max(highs[-48:]) - min(lows[-48:])) / min(lows[-48:]) * 100.0
-    atr_1h_pct = atr_1h / closes[-1] * 100.0
+
+    # True 1h ATR: aggregate complete 5m bars into hourly OHLC, then
+    # calculate a 14-period ATR on those hourly bars.
+    hourly = {}
+    for kline in closed:
+        try:
+            open_ms = int(kline[KLINE_OPEN_TIME])
+            hour_key = open_ms // (60 * 60 * 1000)
+            hourly.setdefault(hour_key, []).append(kline)
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    complete_hours = []
+    for hour_key in sorted(hourly):
+        bars = hourly[hour_key]
+        if len(bars) != 12:
+            continue
+        complete_hours.append({
+            "open": float(bars[0][KLINE_OPEN]),
+            "high": max(float(k[KLINE_HIGH]) for k in bars),
+            "low": min(float(k[KLINE_LOW]) for k in bars),
+            "close": float(bars[-1][KLINE_CLOSE]),
+        })
+
+    if len(complete_hours) < 15:
+        return None
+
+    hourly_trs = []
+    for i in range(1, len(complete_hours)):
+        prev_close = complete_hours[i - 1]["close"]
+        high = complete_hours[i]["high"]
+        low = complete_hours[i]["low"]
+        hourly_trs.append(max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        ))
+
+    if len(hourly_trs) < 14:
+        return None
+
+    atr_1h = sum(hourly_trs[-14:]) / 14.0
+    hourly_close = complete_hours[-1]["close"]
+    if hourly_close <= 0:
+        return None
+
+    atr_1h_pct = atr_1h / hourly_close * 100.0
     ret_1h_pct = (closes[-1] / closes[-13] - 1.0) * 100.0
     range_12h = (max(highs[-144:]) - min(lows[-144:])) / min(lows[-144:]) * 100.0
 
@@ -628,9 +675,16 @@ def scan(session, ist_hour):
     print(f"Scanning {len(MONITORING_TOKENS)} monitoring tokens...")
 
     cooldown = load_cooldown()
-    watchlist_state = load_json(WATCHLIST_STATE_FILE)
-    if not isinstance(watchlist_state, dict):
-        watchlist_state = {}
+    raw_watchlist_state = load_json(WATCHLIST_STATE_FILE)
+    if not isinstance(raw_watchlist_state, dict):
+        raw_watchlist_state = {}
+
+    # Drop WATCH entries created by any previous strategy version.
+    watchlist_state = {
+        symbol: entry
+        for symbol, entry in raw_watchlist_state.items()
+        if isinstance(entry, dict) and entry.get("strategy_id") == STRATEGY_ID
+    }
 
     now = now_utc()
 
@@ -822,6 +876,7 @@ def main():
             cooldown[symbol] = record_alert(symbol, "WATCHLIST", now=alert_ts)
             log_signal(symbol, "WATCHLIST", features, session)
             watchlist_state[symbol] = {
+                "strategy_id": STRATEGY_ID,
                 "ts": alert_ts.isoformat(),
                 "base_high_4h": features["base_high_4h"],
                 "atr_slope_12h": features["atr_slope_12h"],
