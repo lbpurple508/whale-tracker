@@ -820,21 +820,6 @@ def scan():
             atr_threshold,
         )
 
-        if setup and symbol not in state["watch"]:
-
-            state["watch"][symbol] = {
-                "created_at":
-                    iso(current),
-                "entry_price":
-                    setup["entry"],
-                "distance_before":
-                    setup["distance_before"],
-            }
-
-            watches.append(
-                (symbol, setup)
-            )
-
         last_breakout = parse_dt(
             state["last_breakout"].get(
                 symbol
@@ -849,6 +834,8 @@ def scan():
             last_breakout,
         )
 
+        recovery_actionable = False
+
         if recovery:
 
             late = (
@@ -861,10 +848,31 @@ def scan():
                 enter.append(
                     (symbol, recovery)
                 )
+                recovery_actionable = True
             elif MAX_ENTRY_DRIFT_PCT < late <= MAX_REVIEW_DRIFT_PCT:
                 missed.append(
                     (symbol, recovery)
                 )
+                recovery_actionable = True
+
+        if (
+            setup
+            and symbol not in state["watch"]
+            and not recovery_actionable
+        ):
+
+            state["watch"][symbol] = {
+                "created_at":
+                    iso(current),
+                "entry_price":
+                    setup["entry"],
+                "distance_before":
+                    setup["distance_before"],
+            }
+
+            watches.append(
+                (symbol, setup)
+            )
 
     # --------------------------------------------------------
     # Send WATCH.
@@ -949,9 +957,11 @@ def scan():
     # --------------------------------------------------------
     # Send MISSED.
     # --------------------------------------------------------
+    enter_symbols = {symbol for symbol, _ in enter}
+
     for symbol, item in missed:
 
-        if symbol in sent:
+        if symbol in sent or symbol in enter_symbols:
             continue
 
         if cooldown_active(
