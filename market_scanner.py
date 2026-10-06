@@ -732,9 +732,12 @@ def scan():
         if not price:
             continue
 
+        # Only closed candles can establish a WATCH touch. The live/open
+        # candle is deliberately excluded so a temporary wick cannot fire ENTER.
+        closed = closed_only(candles)
         created_ms = int(created.timestamp() * 1000)
         since_watch = [
-            x for x in candles
+            x for x in closed
             if isinstance(x, dict)
             and x.get("open_time", 0) >= created_ms
         ]
@@ -752,6 +755,24 @@ def scan():
         )
         highest_high = max(previous_high, observed_high)
         watch["highest_high_since_watch"] = highest_high
+
+        if highest_high >= entry_price and not watch.get("touch_time"):
+            touch_candidates = [
+                x for x in since_watch
+                if float(x.get("high", 0.0)) >= entry_price
+            ]
+            if touch_candidates:
+                first_touch = min(
+                    touch_candidates,
+                    key=lambda x: int(x["open_time"]),
+                )
+                watch["touch_time"] = iso(
+                    datetime.fromtimestamp(
+                        int(first_touch["open_time"]) / 1000.0,
+                        tz=timezone.utc,
+                    )
+                )
+
         touched = highest_high >= entry_price
 
         if not touched:
@@ -765,8 +786,6 @@ def scan():
                     None,
                 )
             continue
-
-        closed = closed_only(candles)
 
         item = {
             "entry": entry_price,
@@ -788,7 +807,10 @@ def scan():
                     "taker_ratio": 0.5,
                 }
             ),
-            "touch_time": iso(current),
+            "touch_time": watch.get(
+                "touch_time",
+                iso(current),
+            ),
             "source": "WATCH",
         }
 
