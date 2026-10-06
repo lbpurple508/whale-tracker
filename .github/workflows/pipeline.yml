@@ -2,6 +2,7 @@ name: Scanner Pipeline
 
 on:
   workflow_dispatch:
+  push:
 
 concurrency:
   group: scanner-pipeline
