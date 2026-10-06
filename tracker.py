@@ -3,7 +3,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -475,7 +475,7 @@ def update_signals(state: dict) -> int:
 
         tracking_end = min(
             now,
-            entry_dt + __import__("datetime").timedelta(hours=MAX_SIGNAL_AGE_HOURS),
+            entry_dt + timedelta(hours=MAX_SIGNAL_AGE_HOURS),
         )
         candles = fetch_post_entry_klines(symbol, entry_dt, tracking_end)
         if not candles and age_hours < MAX_SIGNAL_AGE_HOURS:
