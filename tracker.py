@@ -208,7 +208,30 @@ def fetch_post_entry_klines(symbol: str, entry_dt: datetime, end_dt: datetime) -
 
             if response.status_code == 200:
                 payload = response.json()
-                return payload if isinstance(payload, list) else []
+                if not isinstance(payload, list):
+                    return []
+
+                # Never score the currently-open 5m candle. Its high/low can
+                # move before close and would create false TP/SL outcomes.
+                now_ms = int(time.time() * 1000)
+                closed = []
+                for candle in payload:
+                    if not isinstance(candle, list) or len(candle) < 7:
+                        continue
+                    try:
+                        open_ms = int(candle[0])
+                        close_ms = int(candle[6])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+
+                    if open_ms < start_ms:
+                        continue
+                    if close_ms >= end_ms or close_ms >= now_ms:
+                        continue
+
+                    closed.append(candle)
+
+                return closed
 
             retryable = response.status_code == 429 or 500 <= response.status_code < 600
             if retryable and attempt + 1 < PRICE_RETRIES:
