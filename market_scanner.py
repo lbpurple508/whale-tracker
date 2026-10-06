@@ -434,6 +434,7 @@ def setup_from_current(
         "entry": f["previous_4h_high"],
         "distance_before": d,
         "features": f,
+        "current_price": price,
     }
 
 
@@ -1014,6 +1015,9 @@ def scan():
     cleaned = []
 
     for event in state["events"]:
+
+        if not isinstance(event, dict):
+            continue
 
         ts = parse_dt(
             event.get("ts")
