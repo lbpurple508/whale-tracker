@@ -399,7 +399,10 @@ def load_new_signals(state: dict) -> int:
             if not math.isfinite(entry) or entry <= 0:
                 continue
 
-            stage = str(raw.get("stage", "BREAKOUT")).upper()
+            stage_value = raw.get("stage")
+            if not isinstance(stage_value, str) or not stage_value.strip():
+                continue
+            stage = stage_value.strip().upper()
             if not should_track(source, stage):
                 seen[key] = True
                 continue
@@ -524,6 +527,10 @@ def update_signals(state: dict) -> int:
                 else:
                     first_hit = "STOPPED"
                     first_hit_pct = STOP_PCT
+
+                # Later candles are post-resolution and must not contaminate
+                # peak/dip statistics.
+                break
 
         signal["peak"] = peak
         signal["peak_pct"] = ((peak - entry) / entry) * 100.0
