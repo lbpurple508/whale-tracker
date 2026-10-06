@@ -1,9 +1,12 @@
 name: Market Scanner
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "7-59/5 * * * *"
 
 concurrency:
   group: market-scanner
