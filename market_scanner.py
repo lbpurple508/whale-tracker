@@ -585,12 +585,11 @@ def scan():
             "watch": {},
             "cooldowns": {},
             "last_breakout": {},
-            "last_missed": {},
             "events": [],
         },
     )
 
-    for key in ["watch", "cooldowns", "last_breakout", "last_missed"]:
+    for key in ["watch", "cooldowns", "last_breakout"]:
         if not isinstance(state.get(key), dict):
             state[key] = {}
 
@@ -693,10 +692,7 @@ def scan():
         candles = market.get(symbol)
 
         if candles is None:
-            state["watch"].pop(
-                symbol,
-                None,
-            )
+            print(f"Keeping WATCH for {symbol}: kline snapshot unavailable")
             continue
 
         created = parse_dt(
@@ -736,10 +732,27 @@ def scan():
         if not price:
             continue
 
-        touched = any(
-            x["high"] >= entry_price
-            for x in candles[-3:]
+        created_ms = int(created.timestamp() * 1000)
+        since_watch = [
+            x for x in candles
+            if isinstance(x, dict)
+            and x.get("open_time", 0) >= created_ms
+        ]
+
+        try:
+            observed_high = max(
+                (float(x["high"]) for x in since_watch),
+                default=0.0,
+            )
+        except (TypeError, ValueError):
+            observed_high = 0.0
+
+        previous_high = float(
+            watch.get("highest_high_since_watch", 0.0) or 0.0
         )
+        highest_high = max(previous_high, observed_high)
+        watch["highest_high_since_watch"] = highest_high
+        touched = highest_high >= entry_price
 
         if not touched:
             if distance(
@@ -753,6 +766,8 @@ def scan():
                 )
             continue
 
+        closed = closed_only(candles)
+
         item = {
             "entry": entry_price,
             "current_price": price,
@@ -764,10 +779,8 @@ def scan():
             ),
             "features": (
                 features_at(
-                    closed_only(candles),
-                    len(
-                        closed_only(candles)
-                    ),
+                    closed,
+                    len(closed),
                 )
                 or {
                     "range_12h_pct": 0,
@@ -855,6 +868,9 @@ def scan():
                     (symbol, recovery)
                 )
                 recovery_actionable = True
+            elif late < 0:
+                # Old resistance was lost; allow a fresh setup to re-arm.
+                recovery = None
 
         if (
             setup
@@ -979,12 +995,12 @@ def scan():
 
         if tg(message):
 
-            state["last_missed"][symbol] = iso(
-                current
-            )
-
             state["cooldowns"][symbol] = iso(
                 current
+            )
+            touch_ts = parse_dt(item.get("touch_time"))
+            state["last_breakout"][symbol] = iso(
+                touch_ts if touch_ts is not None else current
             )
 
             state["watch"].pop(
