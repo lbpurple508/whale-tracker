@@ -27,7 +27,8 @@ HISTORY_HOURS = 6
 SIG_ATR_SLOPE_12H = 20.0
 SIG_VOL_SLOPE_12H = 30.0
 SIG_TRADES_SLOPE_12H = 20.0
-SIG_RANGE_4H_MIN = 10.0
+SIG_ATR_1H_PCT_MIN = 2.0
+SIG_RET_1H_MIN = 5.0
 
 CONFIRM_MIN_HOURS = 1.0
 CONFIRM_MAX_HOURS = 6.0
@@ -489,6 +490,8 @@ def compute_trend_features(k5):
     trades_slope = (trades_1h - trades_12h) / trades_12h * 100.0
 
     range_4h = (max(highs[-48:]) - min(lows[-48:])) / min(lows[-48:]) * 100.0
+    atr_1h_pct = atr_1h / closes[-1] * 100.0
+    ret_1h_pct = (closes[-1] / closes[-13] - 1.0) * 100.0
     range_12h = (max(highs[-144:]) - min(lows[-144:])) / min(lows[-144:]) * 100.0
 
     rsi_15m = compute_rsi_15m(closes)
@@ -506,6 +509,8 @@ def compute_trend_features(k5):
 
     return {
         "atr_slope_12h": atr_slope,
+        "atr_1h_pct": atr_1h_pct,
+        "ret_1h_pct": ret_1h_pct,
         "vol_slope_12h": vol_slope,
         "trades_slope_12h": trades_slope,
         "range_4h_pct": range_4h,
@@ -546,15 +551,11 @@ def detect_watchlist(features):
     if features is None:
         return False, "no_features"
 
-    reasons = []
-    if features["atr_slope_12h"] < SIG_ATR_SLOPE_12H:
-        reasons.append(f"atr_{features['atr_slope_12h']:.0f}%")
-    if features["vol_slope_12h"] < SIG_VOL_SLOPE_12H:
-        reasons.append(f"vol_{features['vol_slope_12h']:.0f}%")
-    if features["trades_slope_12h"] < SIG_TRADES_SLOPE_12H:
-        reasons.append(f"trades_{features['trades_slope_12h']:.0f}%")
-    if features["range_4h_pct"] < SIG_RANGE_4H_MIN:
-        reasons.append(f"range_{features['range_4h_pct']:.1f}%")
+    if features["atr_1h_pct"] < SIG_ATR_1H_PCT_MIN:
+        return False, f"atr1h_{features['atr_1h_pct']:.2f}%"
+    if features["ret_1h_pct"] < SIG_RET_1H_MIN:
+        return False, f"ret1h_{features['ret_1h_pct']:.2f}%"
+    return True, features
 
     if reasons:
         return False, ",".join(reasons)
