@@ -760,7 +760,7 @@ def main():
 
         msg = (
             f"🟠 <b>MONITORING • ENTER</b>\n\n"
-            f"<b>PAIR:</b> {html.escape(symbol.replace("USDT", ""))}\n"
+            f"<b>NAME:</b> {html.escape(symbol.replace("USDT", ""))}\n"
             f"<b>ENTRY:</b> {format_price(info['current_price'])}\n"
             f"<b>BREAK:</b> +{info['break_pct']:.2f}%\n\n"
             f"✅ <b>ENTER NOW.</b>"
@@ -791,7 +791,7 @@ def main():
 
         msg = (
             f"👀 <b>MONITORING • WATCH</b>\n\n"
-            f"<b>PAIR:</b> {html.escape(symbol.replace("USDT", ""))}\n"
+            f"<b>NAME:</b> {html.escape(symbol.replace("USDT", ""))}\n"
             f"<b>ENTRY:</b> {format_price(features['base_high_4h'])}\n"
             f"<b>NOW:</b> {format_price(features['current_price'])}\n\n"
             f"⚠️ <b>DO NOT BUY YET.</b>"
