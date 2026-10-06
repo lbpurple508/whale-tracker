@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: market-scanner
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -44,6 +44,16 @@ jobs:
           key: market-state-${{ github.run_id }}
           restore-keys: |
             market-state-
+
+      - name: Validate Python
+        run: |
+          python -m py_compile market_scanner.py monitoring_scanner.py tracker.py distribution_scanner.py
+
+      - name: Check private profile
+        env:
+          SCANNER_PROFILE: ${{ secrets.SCANNER_PROFILE }}
+        run: |
+          test -n "$SCANNER_PROFILE" || { echo "SCANNER_PROFILE repository secret is missing"; exit 1; }
 
       - name: Run market scanner
         env:
