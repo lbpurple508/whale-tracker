@@ -759,19 +759,11 @@ def main():
         info = confirmation["info"]
 
         msg = (
-            f"🚀 <b>CONFIRMED BREAKOUT [{html.escape(session)}]</b>\n\n"
-            f"<b>Coin:</b> {html.escape(symbol)}\n"
-            f"<b>Entry:</b> {format_price(info['current_price'])}\n"
-            f"<b>Base High (broken):</b> {format_price(info['base_high'])}\n"
-            f"<b>Break:</b> +{info['break_pct']:.2f}%\n"
-            f"<b>RSI(15m):</b> {info['rsi']:.1f}\n"
-            f"<b>Buyers:</b> {info['taker_ratio'] * 100:.1f}%\n"
-            f"<b>ATR trend:</b> {info['atr_slope_now']:+.0f}%\n"
-            f"<b>Volume:</b> {info['vol_ratio_now']:.2f}x vs 24h avg\n"
-            f"<b>Trades trend:</b> {info['trades_slope_now']:+.0f}%\n"
-            f"<b>Time:</b> {ist.strftime('%H:%M:%S')} IST\n\n"
-            f"✅ <b>ENTER NOW</b> at market.\n"
-            f"Stop: -3% | Targets: +5% / +10% / +25%"
+            f"🟠 <b>MONITORING • ENTER</b>\n\n"
+            f"<b>PAIR:</b> {html.escape(symbol)}\n"
+            f"<b>ENTRY:</b> {format_price(info['current_price'])}\n"
+            f"<b>BREAK:</b> +{info['break_pct']:.2f}%\n\n"
+            f"✅ <b>ENTER NOW.</b>"
         )
 
         if send_telegram(msg):
@@ -798,15 +790,11 @@ def main():
             continue
 
         msg = (
-            f"👀 <b>WATCHLIST: {html.escape(symbol)}</b>\n\n"
-            f"<b>Price:</b> {format_price(features['current_price'])}\n"
-            f"<b>ATR rising:</b> {features['atr_slope_12h']:+.0f}% (12h)\n"
-            f"<b>Volume rising:</b> {features['vol_slope_12h']:+.0f}% (12h)\n"
-            f"<b>Trades rising:</b> {features['trades_slope_12h']:+.0f}% (12h)\n"
-            f"<b>Range 4h:</b> {features['range_4h_pct']:.1f}%\n"
-            f"<b>RSI(15m):</b> {features['rsi_15m']:.1f}\n\n"
-            f"⚠️ <b>DO NOT BUY YET.</b>\n"
-            f"Confirmation in 1 hour if price breaks {format_price(features['base_high_4h'])}."
+            f"👀 <b>MONITORING • WATCH</b>\n\n"
+            f"<b>PAIR:</b> {html.escape(symbol)}\n"
+            f"<b>ENTRY:</b> {format_price(features['base_high_4h'])}\n"
+            f"<b>NOW:</b> {format_price(features['current_price'])}\n\n"
+            f"⚠️ <b>DO NOT BUY YET.</b>"
         )
 
         if send_telegram(msg):
