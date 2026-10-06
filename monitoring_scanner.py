@@ -24,9 +24,6 @@ COOLDOWN_BREAKOUT_MINUTES = 240
 COOLDOWN_WATCHLIST_MINUTES = 60
 HISTORY_HOURS = 6
 
-SIG_ATR_SLOPE_12H = 20.0
-SIG_VOL_SLOPE_12H = 30.0
-SIG_TRADES_SLOPE_12H = 20.0
 SIG_ATR_1H_PCT_MIN = 2.0
 SIG_RET_1H_MIN = 5.0
 
@@ -34,6 +31,7 @@ CONFIRM_MIN_HOURS = 1.0
 CONFIRM_MAX_HOURS = 6.0
 MAX_EXTENSION_PCT = 5.0
 MAX_CONFIRM_SEND_FAILURES = 3
+MAX_ALLOWED_MISSING = 3
 
 # Binance Spot kline field indexes.
 KLINE_OPEN_TIME = 0
@@ -606,10 +604,6 @@ def detect_watchlist(features):
         return False, f"ret1h_{features['ret_1h_pct']:.2f}%"
     return True, features
 
-    if reasons:
-        return False, ",".join(reasons)
-    return True, features
-
 
 def check_confirmation(entry, features_now):
     if features_now is None:
@@ -707,8 +701,8 @@ def scan(session, ist_hour):
         except Exception as exc:
             return symbol, None, f"scan_error:{type(exc).__name__}"
 
-    # Fetch the complete 32-coin snapshot first. Partial coverage is not acceptable
-    # for the riskier monitoring scanner because a missing coin can hide a signal.
+    # Fetch the monitoring snapshot first. A few transient API misses are tolerated;
+    # too many misses still fail closed because broad coverage is important here.
     features_by_symbol = {}
     coverage_failures = {}
 
@@ -741,10 +735,17 @@ def scan(session, ist_hour):
         )
     )
 
-    if len(features_by_symbol) != len(MONITORING_TOKENS):
-        missing = sorted(set(MONITORING_TOKENS) - set(features_by_symbol))
+    missing = sorted(set(MONITORING_TOKENS) - set(features_by_symbol))
+    if missing:
+        print(
+            f"Warning: monitoring coverage incomplete: "
+            f"{len(features_by_symbol)}/{len(MONITORING_TOKENS)} "
+            f"coins available. Missing: {', '.join(missing)}"
+        )
+
+    if len(missing) > MAX_ALLOWED_MISSING:
         raise RuntimeError(
-            f"Monitoring coverage incomplete: {len(features_by_symbol)}/{len(MONITORING_TOKENS)} "
+            f"Monitoring coverage too low: {len(features_by_symbol)}/{len(MONITORING_TOKENS)} "
             f"coins available. Missing: {', '.join(missing)}"
         )
 
@@ -769,8 +770,9 @@ def scan(session, ist_hour):
 
         features_now = features_by_symbol.get(symbol)
         if features_now is None:
-            # Defensive only; full coverage check above should make this unreachable.
-            raise RuntimeError(f"Missing confirmation snapshot for {symbol}")
+            # Keep the WATCH alive; this coin can be checked again on the next scan.
+            print(f"Skipping confirmation for {symbol}: no fresh snapshot")
+            continue
 
         ok, info = check_confirmation(entry, features_now)
         if ok:
@@ -785,7 +787,11 @@ def scan(session, ist_hour):
         if symbol in active_watchlist:
             continue
 
-        features = features_by_symbol[symbol]
+        features = features_by_symbol.get(symbol)
+        if features is None:
+            print(f"Skipping WATCH evaluation for {symbol}: no fresh snapshot")
+            continue
+
         ok, info = detect_watchlist(features)
 
         if ok:
