@@ -515,19 +515,12 @@ def build_watch(symbol, setup):
     f = setup["features"]
     entry = setup["entry"]
     return (
-        f"👀 <b>WATCH SETUP</b>\n\n"
+        f"👀 <b>SPOT TOKENS • WATCH</b>\n\n"
         f"<b>PAIR:</b> {html.escape(symbol)}\n"
-        f"<b>SETUP:</b> MARKET SIGNAL\n\n"
-        f"<b>CURRENT PRICE:</b> {fmt_price(f['close'])}\n"
-        f"<b>PREVIOUS 4H HIGH:</b> {fmt_price(entry)}\n"
+        f"<b>ENTRY:</b> {fmt_price(entry)}\n"
+        f"<b>NOW:</b> {fmt_price(f['close'])}\n"
         f"<b>DISTANCE:</b> {setup['distance_before']:.2f}%\n\n"
-        f"🎯 <b>TARGET ENTRY PRICE:</b> {fmt_price(entry)}\n"
-        f"<b>TRIGGER:</b> FIRST TOUCH\n\n"
-        f"<b>12H RANGE:</b> {f['range_12h_pct']:.2f}%\n"
-        f"<b>1H ATR:</b> {f['atr_1h_pct']:.2f}%\n"
-        f"<b>TAKER BUY:</b> {f['taker_ratio'] * 100:.1f}%\n\n"
-        f"⚠️ <b>DO NOT BUY YET.</b>\n"
-        f"Wait for {fmt_price(entry)}."
+        f"⚠️ <b>DO NOT BUY YET.</b>"
     )
 
 
@@ -543,22 +536,13 @@ def build_enter(
     ) * 100.0
 
     return (
-        f"🚀 <b>ENTER TRADE</b>\n\n"
+        f"🟢 <b>SPOT TOKENS • ENTER</b>\n\n"
         f"<b>PAIR:</b> {html.escape(symbol)}\n"
-        f"<b>SETUP:</b> MARKET SIGNAL\n\n"
-        f"🎯 <b>ENTRY PRICE:</b> {fmt_price(entry)}\n"
-        f"<b>TRIGGER:</b> PREVIOUS 4H HIGH TOUCH\n"
-        f"<b>CURRENT PRICE:</b> {fmt_price(price)}\n"
-        f"<b>LATE FROM ENTRY:</b> {late:+.2f}%\n\n"
-        f"<b>DISTANCE BEFORE BREAKOUT:</b> "
-        f"{item['distance_before']:.2f}%\n"
-        f"<b>12H RANGE:</b> {f['range_12h_pct']:.2f}%\n"
-        f"<b>1H ATR:</b> {f['atr_1h_pct']:.2f}%\n"
-        f"<b>TAKER BUY:</b> {f['taker_ratio'] * 100:.1f}%\n"
-        f"<b>DETECTION:</b> {html.escape(item.get('source', 'LIVE'))}\n\n"
-        f"<b>TARGET LADDER FROM ENTRY:</b>\n"
-        f"{targets(entry)}\n\n"
-        f"✅ <b>ENTER TRADE AT / NEAR THE TARGET ENTRY PRICE.</b>"
+        f"<b>ENTRY:</b> {fmt_price(entry)}\n"
+        f"<b>NOW:</b> {fmt_price(price)}\n"
+        f"<b>DRIFT:</b> {late:+.2f}%\n\n"
+        f"<b>TARGETS:</b> {targets(entry)}\n\n"
+        f"✅ <b>ENTER AT / NEAR ENTRY.</b>"
     )
 
 
@@ -578,18 +562,12 @@ def build_missed(
     )
 
     return (
-        f"⚠️ <b>MISSED IDEAL ENTRY</b>\n\n"
+        f"⛔ <b>SPOT TOKENS • MISSED</b>\n\n"
         f"<b>PAIR:</b> {html.escape(symbol)}\n"
-        f"<b>SETUP:</b> MARKET SIGNAL\n\n"
-        f"🎯 <b>ORIGINAL ENTRY:</b> {fmt_price(entry)}\n"
-        f"<b>CURRENT PRICE:</b> {fmt_price(price)}\n"
-        f"<b>LATE BY:</b> +{late:.2f}%\n\n"
-        f"<b>ORIGINAL DISTANCE:</b> "
-        f"{item['distance_before']:.2f}%\n"
-        f"<b>TOUCH TIME:</b> {html.escape(touch_time)}\n\n"
-        f"<b>TARGET LADDER FROM ORIGINAL ENTRY:</b>\n"
-        f"{targets(entry)}\n\n"
-        f"STATUS: <b>MISSED ENTRY — DO NOT CHASE.</b>"
+        f"<b>ORIGINAL ENTRY:</b> {fmt_price(entry)}\n"
+        f"<b>NOW:</b> {fmt_price(price)}\n"
+        f"<b>LATE:</b> +{late:.2f}%\n\n"
+        f"⛔ <b>DO NOT CHASE.</b>"
     )
 
 
