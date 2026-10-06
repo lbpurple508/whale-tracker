@@ -14,8 +14,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "pump_scanner_state.json"
-HISTORY_FILE = BASE_DIR / "pump_signal_history.json"
+STATE_FILE = BASE_DIR / "market_state.json"
+HISTORY_FILE = BASE_DIR / "market_events.json"
 
 BINANCE_BASE = "https://data-api.binance.vision"
 INTERVAL = "5m"
@@ -24,19 +24,19 @@ MAX_WORKERS = 16
 REQUEST_TIMEOUT = 12
 REQUEST_RETRIES = 2
 
-MAX_PRICE = 2.0
+PRICE_CAP = 2.0
 
 # Validated historical setup:
-# EXTREME + price 0..1% below previous 4H high.
+# MARKET SIGNAL + price 0..1% below previous 4H high.
 RANGE_QUANTILE = 0.95
 ZONE_MIN_PCT = -1.0
 ZONE_MAX_PCT = 0.0
 
 # Practical alert handling.
-WATCH_EXPIRY_HOURS = 6
-COOLDOWN_HOURS = 12
-MAX_ENTRY_DRIFT_PCT = 0.25
-MAX_REVIEW_DRIFT_PCT = 5.0
+WATCH_TTL_HOURS = 6
+SYMBOL_TTL_HOURS = 12
+ENTRY_DRIFT_LIMIT = 0.25
+REVIEW_DRIFT_LIMIT = 5.0
 RECENT_BARS = 12
 
 TARGETS = [5, 10, 20, 50, 100]
@@ -629,7 +629,7 @@ def scan():
     symbols, prices = load_universe()
 
     print(
-        "Eligible Spot USDT <= 2.0:",
+        "Eligible Spot USDT markets:",
         len(symbols),
     )
 
