@@ -22,3 +22,6 @@ futures_signals.json
 
 tracker_state.json
 report.txt
+
+market_state.json
+market_events.json
