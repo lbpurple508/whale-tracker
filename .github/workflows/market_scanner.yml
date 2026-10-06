@@ -64,7 +64,7 @@ jobs:
           python market_scanner.py
 
       - name: Save market state
-        if: always()
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: |
