@@ -520,7 +520,7 @@ def build_watch(symbol, setup):
     f = setup["features"]
     entry = setup["entry"]
     return (
-        f"👀 <b>SPOT TOKENS • WATCH</b>\n\n"
+        f"🔴 <b>SPOT TOKENS • WATCH</b>\n\n"
         f"<b>NAME:</b> {html.escape(display_name(symbol))}\n"
         f"<b>ENTRY:</b> {fmt_price(entry)}\n"
         f"<b>NOW:</b> {fmt_price(setup.get('current_price', f['close']))}\n"
