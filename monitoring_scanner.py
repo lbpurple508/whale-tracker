@@ -889,7 +889,6 @@ def main():
                 "vol_slope_12h": features["vol_slope_12h"],
                 "trades_slope_12h": features["trades_slope_12h"],
                 "range_4h_pct": features["range_4h_pct"],
-                "entry_price": features["current_price"],
                 "failed_sends": 0,
             }
 
