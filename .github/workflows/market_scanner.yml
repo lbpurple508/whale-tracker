@@ -1,16 +1,13 @@
-name: Market Scanner
+name: Spot Market Monitor
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
   schedule:
     - cron: "7-59/5 * * * *"
 
 concurrency:
   group: market-scanner
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
