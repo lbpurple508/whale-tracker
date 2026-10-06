@@ -24,32 +24,32 @@ MAX_WORKERS = 16
 REQUEST_TIMEOUT = 12
 REQUEST_RETRIES = 2
 
-PRICE_CAP = 2.0
+PROFILE_RAW = os.environ.get("SCANNER_PROFILE", "").strip()
+if not PROFILE_RAW:
+    raise RuntimeError("SCANNER_PROFILE secret is required")
 
-# Internal signal profile. The public source intentionally keeps the
-# research description minimal; these values drive the live rule.
-RANGE_QUANTILE = 0.95
-ZONE_MIN_PCT = -1.0
-ZONE_MAX_PCT = 0.0
+try:
+    PROFILE = json.loads(PROFILE_RAW)
+except json.JSONDecodeError as exc:
+    raise RuntimeError("SCANNER_PROFILE must be valid JSON") from exc
 
-# Alert lifecycle settings.
-WATCH_TTL_HOURS = 6
-SYMBOL_TTL_HOURS = 12
-ENTRY_DRIFT_LIMIT = 0.25
-REVIEW_DRIFT_LIMIT = 5.0
-RECENT_BARS = 12
+PRICE_CAP = float(PROFILE["price_cap"])
+RANGE_QUANTILE = float(PROFILE["range_quantile"])
+ZONE_LOW = float(PROFILE["zone_low"])
+ZONE_HIGH = float(PROFILE["zone_high"])
+WATCH_TTL_HOURS = float(PROFILE["watch_ttl_hours"])
+SYMBOL_TTL_HOURS = float(PROFILE["symbol_ttl_hours"])
+ENTRY_DRIFT_LIMIT = float(PROFILE["entry_drift_limit"])
+REVIEW_DRIFT_LIMIT = float(PROFILE["review_drift_limit"])
+RECENT_BARS = int(PROFILE["recent_bars"])
 
-TARGETS = [5, 10, 20, 50, 100]
+TARGETS = [int(x) for x in PROFILE.get("targets", [5, 10, 20, 50, 100])]
 
 EXCLUDED = {
-    "RAREUSDT", "ARKUSDT", "WIFUSDT", "QIUSDT", "MOVEUSDT",
-    "STXUSDT", "LSKUSDT", "SYNUSDT", "MOVRUSDT", "NOMUSDT",
-    "JASMYUSDT", "TLMUSDT", "GLMRUSDT", "QUICKUSDT", "ACTUSDT",
-    "BLURUSDT", "RESOLVUSDT", "AVAUSDT", "DODOUSDT", "PORTALUSDT",
-    "VELODROMEUSDT", "EPICUSDT", "SOPHUSDT", "AWEUSDT", "SCRUSDT",
-    "HEIUSDT", "TOWNSUSDT", "GTCUSDT", "FTTUSDT", "COOKIEUSDT",
-    "QKCUSDT", "GNSUSDT",
+    str(x).upper()
+    for x in PROFILE.get("excluded_symbols", [])
 }
+
 
 
 def now():
