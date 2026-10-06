@@ -33,14 +33,14 @@ try:
 except json.JSONDecodeError as exc:
     raise RuntimeError("SCANNER_PROFILE must be valid JSON") from exc
 
-PRICE_CAP = float(PROFILE["price_cap"])
+PRICE_LIMIT = float(PROFILE["price_cap"])
 RANGE_QUANTILE = float(PROFILE["range_quantile"])
-ZONE_LOW = float(PROFILE["zone_low"])
-ZONE_HIGH = float(PROFILE["zone_high"])
-WATCH_TTL_HOURS = float(PROFILE["watch_ttl_hours"])
-SYMBOL_TTL_HOURS = float(PROFILE["symbol_ttl_hours"])
-ENTRY_DRIFT_LIMIT = float(PROFILE["entry_drift_limit"])
-REVIEW_DRIFT_LIMIT = float(PROFILE["review_drift_limit"])
+ZONE_MIN_PCT = float(PROFILE["zone_low"])
+ZONE_MAX_PCT = float(PROFILE["zone_high"])
+WATCH_EXPIRY_HOURS = float(PROFILE["watch_ttl_hours"])
+COOLDOWN_HOURS = float(PROFILE["symbol_ttl_hours"])
+MAX_ENTRY_DRIFT_PCT = float(PROFILE["entry_drift_limit"])
+MAX_REVIEW_DRIFT_PCT = float(PROFILE["review_drift_limit"])
 RECENT_BARS = int(PROFILE["recent_bars"])
 
 TARGETS = [int(x) for x in PROFILE.get("targets", [5, 10, 20, 50, 100])]
@@ -215,7 +215,7 @@ def load_universe():
             continue
 
         p = prices.get(s)
-        if p is None or p > MAX_PRICE:
+        if p is None or p > PRICE_LIMIT:
             continue
 
         symbols.append(s)
@@ -1127,7 +1127,7 @@ if __name__ == "__main__":
             f"FATAL: {type(exc).__name__}: {exc}"
         )
         tg(
-            "🚨 <b>PUMP SCANNER ERROR</b>\n\n"
+            "🚨 <b>MARKET SCANNER ERROR</b>\n\n"
             + html.escape(
                 str(exc)[:500]
             )
