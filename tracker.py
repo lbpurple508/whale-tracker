@@ -670,6 +670,12 @@ def main() -> None:
     cleaned = clean_state(state)
     print(f"Cleaned: {cleaned} invalid/duplicate signals removed")
 
+    previous_status = {
+        str(signal.get("key")): signal.get("status")
+        for signal in state.get("signals", [])
+        if isinstance(signal, dict) and signal.get("key")
+    }
+
     added = load_new_signals(state)
     print(f"New signals: {added}")
     print(f"Total tracked: {len(state['signals'])}")
@@ -677,22 +683,31 @@ def main() -> None:
     updated = update_signals(state)
     print(f"Updated: {updated}")
 
+    newly_resolved = []
+    for signal in state.get("signals", []):
+        if not isinstance(signal, dict):
+            continue
+
+        key = signal.get("key")
+        before = previous_status.get(str(key))
+        after = signal.get("status")
+
+        if before == "ACTIVE" and after in {"TP30_HIT", "STOPPED", "EXPIRED"}:
+            newly_resolved.append(signal.get("symbol", "?"))
+
     if not save_json(TRACKER_FILE, state):
         print("State was not saved successfully")
         return
 
-    # Only send Telegram when at least one ACTIVE signal exists.
-    # Prevents 288 daily reports for the same closed signals.
-    has_active = any(
-        isinstance(s, dict) and s.get("status") == "ACTIVE"
-        for s in state.get("signals", [])
-    )
-
-    if has_active:
+    # Event-driven Telegram reporting only:
+    # - new signal added (ENTER)
+    # - existing ACTIVE signal resolves (TP30 / STOP / EXPIRED)
+    # Ordinary 5-minute price updates stay silent to prevent Telegram spam.
+    if added > 0 or newly_resolved:
         report = build_report(state)
         send_telegram(report)
     else:
-        print("No active signals. Skipping report.")
+        print("No tracker event. Skipping Telegram report.")
 
 
 if __name__ == "__main__":
