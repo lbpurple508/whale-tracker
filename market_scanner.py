@@ -44,6 +44,7 @@ MAX_REVIEW_DRIFT_PCT = float(PROFILE["review_drift_limit"])
 RECENT_BARS = int(PROFILE["recent_bars"])
 
 TARGETS = [int(x) for x in PROFILE.get("targets", [5, 10, 20, 50, 100])]
+STOP_PCT = -3.0
 
 EXCLUDED = {
     str(x).upper()
@@ -540,12 +541,20 @@ def build_enter(
         price / entry - 1.0
     ) * 100.0
 
+    if not math.isfinite(entry) or entry <= 0:
+        raise ValueError(f"Invalid ENTER entry price for {symbol}: {entry}")
+
+    stop_price = entry * (1.0 + STOP_PCT / 100.0)
+    if not math.isfinite(stop_price) or stop_price <= 0:
+        raise ValueError(f"Invalid ENTER stop price for {symbol}: {stop_price}")
+
     return (
         f"🟢 <b>SPOT TOKENS • ENTER</b>\n\n"
         f"<b>NAME:</b> {html.escape(display_name(symbol))}\n"
         f"<b>ENTRY:</b> {fmt_price(entry)}\n"
         f"<b>NOW:</b> {fmt_price(price)}\n"
-        f"<b>DRIFT:</b> {late:+.2f}%\n\n"
+        f"<b>DRIFT:</b> {late:+.2f}%\n"
+        f"🛑 <b>SL:</b> {fmt_price(stop_price)} ({STOP_PCT:+.0f}%)\n\n"
         f"<b>TARGETS:</b> {targets(entry)}\n\n"
         f"✅ <b>ENTER AT / NEAR ENTRY.</b>"
     )
