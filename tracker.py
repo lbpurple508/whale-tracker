@@ -632,13 +632,17 @@ def build_report(state: dict) -> str:
     if active:
         lines.extend(["", "🟡 <b>ACTIVE</b>"])
         for signal in active[-5:]:
+            entry_price = _as_finite_float(signal.get("entry"), 0.0)
             peak = _as_finite_float(signal.get("peak_pct"), 0.0)
             dip_tracked = _as_finite_float(signal.get("dip_pct_tracked"), 0.0)
             current = _as_finite_float(signal.get("current_pct"), 0.0)
+            stop_price = entry_price * (1.0 + STOP_PCT / 100.0)
+            target_price = entry_price * (1.0 + PUMP_TARGET / 100.0)
             lines.append(
                 f"• <b>{signal.get('symbol', '?')}</b> "
-                f"{format_price(signal.get('entry', 0))} → {current:+.2f}% "
-                f"(peak {peak:+.2f}%, dip {dip_tracked:+.2f}%)"
+                f"{format_price(entry_price)} → {current:+.2f}% "
+                f"(SL {format_price(stop_price)}, TP {format_price(target_price)}, "
+                f"peak {peak:+.2f}%, dip {dip_tracked:+.2f}%)"
             )
 
     if stopped:
