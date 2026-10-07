@@ -25,7 +25,7 @@ COOLDOWN_WATCHLIST_MINUTES = 60
 HISTORY_HOURS = 6
 
 SIG_ATR_1H_PCT_MIN = 2.0
-SIG_RET_1H_MIN = 5.0
+SIG_RET_1H_MIN = 5.0\nSTOP_PCT = -3.0\nPUMP_TARGET = 30.0
 
 CONFIRM_MIN_HOURS = 1.0
 CONFIRM_MAX_HOURS = 6.0
@@ -838,11 +838,17 @@ def main():
         symbol = confirmation["symbol"]
         info = confirmation["info"]
 
+        entry_price = float(info["current_price"])
+        stop_price = entry_price * (1.0 + STOP_PCT / 100.0)
+        target_price = entry_price * (1.0 + PUMP_TARGET / 100.0)
+
         msg = (
             f"🟢 <b>MONITORING • ENTER</b>\n\n"
             f"<b>NAME:</b> {html.escape(display_name(symbol))}\n"
-            f"<b>ENTRY:</b> {format_price(info['current_price'])}\n"
-            f"<b>BREAK:</b> +{info['break_pct']:.2f}%\n\n"
+            f"<b>ENTRY:</b> {format_price(entry_price)}\n"
+            f"<b>BREAK:</b> +{info['break_pct']:.2f}%\n"
+            f"🛑 <b>SL:</b> {format_price(stop_price)} ({STOP_PCT:+.0f}%)\n"
+            f"🎯 <b>TP:</b> {format_price(target_price)} (+{PUMP_TARGET:.0f}%)\n\n"
             f"✅ <b>ENTER NOW.</b>"
         )
 
